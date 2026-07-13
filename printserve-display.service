@@ -1,0 +1,16 @@
+[Unit]
+Description=VESYL Print — LCD system info display
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vesyl
+WorkingDirectory=/home/vesyl/printserve
+ExecStart=/usr/bin/python3 /home/vesyl/printserve/main.py
+ExecStopPost=/usr/bin/python3 /home/vesyl/printserve/main.py --offline
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
