@@ -8,8 +8,12 @@ in the 'lpadmin' group to add printers (no sudo needed).
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+
+# Test page sent to a printer right after the app auto-provisions it.
+TEST_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "base.jpg")
 
 # CUPS device-URI schemes that indicate a printer reached over the network
 # (as opposed to usb://, parallel://, serial://, file://, ...).
@@ -149,12 +153,29 @@ def add_printer(uri: str, model: str) -> str | None:
     return queue if result.returncode == 0 else None
 
 
+def print_test_page(queue: str) -> bool:
+    """Send the test image to a queue. Returns True if the job was accepted."""
+    if not os.path.exists(TEST_IMAGE):
+        return False
+    try:
+        result = subprocess.run(
+            ["lp", "-d", queue, TEST_IMAGE],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def ensure_printer() -> str | None:
     """Display name of a network printer, provisioning one if none exists.
 
     Returns the model/description to show, or None if nothing is configured
-    and nothing could be discovered. May block for several seconds while
-    browsing the network, so call this off the render loop.
+    and nothing could be discovered. When it provisions a *new* printer, it
+    sends a test page. May block for several seconds while browsing the
+    network, so call this off the render loop.
     """
     existing = configured_printer()
     if existing:
@@ -166,4 +187,9 @@ def ensure_printer() -> str | None:
 
     uri, model = found
     queue = add_printer(uri, model)
-    return _display_name(queue) if queue else None
+    if not queue:
+        return None
+
+    # Newly provisioned — send a test page to confirm it works.
+    print_test_page(queue)
+    return _display_name(queue)
