@@ -9,10 +9,12 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import threading
 import time
 
 from PIL import Image, ImageDraw, ImageFont
 
+import printers
 import sysinfo
 from framebuffer import Framebuffer
 
@@ -48,6 +50,7 @@ class InfoScreen:
         self.f_value = load_font(FONT_PATH, 26)
         self.f_footer = load_font(FONT_PATH, 16)
         self.logo = self._load_logo()
+        self.printer_name: str | None = None  # set once discovered
 
     def _load_logo(self) -> Image.Image | None:
         try:
@@ -69,6 +72,14 @@ class InfoScreen:
         )
         self._row(d, "HOSTNAME", sysinfo.hostname(), y=200)
         self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=252)
+
+        # printer name, right-aligned just above the online status; truncated
+        # to the right of the IP value so the two never collide
+        if self.printer_name:
+            name = self._fit(d, self.printer_name, self.f_footer, self.w - 120)
+            tw = d.textlength(name, font=self.f_footer)
+            d.text((self.w - 16 - tw, self.h - 48), name,
+                   font=self.f_footer, fill=MUTED)
 
         self._status(d, "online", OK)
         return img
@@ -118,6 +129,14 @@ class InfoScreen:
         tx = self.w - 16 - tw
         d.text((tx, self.h - 28), text, font=self.f_footer, fill=MUTED)
         d.ellipse([tx - 20, self.h - 26, tx - 8, self.h - 14], fill=color)
+
+    def _fit(self, d, text, font, max_w):
+        """Truncate text with an ellipsis so it fits within max_w pixels."""
+        if d.textlength(text, font=font) <= max_w:
+            return text
+        while text and d.textlength(text + "…", font=font) > max_w:
+            text = text[:-1]
+        return text + "…"
 
     def _centered(self, d, text, font, y, fill):
         w = d.textlength(text, font=font)
@@ -184,6 +203,15 @@ def main() -> None:
     if args.once:
         fb.show(screen.render())
         return
+
+    # Resolve the network printer at load: use the configured one, or auto-add
+    # the first discovered printer if none is configured. Discovery browses the
+    # network (several seconds), so run it in a background thread to keep the
+    # display responsive; the name appears once it resolves.
+    def resolve_printer():
+        screen.printer_name = printers.ensure_printer()
+
+    threading.Thread(target=resolve_printer, daemon=True).start()
 
     # The Plymouth splash covers the boot window; the app goes straight to the
     # live info screen and refreshes on the interval.

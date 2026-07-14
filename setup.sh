@@ -34,12 +34,13 @@ echo "==> Repo:        $REPO_DIR"
 echo "==> Run as user: $RUN_USER"
 
 # --- 1. dependencies -------------------------------------------------------
-echo "==> Installing dependencies (python3, Pillow, numpy, fonts)..."
+echo "==> Installing dependencies (python3, Pillow, numpy, fonts, CUPS)..."
 apt-get update || echo "   (apt-get update failed — continuing with cached lists)"
-apt-get install -y python3 python3-pil python3-numpy fonts-dejavu-core
+apt-get install -y python3 python3-pil python3-numpy fonts-dejavu-core cups
 
-# The service user must be in 'video' to write /dev/fb1.
-usermod -aG video "$RUN_USER"
+# The service user must be in 'video' to write /dev/fb1, and 'lpadmin' to
+# discover and add network printers to CUPS without sudo.
+usermod -aG video,lpadmin "$RUN_USER"
 
 # --- 2. locate the boot config + overlays dir ------------------------------
 if [[ -f /boot/firmware/config.txt ]]; then
