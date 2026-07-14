@@ -73,20 +73,17 @@ class InfoScreen:
         self._status(d, "online", OK)
         return img
 
-    def render_boot(self, units: list[str], frame: int = 0) -> Image.Image:
-        """Boot splash: logo, animated 'booting…', starting services listed."""
+    def render_splash(self) -> Image.Image:
+        """Static boot splash (logo + 'booting…').
+
+        This is what the Plymouth boot screen shows: it is rendered once to
+        assets/plymouth-splash.png and installed as the Plymouth theme image
+        by setup.sh. Keeping it here lets the asset be regenerated if the
+        logo or theme changes.
+        """
         img, d = self._new()
         self._header(img, d, accent=ACCENT)
-
-        dots = "." * (1 + frame % 3)
-        self._centered(d, "booting" + dots, self.f_head, y=128, fill=FG)
-
-        # currently-starting services, stacked up from the bottom-left corner
-        y = self.h - 24
-        for name in units:
-            text = name if len(name) <= 42 else name[:41] + "…"
-            d.text((16, y), text, font=self.f_footer, fill=MUTED)
-            y -= 20
+        self._centered(d, "booting...", self.f_head, y=128, fill=FG)
         return img
 
     def render_offline(self, message: str = "display service stopped") -> Image.Image:
@@ -160,42 +157,37 @@ def main() -> None:
         help="render the static disconnected screen once and exit",
     )
     ap.add_argument(
-        "--boot",
+        "--splash",
         action="store_true",
-        help="show the boot splash (logo + starting services) until stopped",
+        help="render the boot splash once and exit",
     )
     args = ap.parse_args()
 
     # The LCD's SPI driver loads late in boot (fb1 appears ~15-20s in), so the
     # service can start before the device exists — wait for it. Manual one-shot
     # modes fail fast instead of hanging.
-    manual = args.once or args.offline
+    manual = args.once or args.offline or args.splash
     fb = open_framebuffer(args.device, wait=0.0 if manual else 30.0)
     screen = InfoScreen(fb)
 
     if args.offline:
         fb.show(screen.render_offline())
         return
+    if args.splash:
+        fb.show(screen.render_splash())
+        return
 
     running = {"go": True}
     signal.signal(signal.SIGINT, lambda *_: running.update(go=False))
     signal.signal(signal.SIGTERM, lambda *_: running.update(go=False))
 
-    if args.boot:
-        # Preview the boot splash on its own (loops until stopped).
-        frame = 0
-        while running["go"]:
-            fb.show(screen.render_boot(sysinfo.booting_units(), frame))
-            frame += 1
-            time.sleep(0.5)
-        return
-
     if args.once:
         fb.show(screen.render())
         return
 
+    # The Plymouth splash covers the boot window; the app goes straight to the
+    # live info screen and refreshes on the interval.
     try:
-        boot_splash(fb, screen, running)
         while running["go"]:
             start = time.monotonic()
             fb.show(screen.render())
@@ -209,25 +201,6 @@ def main() -> None:
             fb.show(screen.render_offline())
         except Exception:
             pass
-
-
-def boot_splash(fb, screen, running, timeout: float = 60.0) -> None:
-    """Show the booting splash until the network is up (or we give up).
-
-    This is the first thing painted once fb1 exists, so it replaces whatever
-    the LCD showed during boot. It lists services as they start and hands off
-    to the live info screen once an IP is assigned.
-    """
-    deadline = time.monotonic() + timeout
-    frame = 0
-    while (
-        running["go"]
-        and not sysinfo.ip_addresses()
-        and time.monotonic() < deadline
-    ):
-        fb.show(screen.render_boot(sysinfo.booting_units(), frame))
-        frame += 1
-        time.sleep(0.5)
 
 
 if __name__ == "__main__":

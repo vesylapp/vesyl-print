@@ -35,32 +35,3 @@ def primary_ip() -> str:
 
 def now() -> datetime:
     return datetime.now()
-
-
-def booting_units(limit: int = 3) -> list[str]:
-    """Units systemd is actively starting right now, newest first.
-
-    Parsed from `systemctl list-jobs`; the 'running' state means the unit's
-    start job is in progress (vs. 'waiting' which is queued behind ordering).
-    Returns friendly names with the '.service' suffix stripped.
-    """
-    try:
-        out = subprocess.run(
-            ["systemctl", "list-jobs", "--no-legend"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-
-    units = []
-    for line in out.splitlines():
-        parts = line.split()
-        # columns: JOB UNIT TYPE STATE
-        if len(parts) >= 4 and parts[2] == "start" and parts[3] == "running":
-            name = parts[1]
-            if name.endswith(".service"):
-                name = name[: -len(".service")]
-            units.append(name)
-    return units[:limit]
