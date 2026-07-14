@@ -191,5 +191,5 @@ def ensure_printer() -> str | None:
         return None
 
     # Newly provisioned — send a test page to confirm it works.
-    print_test_page(queue)
+    # print_test_page(queue)
     return _display_name(queue)
