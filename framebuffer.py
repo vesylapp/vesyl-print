@@ -46,6 +46,25 @@ class Framebuffer:
     def size(self) -> tuple[int, int]:
         return (self.width, self.height)
 
+    def capture(self) -> Image.Image:
+        """Read the current framebuffer contents as an RGB Pillow image."""
+        nbytes = self.stride * self.height
+        with open(self.device, "rb") as fb:
+            raw = fb.read(nbytes)
+        if len(raw) < nbytes:
+            raise RuntimeError(
+                f"{self.device}: short read {len(raw)} < {nbytes}"
+            )
+
+        row_px = self.stride // 2
+        arr = np.frombuffer(raw, dtype="<u2", count=self.height * row_px)
+        arr = arr.reshape((self.height, row_px))[:, : self.width]
+        r = ((arr >> 11) & 0x1F) << 3
+        g = ((arr >> 5) & 0x3F) << 2
+        b = (arr & 0x1F) << 3
+        rgb = np.stack([r, g, b], axis=-1).astype(np.uint8)
+        return Image.fromarray(rgb, "RGB")
+
     def show(self, image: Image.Image) -> None:
         """Blit a Pillow image to the framebuffer, converting to RGB565."""
         if image.size != self.size:

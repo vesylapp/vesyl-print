@@ -178,6 +178,37 @@ journalctl -u vesyl-print-agent -f
 
 Agent logs never include `device_token`.
 
+## Stream the LCD (demo)
+
+The **display service** streams the live UI as MJPEG on port **8765** (same
+frames it paints to the panel). On your laptop:
+
+```text
+http://10.0.0.28:8765/
+```
+
+| URL | Purpose |
+|-----|---------|
+| `/` | Full-page live view |
+| `/stream.mjpg` | Raw MJPEG |
+| `/snapshot.jpg` | Single frame |
+
+Options on `main.py` / the unit’s `ExecStart`:
+
+```bash
+python3 main.py                  # stream on (default)
+python3 main.py --no-stream      # LCD only
+python3 main.py --stream-port 8765 --stream-scale 2 --stream-fps 2
+```
+
+Standalone (polls `/dev/fb1` without embedding in the display loop):
+
+```bash
+python3 stream_lcd.py --port 8765
+```
+
+Only use on a trusted network (binds all interfaces by default).
+
 ## Development / tests
 
 ```bash

@@ -19,6 +19,13 @@ import statusio
 import sysinfo
 from config import load_config
 from framebuffer import Framebuffer
+from stream_lcd import (
+    DEFAULT_FPS,
+    DEFAULT_PORT,
+    DEFAULT_QUALITY,
+    DEFAULT_SCALE,
+    LcdStreamServer,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -287,6 +294,36 @@ def main() -> None:
         action="store_true",
         help="render the boot splash once and exit",
     )
+    ap.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="serve LCD MJPEG stream during the live loop (default: on)",
+    )
+    ap.add_argument(
+        "--stream-port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"MJPEG HTTP port (default {DEFAULT_PORT})",
+    )
+    ap.add_argument(
+        "--stream-fps",
+        type=float,
+        default=DEFAULT_FPS,
+        help="client stream rate (default 2)",
+    )
+    ap.add_argument(
+        "--stream-scale",
+        type=float,
+        default=DEFAULT_SCALE,
+        help="upscale for viewing (default 2)",
+    )
+    ap.add_argument(
+        "--stream-quality",
+        type=int,
+        default=DEFAULT_QUALITY,
+        help="JPEG quality (default 80)",
+    )
     args = ap.parse_args()
 
     cfg = load_config()
@@ -316,13 +353,29 @@ def main() -> None:
 
     threading.Thread(target=resolve_printers, daemon=True).start()
 
+    streamer: LcdStreamServer | None = None
+    if args.stream:
+        streamer = LcdStreamServer(
+            port=args.stream_port,
+            fps=args.stream_fps,
+            scale=args.stream_scale,
+            quality=args.stream_quality,
+            native_size=fb.size,
+        )
+        streamer.start()
+
     try:
         while running["go"]:
             start = time.monotonic()
-            fb.show(screen.render())
+            frame = screen.render()
+            fb.show(frame)
+            if streamer is not None:
+                streamer.publish(frame)
             elapsed = time.monotonic() - start
             time.sleep(max(0.0, args.interval - elapsed))
     finally:
+        if streamer is not None:
+            streamer.stop()
         try:
             fb.show(screen.render_offline())
         except Exception:
