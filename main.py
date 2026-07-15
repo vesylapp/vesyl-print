@@ -52,7 +52,8 @@ class InfoScreen:
         self.f_value = load_font(FONT_PATH, 26)
         self.f_footer = load_font(FONT_PATH, 16)
         self.logo = self._load_logo()
-        self.printer_name: str | None = None  # set once discovered
+        # Filled by the background CUPS discovery thread after startup.
+        self.printer_names: list[str] = []
 
     def _load_logo(self) -> Image.Image | None:
         try:
@@ -67,20 +68,30 @@ class InfoScreen:
         img, d = self._new()
         body_top = self._live_header(img, d)
 
-        # Spread the three info rows evenly between the header and footer.
-        footer_top = self.h - 52
-        row_span = footer_top - body_top
+        # Printer list sits above the status line (bottom-most name at h-48);
+        # stack additional names upward and let body rows use the space above.
+        printer_line_h = 18
+        n_printers = len(self.printer_names)
+        list_bottom = self.h - 48
+        if n_printers:
+            list_top = list_bottom - (n_printers - 1) * printer_line_h
+            footer_top = list_top - 8
+        else:
+            footer_top = self.h - 52
+
+        row_span = max(footer_top - body_top, 1)
         step = row_span / 3
         self._row(d, "HOSTNAME", sysinfo.hostname(), y=round(body_top))
         self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=round(body_top + step))
         self._row(d, "CPU TEMP", sysinfo.cpu_temp_c(), y=round(body_top + 2 * step))
 
-        # printer name, right-aligned just above the online status
-        if self.printer_name:
-            name = self._fit(d, self.printer_name, self.f_footer, self.w - 120)
+        # Network printers: vertical list, right-aligned above the online status.
+        max_name_w = self.w - 120
+        for i, raw in enumerate(self.printer_names):
+            name = self._fit(d, raw, self.f_footer, max_name_w)
             tw = d.textlength(name, font=self.f_footer)
-            d.text((self.w - 16 - tw, self.h - 48), name,
-                   font=self.f_footer, fill=MUTED)
+            y = list_bottom - (n_printers - 1 - i) * printer_line_h
+            d.text((self.w - 16 - tw, y), name, font=self.f_footer, fill=MUTED)
 
         self._status(d, "online", OK)
         return img
@@ -245,14 +256,14 @@ def main() -> None:
         fb.show(screen.render())
         return
 
-    # Resolve the network printer at load: use the configured one, or auto-add
-    # the first discovered printer if none is configured. Discovery browses the
-    # network (several seconds), so run it in a background thread to keep the
-    # display responsive; the name appears once it resolves.
-    def resolve_printer():
-        screen.printer_name = printers.ensure_printer()
+    # Poll CUPS for every network printer and auto-add any that are missing.
+    # Discovery browses the network (several seconds), so run it in a
+    # background thread to keep the display responsive; names appear once
+    # the scan finishes.
+    def resolve_printers():
+        screen.printer_names = printers.ensure_printers()
 
-    threading.Thread(target=resolve_printer, daemon=True).start()
+    threading.Thread(target=resolve_printers, daemon=True).start()
 
     # The Plymouth splash covers the boot window; the app goes straight to the
     # live info screen and refreshes on the interval.

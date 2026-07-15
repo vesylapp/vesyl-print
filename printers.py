@@ -1,9 +1,10 @@
 """Discover and provision network printers via CUPS.
 
-The app shows the current network printer, and — if none is configured —
-auto-adds the first one it discovers on the network (driverless / IPP
-Everywhere), naming the queue after the printer model. Requires membership
-in the 'lpadmin' group to add printers (no sudo needed).
+On startup the app polls CUPS for discoverable network printers and adds
+any that are not already configured (driverless / IPP Everywhere), naming
+each queue after the printer model. The live display lists every configured
+network printer. Requires membership in the 'lpadmin' group to add printers
+(no sudo needed).
 """
 
 from __future__ import annotations
@@ -35,29 +36,35 @@ def _is_network_uri(uri: str) -> bool:
     return "://" in uri and uri.split(":", 1)[0].lower() in _NETWORK_URI_SCHEMES
 
 
-# --- currently configured printer ------------------------------------------
+# --- currently configured printers -----------------------------------------
 
-def configured_printer() -> str | None:
-    """Display name (model/description) of the first configured network
-    queue, or None if there isn't one."""
-    queue = _first_network_queue()
-    return _display_name(queue) if queue else None
-
-
-def _first_network_queue() -> str | None:
-    """Name of the first CUPS queue with a network device URI, or None.
+def configured_network_queues() -> list[tuple[str, str]]:
+    """(queue_name, uri) for every CUPS queue with a network device URI.
 
     Parses `lpstat -v` lines of the form "device for <name>: <uri>".
     """
     out = _run(["lpstat", "-v"], 3)
     prefix = "device for "
+    queues: list[tuple[str, str]] = []
     for line in out.splitlines():
         if not line.startswith(prefix):
             continue
         name, _, uri = line[len(prefix):].partition(":")
-        if _is_network_uri(uri.strip()):
-            return name.strip()
-    return None
+        uri = uri.strip()
+        if _is_network_uri(uri):
+            queues.append((name.strip(), uri))
+    return queues
+
+
+def configured_printers() -> list[str]:
+    """Display names of all configured network queues (stable order)."""
+    return [_display_name(queue) for queue, _ in configured_network_queues()]
+
+
+def configured_printer() -> str | None:
+    """Display name of the first configured network queue, or None."""
+    names = configured_printers()
+    return names[0] if names else None
 
 
 # Driver names CUPS reports that aren't the real printer model. A driverless
@@ -88,12 +95,12 @@ def _display_name(queue: str) -> str:
 
 # --- discovery + provisioning ----------------------------------------------
 
-def discover_network_printer() -> tuple[str, str] | None:
-    """(device_uri, make_and_model) of the first discoverable network printer.
+def discover_network_printers() -> list[tuple[str, str]]:
+    """All discoverable network printers as (device_uri, make_and_model).
 
     Uses `lpinfo -l -v`, which browses the network (mDNS) and can take a few
     seconds. Skips backend placeholders (uri = "ipp", "socket", …) and
-    devices with an unknown model.
+    devices with an unknown model. Dedupes by URI.
     """
     out = _run(["lpinfo", "-l", "-v"], 25)
 
@@ -113,6 +120,8 @@ def discover_network_printer() -> tuple[str, str] | None:
     if current is not None:
         devices.append(current)
 
+    found: list[tuple[str, str]] = []
+    seen_uris: set[str] = set()
     for d in devices:
         uri = d.get("uri", "")
         model = d.get("make-and-model", "")
@@ -121,9 +130,17 @@ def discover_network_printer() -> tuple[str, str] | None:
             and _is_network_uri(uri)
             and model
             and model.lower() != "unknown"
+            and uri not in seen_uris
         ):
-            return uri, model
-    return None
+            seen_uris.add(uri)
+            found.append((uri, model))
+    return found
+
+
+def discover_network_printer() -> tuple[str, str] | None:
+    """(device_uri, make_and_model) of the first discoverable network printer."""
+    found = discover_network_printers()
+    return found[0] if found else None
 
 
 def _queue_name(model: str) -> str:
@@ -169,27 +186,32 @@ def print_test_page(queue: str) -> bool:
     return result.returncode == 0
 
 
-def ensure_printer() -> str | None:
-    """Display name of a network printer, provisioning one if none exists.
+def ensure_printers() -> list[str]:
+    """Ensure every discoverable network printer has a CUPS queue.
 
-    Returns the model/description to show, or None if nothing is configured
-    and nothing could be discovered. When it provisions a *new* printer, it
-    sends a test page. May block for several seconds while browsing the
-    network, so call this off the render loop.
+    Returns display names of all configured network printers (including any
+    that were already present). Discovery browses the network and can take
+    several seconds, so call this off the render loop.
     """
-    existing = configured_printer()
-    if existing:
-        return existing
+    existing = configured_network_queues()
+    existing_uris = {uri for _, uri in existing}
+    existing_names = {name for name, _ in existing}
 
-    found = discover_network_printer()
-    if not found:
-        return None
+    for uri, model in discover_network_printers():
+        if uri in existing_uris:
+            continue
+        queue = _queue_name(model)
+        if queue in existing_names:
+            continue
+        added = add_printer(uri, model)
+        if added:
+            existing_uris.add(uri)
+            existing_names.add(added)
 
-    uri, model = found
-    queue = add_printer(uri, model)
-    if not queue:
-        return None
+    return configured_printers()
 
-    # Newly provisioned — send a test page to confirm it works.
-    # print_test_page(queue)
-    return _display_name(queue)
+
+def ensure_printer() -> str | None:
+    """Back-compat: first network printer display name after ensure_printers()."""
+    names = ensure_printers()
+    return names[0] if names else None
