@@ -335,18 +335,21 @@ def run_agent(cfg: Config | None = None) -> None:
         return client.ws_ticket(creds_now.device_token)
 
     def ensure_cable(creds: auth.Credentials) -> cable.PrintCableSession | None:
+        """Start cable in the background. Never block on subscribe/stop."""
         if not cfg.cable_enabled or not cable.websocket_available():
             return None
         sess = cable_session_holder["s"]
         if sess and sess.subscribed:
             return sess
-        if sess and sess.connected and not sess.subscribed:
-            # Still handshaking
+        if sess and sess.connected:
+            # Handshake in progress — leave it alone.
             return sess
-
-        # (Re)connect with a fresh ticket
         if sess:
-            sess.stop()
+            # Dead/failed session — tear down without blocking the heartbeat loop.
+            try:
+                sess.stop()
+            except Exception:
+                pass
             cable_session_holder["s"] = None
 
         sess = cable.PrintCableSession(
@@ -358,9 +361,12 @@ def run_agent(cfg: Config | None = None) -> None:
             on_subscribed=lambda: log.info("cable PrintNodeChannel ready"),
             on_disconnected=lambda: log.info("cable disconnected"),
         )
-        if sess.start():
-            cable_session_holder["s"] = sess
-            return sess
+        try:
+            if sess.start():
+                cable_session_holder["s"] = sess
+                return sess
+        except Exception:
+            log.exception("cable start failed")
         return None
 
     creds = auth.load_credentials(cfg.credentials_path)
@@ -416,53 +422,10 @@ def run_agent(cfg: Config | None = None) -> None:
                         store=store,
                     )
 
-            # Maintain cable when paired
-            if creds and cfg.cable_enabled and cable.websocket_available():
-                need = (
-                    sess is None
-                    or not sess.connected
-                    or (not sess.subscribed and now >= cable_retry_after)
-                )
-                if need and now >= last_cable_try + 2.0:
-                    last_cable_try = now
-                    sess = ensure_cable(creds)
-                    if sess and not sess.subscribed:
-                        if not sess.wait_subscribed(timeout=8.0):
-                            log.warning("cable subscribe timeout — will retry")
-                            sess.stop()
-                            cable_session_holder["s"] = None
-                            sess = None
-                            cable_retry_after = now + min(60.0, backoff * 3)
-                            backoff = min(max_backoff, backoff * 2)
-                        else:
-                            backoff = 1.0
-                    elif sess is None:
-                        cable_retry_after = now + min(60.0, backoff * 3)
-                        backoff = min(max_backoff, backoff * 2)
-            else:
-                if sess:
-                    sess.stop()
-                    cable_session_holder["s"] = None
-                    sess = None
-
-            # Heartbeat: prefer channel when subscribed; always keep REST for LCD/status.
+            # REST heartbeat first — cable must never block liveness / LCD status.
             do_hb = (now - last_hb) >= hb_interval or last_hb == 0.0
             st: statusio.AgentStatus | None = None
             if do_hb:
-                if sess and sess.subscribed and creds:
-                    # Channel heartbeat flushes pending jobs server-side.
-                    try:
-                        inv = printers.inventory_payload()
-                    except Exception:
-                        inv = None
-                    sess.perform(
-                        "heartbeat",
-                        agent_version=AGENT_VERSION,
-                        hostname=sysinfo.hostname(),
-                        printers=inv,
-                    )
-                    last_cable_hb = time.monotonic()
-                    # Still REST-heartbeat for status.json / whoami refresh.
                 st = run_once(cfg, client)
                 last_hb = time.monotonic()
                 if st.cloud == "online":
@@ -471,24 +434,44 @@ def run_agent(cfg: Config | None = None) -> None:
                     backoff = min(max_backoff, max(backoff, 1.0) * 2)
             else:
                 st = statusio.read_status(cfg.status_path)
-                # Mid-interval cable heartbeat if subscribed (keeps node online + flush)
-                if (
-                    sess
-                    and sess.subscribed
-                    and creds
-                    and (now - last_cable_hb) >= hb_interval
-                ):
+
+            # Maintain cable in the background when paired (non-blocking).
+            if creds and cfg.cable_enabled and cable.websocket_available():
+                need = sess is None or not sess.connected
+                if need and now >= last_cable_try + 5.0 and now >= cable_retry_after:
+                    last_cable_try = now
                     try:
-                        inv = printers.inventory_payload()
+                        sess = ensure_cable(creds)
+                        if sess is None:
+                            cable_retry_after = now + min(60.0, max(10.0, backoff * 3))
+                            backoff = min(max_backoff, backoff * 2)
                     except Exception:
-                        inv = None
-                    sess.perform(
-                        "heartbeat",
-                        agent_version=AGENT_VERSION,
-                        hostname=sysinfo.hostname(),
-                        printers=inv,
-                    )
-                    last_cable_hb = time.monotonic()
+                        log.exception("cable ensure failed")
+                        cable_retry_after = now + 30.0
+                        sess = cable_session_holder["s"]
+                elif sess and sess.subscribed:
+                    backoff = 1.0
+                    # Channel heartbeat (flush pending) alongside REST.
+                    if (now - last_cable_hb) >= hb_interval:
+                        try:
+                            inv = printers.inventory_payload()
+                        except Exception:
+                            inv = None
+                        if sess.perform(
+                            "heartbeat",
+                            agent_version=AGENT_VERSION,
+                            hostname=sysinfo.hostname(),
+                            printers=inv,
+                        ):
+                            last_cable_hb = time.monotonic()
+            else:
+                if sess:
+                    try:
+                        sess.stop()
+                    except Exception:
+                        pass
+                    cable_session_holder["s"] = None
+                    sess = None
 
             # REST pull safety net
             pull_every = (
@@ -526,16 +509,18 @@ def run_agent(cfg: Config | None = None) -> None:
             # Sleep
             if push_jobs.qsize() > 0:
                 sleep_for = 0.05
-            elif cfg.pull_jobs_enabled and creds and (
-                st is None or st.pairing == "paired"
-            ):
-                sleep_for = min(float(pull_interval), 1.0 if (sess and sess.subscribed) else float(pull_interval))
             elif st and st.pairing == "unpaired":
                 sleep_for = min(10.0, float(hb_interval))
             elif st and st.pairing == "revoked":
                 sleep_for = min(30.0, float(hb_interval))
             elif st and st.cloud == "offline":
-                sleep_for = min(max_backoff, max(float(hb_interval), backoff))
+                # Reconnect quickly after failures; still respect backoff cap.
+                sleep_for = min(max_backoff, max(5.0, backoff))
+            elif cfg.pull_jobs_enabled and creds:
+                sleep_for = min(
+                    float(pull_interval),
+                    1.0 if (sess and sess.subscribed) else float(pull_interval),
+                )
             else:
                 sleep_for = float(hb_interval)
 

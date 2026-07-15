@@ -205,5 +205,34 @@ class TestConfigCable(unittest.TestCase):
         self.assertTrue(cfg.cable_url.endswith("/print/cable"))
 
 
+class TestSessionStartNoDeadlock(unittest.TestCase):
+    def test_start_does_not_deadlock_without_ws(self):
+        """Regression: start() used to call stop() under a non-reentrant Lock."""
+        calls = []
+
+        def get_ticket():
+            calls.append("ticket")
+            return {"ticket": "t", "expires_in": 60, "cable_path": "/print/cable"}
+
+        sess = cable.PrintCableSession(
+            cable_url="wss://example/print/cable",
+            get_ticket=get_ticket,
+            on_print_job=lambda j: None,
+        )
+        # Even if websocket is missing, start must return (not hang).
+        with mock.patch.object(cable, "_HAS_WS", False):
+            ok = sess.start()
+        self.assertFalse(ok)
+        # With WS available but client start mocked, must still return promptly.
+        with mock.patch.object(cable, "_HAS_WS", True):
+            with mock.patch.object(
+                cable.ActionCableClient, "start", lambda self: None
+            ):
+                ok = sess.start()
+        self.assertTrue(ok)
+        self.assertEqual(calls, ["ticket"])
+        sess.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

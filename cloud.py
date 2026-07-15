@@ -87,16 +87,19 @@ class CloudClient:
             "Accept": "application/json",
             "User-Agent": "vesyl-print-agent",
         }
-        if body is not None:
-            data = json.dumps(body).encode("utf-8")
+        # Always send a body for POST/PUT/PATCH so urllib never downgrades to GET
+        # (a GET on /heartbeat yields Rails RoutingError "Not Found").
+        method_u = method.upper()
+        if body is not None or method_u in ("POST", "PUT", "PATCH"):
+            data = json.dumps(body if body is not None else {}).encode("utf-8")
             headers["Content-Type"] = "application/json"
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
         req = urllib.request.Request(
-            self._url(path), data=data, headers=headers, method=method
+            self._url(path), data=data, headers=headers, method=method_u
         )
-        log.debug("%s %s", method, path)
+        log.debug("%s %s", method_u, path)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read()

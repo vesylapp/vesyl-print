@@ -28,7 +28,7 @@ try:
     import websocket  # type: ignore[import-untyped]
 
     _HAS_WS = True
-except ImportError:  # pragma: no cover - env without package
+except ImportError:  # pragma: no cover
     websocket = None  # type: ignore[assignment]
     _HAS_WS = False
 
@@ -56,7 +56,8 @@ EventHandler = Callable[[], None]
 class ActionCableClient:
     """Background WebSocket client for PrintNodeChannel.
 
-    Thread-safe: callbacks run on the WS thread — keep them short or enqueue work.
+    Callbacks run on the WS thread — keep them short or enqueue work.
+    ``stop()`` never blocks the caller more than a short join timeout.
     """
 
     def __init__(
@@ -67,14 +68,12 @@ class ActionCableClient:
         on_connected: EventHandler | None = None,
         on_disconnected: EventHandler | None = None,
         on_subscribed: EventHandler | None = None,
-        reconnect: bool = False,
     ):
         self._url = url
         self._on_message = on_message
         self._on_connected = on_connected
         self._on_disconnected = on_disconnected
         self._on_subscribed = on_subscribed
-        self._reconnect = reconnect
 
         self._ws: Any = None
         self._thread: threading.Thread | None = None
@@ -101,27 +100,46 @@ class ActionCableClient:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._subscribed.clear()
+        self._connected.clear()
         self._thread = threading.Thread(
             target=self._run, name="vesyl-print-cable", daemon=True
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 2.0) -> None:
+        """Signal the socket to close. Never hang the agent main loop."""
         self._stop.set()
         self._subscribed.clear()
         ws = self._ws
         if ws is not None:
             try:
-                ws.close()
+                # Prefer closing the underlying sock; WebSocketApp.close can hang.
+                sock = getattr(ws, "sock", None)
+                if sock is not None:
+                    try:
+                        sock.shutdown(2)  # SHUT_RDWR
+                    except Exception:
+                        pass
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                ws.keep_running = False
+                try:
+                    ws.close()
+                except Exception:
+                    pass
             except Exception:
                 pass
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
+        thr = self._thread
+        if thr and thr.is_alive() and thr is not threading.current_thread():
+            thr.join(timeout=timeout)
         self._connected.clear()
         self._thread = None
         self._ws = None
 
-    def wait_subscribed(self, timeout: float = 15.0) -> bool:
+    def wait_subscribed(self, timeout: float = 10.0) -> bool:
         return self._subscribed.wait(timeout=timeout)
 
     def perform(self, action: str, **data: Any) -> None:
@@ -138,42 +156,42 @@ class ActionCableClient:
         raw = json.dumps(obj, separators=(",", ":"))
         with self._send_lock:
             ws = self._ws
-            if ws is None:
+            if ws is None or self._stop.is_set():
                 raise RuntimeError("cable not connected")
             ws.send(raw)
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self._connect_once()
-            except Exception:
+        assert websocket is not None
+        if self._stop.is_set():
+            return
+        log.info("cable connecting")
+        try:
+            self._ws = websocket.WebSocketApp(
+                self._url,
+                header=[],
+                on_open=self._on_open,
+                on_message=self._on_ws_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
+            )
+            # Short ping keeps dead peers from hanging forever; sockopt timeouts help.
+            self._ws.run_forever(
+                ping_interval=25,
+                ping_timeout=10,
+                skip_utf8_validation=True,
+            )
+        except Exception:
+            if not self._stop.is_set():
                 log.exception("cable connection error")
+        finally:
             self._connected.clear()
             self._subscribed.clear()
-            if self._on_disconnected:
+            self._ws = None
+            if self._on_disconnected and not self._stop.is_set():
                 try:
                     self._on_disconnected()
                 except Exception:
                     log.debug("on_disconnected failed", exc_info=True)
-            if self._stop.is_set() or not self._reconnect:
-                break
-            time.sleep(2.0)
-
-    def _connect_once(self) -> None:
-        assert websocket is not None
-        log.info("cable connecting")
-        # disable Origin header — print cable allows Origin-less device clients
-        headers = []
-        self._ws = websocket.WebSocketApp(
-            self._url,
-            header=headers,
-            on_open=self._on_open,
-            on_message=self._on_ws_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-        )
-        # run_forever blocks until close
-        self._ws.run_forever(ping_interval=0, ping_timeout=None)
 
     def _on_open(self, _ws: Any) -> None:
         log.info("cable socket open — waiting for welcome")
@@ -232,7 +250,6 @@ class ActionCableClient:
             self._subscribed.clear()
             return
 
-        # Application message: { identifier, message: {...} }
         if "message" in data:
             msg = data["message"]
             if isinstance(msg, dict) and self._on_message:
@@ -253,7 +270,7 @@ class ActionCableClient:
 
 
 class PrintCableSession:
-    """High-level session: ticket → connect → PrintNodeChannel, with job queue."""
+    """High-level session: ticket → connect → PrintNodeChannel."""
 
     def __init__(
         self,
@@ -274,7 +291,8 @@ class PrintCableSession:
         self._on_subscribed = on_subscribed
         self._on_disconnected = on_disconnected
         self._client: ActionCableClient | None = None
-        self._lock = threading.Lock()
+        # RLock: start() stops any existing client while already holding the lock.
+        self._lock = threading.RLock()
 
     @property
     def subscribed(self) -> bool:
@@ -287,12 +305,16 @@ class PrintCableSession:
         return bool(c and c.connected)
 
     def start(self) -> bool:
-        """Fetch ticket and start client. Returns False if WS unavailable."""
+        """Fetch ticket and start client (non-blocking handshake).
+
+        Returns False if WS unavailable or ticket fails. Does **not** wait for
+        subscription — poll ``subscribed`` or call ``wait_subscribed``.
+        """
         if not _HAS_WS:
             log.warning("cable: websocket-client not installed — push disabled")
             return False
         with self._lock:
-            self.stop()
+            self._stop_unlocked()
             try:
                 ticket_payload = self._get_ticket()
             except Exception as e:
@@ -302,23 +324,29 @@ class PrintCableSession:
             if not ticket:
                 log.warning("cable: ws_ticket response missing ticket")
                 return False
-            # Prefer server-provided path if absolute URL not given; keep config cable_url.
             url = build_cable_connect_url(self._cable_url, str(ticket))
             self._client = ActionCableClient(
                 url,
                 on_message=self._dispatch_message,
                 on_subscribed=self._on_subscribed,
                 on_disconnected=self._on_disconnected,
-                reconnect=False,  # agent reconnects with a fresh ticket
             )
-            self._client.start()
+            try:
+                self._client.start()
+            except Exception as e:
+                log.warning("cable: start failed: %s", e)
+                self._client = None
+                return False
         return True
+
+    def _stop_unlocked(self) -> None:
+        if self._client:
+            self._client.stop(timeout=1.5)
+            self._client = None
 
     def stop(self) -> None:
         with self._lock:
-            if self._client:
-                self._client.stop()
-                self._client = None
+            self._stop_unlocked()
 
     def perform(self, action: str, **data: Any) -> bool:
         c = self._client
@@ -331,7 +359,7 @@ class PrintCableSession:
             log.warning("cable perform %s failed: %s", action, e)
             return False
 
-    def wait_subscribed(self, timeout: float = 15.0) -> bool:
+    def wait_subscribed(self, timeout: float = 10.0) -> bool:
         c = self._client
         if not c:
             return False
