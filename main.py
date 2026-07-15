@@ -24,8 +24,9 @@ FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 LOGO_PATH = os.path.join(BASE_DIR, "assets", "logo.png")
 
 # logo header sizing
-LOGO_WIDTH = 270  # rendered width on screen (aspect preserved)
-LOGO_TOP = 16
+LOGO_WIDTH = 240  # rendered width on screen (aspect preserved)
+LOGO_TOP = 14
+LOGO_LEFT = 16
 
 # colors
 BG = (16, 18, 24)
@@ -44,7 +45,8 @@ class InfoScreen:
     def __init__(self, fb: Framebuffer):
         self.fb = fb
         self.w, self.h = fb.size
-        self.f_clock = load_font(FONT_BOLD, 60)
+        self.f_clock = load_font(FONT_BOLD, 28)
+        self.f_date = load_font(FONT_PATH, 14)
         self.f_head = load_font(FONT_BOLD, 42)
         self.f_label = load_font(FONT_BOLD, 18)
         self.f_value = load_font(FONT_PATH, 26)
@@ -63,21 +65,17 @@ class InfoScreen:
     def render(self) -> Image.Image:
         """Live screen: clock, hostname, IP, CPU temp and an 'online' status."""
         img, d = self._new()
-        self._header(img, d, accent=ACCENT)
+        body_top = self._live_header(img, d)
 
-        now = sysinfo.now()
-        # Vertical stack is tight on the 480×320 panel; keep rows compact so
-        # hostname, IP and CPU temp all fit above the footer.
-        self._centered(d, now.strftime("%H:%M:%S"), self.f_clock, y=88, fill=FG)
-        self._centered(
-            d, now.strftime("%A, %d %B %Y"), self.f_footer, y=150, fill=MUTED
-        )
-        self._row(d, "HOSTNAME", sysinfo.hostname(), y=180)
-        self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=224)
-        self._row(d, "CPU TEMP", sysinfo.cpu_temp_c(), y=268)
+        # Spread the three info rows evenly between the header and footer.
+        footer_top = self.h - 52
+        row_span = footer_top - body_top
+        step = row_span / 3
+        self._row(d, "HOSTNAME", sysinfo.hostname(), y=round(body_top))
+        self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=round(body_top + step))
+        self._row(d, "CPU TEMP", sysinfo.cpu_temp_c(), y=round(body_top + 2 * step))
 
-        # printer name, right-aligned just above the online status; truncated
-        # so it stays clear of the left-aligned CPU value
+        # printer name, right-aligned just above the online status
         if self.printer_name:
             name = self._fit(d, self.printer_name, self.f_footer, self.w - 120)
             tw = d.textlength(name, font=self.f_footer)
@@ -116,7 +114,7 @@ class InfoScreen:
         return img, ImageDraw.Draw(img)
 
     def _header(self, img, d, accent):
-        """Logo (centered) with a divider line in the given accent color."""
+        """Centered logo (splash/offline) with a divider in the accent color."""
         if self.logo is not None:
             lx = (self.w - self.logo.width) // 2
             img.paste(self.logo, (lx, LOGO_TOP), self.logo)
@@ -125,6 +123,42 @@ class InfoScreen:
             self._centered(d, "VESYL PRINT", self.f_label, y=20, fill=accent)
             divider_y = 52
         d.rectangle([40, divider_y, self.w - 40, divider_y + 2], fill=accent)
+
+    def _live_header(self, img, d) -> int:
+        """Logo left + compact clock/date right; returns y where body rows start."""
+        now = sysinfo.now()
+        clock = now.strftime("%H:%M:%S")
+        date = now.strftime("%a, %d %b %Y")
+
+        if self.logo is not None:
+            img.paste(self.logo, (LOGO_LEFT, LOGO_TOP), self.logo)
+            header_bottom = LOGO_TOP + self.logo.height
+        else:
+            d.text((LOGO_LEFT, LOGO_TOP + 4), "VESYL PRINT",
+                   font=self.f_label, fill=ACCENT)
+            header_bottom = LOGO_TOP + 28
+
+        # Right-align clock + date in the header band beside the logo.
+        # textbbox top can be non-zero; measure ink heights and leave a clear gap.
+        clock_bbox = d.textbbox((0, 0), clock, font=self.f_clock)
+        date_bbox = d.textbbox((0, 0), date, font=self.f_date)
+        clock_h = clock_bbox[3] - clock_bbox[1]
+        date_h = date_bbox[3] - date_bbox[1]
+        gap = 8
+        stack_h = clock_h + gap + date_h
+        # Vertically center the stack against the logo band.
+        band_top = LOGO_TOP
+        band_h = max(header_bottom - LOGO_TOP, stack_h)
+        stack_y = band_top + (band_h - stack_h) // 2
+        self._right(d, clock, self.f_clock, y=stack_y, fill=FG, pad=16)
+        self._right(
+            d, date, self.f_date, y=stack_y + clock_h + gap, fill=MUTED, pad=16
+        )
+
+        header_bottom = max(header_bottom, stack_y + stack_h)
+        divider_y = header_bottom + 10
+        d.rectangle([40, divider_y, self.w - 40, divider_y + 2], fill=ACCENT)
+        return divider_y + 16
 
     def _status(self, d, text, color):
         """Right-aligned footer: label with a colored dot to its left."""
@@ -144,6 +178,10 @@ class InfoScreen:
     def _centered(self, d, text, font, y, fill):
         w = d.textlength(text, font=font)
         d.text(((self.w - w) / 2, y), text, font=font, fill=fill)
+
+    def _right(self, d, text, font, y, fill, pad: int = 16):
+        w = d.textlength(text, font=font)
+        d.text((self.w - pad - w, y), text, font=font, fill=fill)
 
     def _row(self, d, label, value, y):
         d.text((16, y), label, font=self.f_label, fill=MUTED)
