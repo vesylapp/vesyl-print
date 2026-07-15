@@ -1,7 +1,7 @@
-"""VESYL print device — system info display.
+"""VESYL print device — system info + cloud pairing status display.
 
-Renders time, hostname, IP address and CPU temp to the 3.5" LCD (/dev/fb1)
-and refreshes once a second. Run with:  python3 main.py
+Renders time, host info, printers and cloud pairing state to the 3.5" LCD
+(/dev/fb1) and refreshes once a second. Run with:  python3 main.py
 """
 
 from __future__ import annotations
@@ -15,7 +15,9 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 
 import printers
+import statusio
 import sysinfo
+from config import load_config
 from framebuffer import Framebuffer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,8 +35,9 @@ BG = (16, 18, 24)
 ACCENT = (237, 252, 51)  # VESYL yellow-green, matches logo mark
 FG = (235, 238, 245)
 MUTED = (140, 148, 165)
-OK = (80, 220, 120)  # online status
-DOWN = (232, 72, 72)  # disconnected status
+OK = (80, 220, 120)  # online / paired cloud
+DOWN = (232, 72, 72)  # disconnected / revoked
+WARN = (255, 180, 60)  # unpaired
 
 
 def load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
@@ -42,7 +45,7 @@ def load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
 
 
 class InfoScreen:
-    def __init__(self, fb: Framebuffer):
+    def __init__(self, fb: Framebuffer, status_path: str | None = None):
         self.fb = fb
         self.w, self.h = fb.size
         self.f_clock = load_font(FONT_BOLD, 28)
@@ -51,9 +54,11 @@ class InfoScreen:
         self.f_label = load_font(FONT_BOLD, 18)
         self.f_value = load_font(FONT_PATH, 26)
         self.f_footer = load_font(FONT_PATH, 16)
+        self.f_hint = load_font(FONT_PATH, 15)
         self.logo = self._load_logo()
         # Filled by the background CUPS discovery thread after startup.
         self.printer_names: list[str] = []
+        self.status_path = status_path
 
     def _load_logo(self) -> Image.Image | None:
         try:
@@ -63,13 +68,70 @@ class InfoScreen:
         h = round(LOGO_WIDTH * logo.height / logo.width)
         return logo.resize((LOGO_WIDTH, h), Image.LANCZOS)
 
+    def _agent_status(self) -> statusio.AgentStatus | None:
+        if not self.status_path:
+            return None
+        return statusio.read_status(self.status_path)
+
     def render(self) -> Image.Image:
-        """Live screen: clock, hostname, IP, CPU temp and an 'online' status."""
+        """Live screen: host info, printers, cloud pairing status."""
         img, d = self._new()
         body_top = self._live_header(img, d)
+        st = self._agent_status()
+        pairing = st.pairing if st else "unpaired"
+        cloud = st.cloud if st else "unknown"
 
-        # Printer list sits above the status line (bottom-most name at h-48);
-        # stack additional names upward and let body rows use the space above.
+        if pairing == "revoked":
+            return self._render_revoked(img, d, body_top, st)
+        if pairing != "paired":
+            return self._render_unpaired(img, d, body_top)
+
+        return self._render_paired(img, d, body_top, st, cloud)
+
+    def _render_unpaired(self, img, d, body_top: int) -> Image.Image:
+        y = body_top
+        self._centered(d, "Unpaired", self.f_label, y=y, fill=WARN)
+        y += 28
+        self._centered(
+            d, "claim: vesyl-print claim <CODE>", self.f_hint, y=y, fill=MUTED
+        )
+        y += 36
+        self._row(d, "HOSTNAME", sysinfo.hostname(), y=y)
+        y += 56
+        self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=y)
+
+        self._status(d, "unpaired", WARN)
+        return img
+
+    def _render_revoked(
+        self, img, d, body_top: int, st: statusio.AgentStatus | None
+    ) -> Image.Image:
+        y = body_top
+        self._centered(d, "Revoked", self.f_label, y=y, fill=DOWN)
+        y += 28
+        self._centered(d, "re-pair required", self.f_hint, y=y, fill=MUTED)
+        y += 26
+        self._centered(
+            d, "vesyl-print claim <CODE>", self.f_hint, y=y, fill=MUTED
+        )
+        y += 36
+        if st and st.organization_name:
+            self._row(d, "WAS", st.organization_name, y=y)
+            y += 56
+        self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=y)
+
+        self._status(d, "revoked", DOWN)
+        return img
+
+    def _render_paired(
+        self,
+        img,
+        d,
+        body_top: int,
+        st: statusio.AgentStatus | None,
+        cloud: str,
+    ) -> Image.Image:
+        # Printer list sits above the status line; body rows share the rest.
         printer_line_h = 18
         n_printers = len(self.printer_names)
         list_bottom = self.h - 48
@@ -79,13 +141,16 @@ class InfoScreen:
         else:
             footer_top = self.h - 52
 
-        row_span = max(footer_top - body_top, 1)
-        step = row_span / 3
-        self._row(d, "HOSTNAME", sysinfo.hostname(), y=round(body_top))
-        self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=round(body_top + step))
-        self._row(d, "CPU TEMP", sysinfo.cpu_temp_c(), y=round(body_top + 2 * step))
+        org = (st.organization_name if st else None) or "—"
+        wh = (st.warehouse_name if st else None) or "—"
 
-        # Network printers: vertical list, right-aligned above the online status.
+        row_span = max(footer_top - body_top, 1)
+        step = row_span / 4
+        self._row(d, "ORGANIZATION", org, y=round(body_top))
+        self._row(d, "WAREHOUSE", wh, y=round(body_top + step))
+        self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=round(body_top + 2 * step))
+        self._row(d, "CPU TEMP", sysinfo.cpu_temp_c(), y=round(body_top + 3 * step))
+
         max_name_w = self.w - 120
         for i, raw in enumerate(self.printer_names):
             name = self._fit(d, raw, self.f_footer, max_name_w)
@@ -93,17 +158,14 @@ class InfoScreen:
             y = list_bottom - (n_printers - 1 - i) * printer_line_h
             d.text((self.w - 16 - tw, y), name, font=self.f_footer, fill=MUTED)
 
-        self._status(d, "online", OK)
+        if cloud == "online":
+            self._status(d, "cloud", OK)
+        else:
+            self._status(d, "cloud offline", DOWN)
         return img
 
     def render_splash(self) -> Image.Image:
-        """Static boot splash (logo + 'booting…').
-
-        This is what the Plymouth boot screen shows: it is rendered once to
-        assets/plymouth-splash.png and installed as the Plymouth theme image
-        by setup.sh. Keeping it here lets the asset be regenerated if the
-        logo or theme changes.
-        """
+        """Static boot splash (logo + 'booting…')."""
         img, d = self._new()
         self._header(img, d, accent=ACCENT)
         self._centered(d, "booting...", self.f_head, y=128, fill=FG)
@@ -149,15 +211,12 @@ class InfoScreen:
                    font=self.f_label, fill=ACCENT)
             header_bottom = LOGO_TOP + 28
 
-        # Right-align clock + date in the header band beside the logo.
-        # textbbox top can be non-zero; measure ink heights and leave a clear gap.
         clock_bbox = d.textbbox((0, 0), clock, font=self.f_clock)
         date_bbox = d.textbbox((0, 0), date, font=self.f_date)
         clock_h = clock_bbox[3] - clock_bbox[1]
         date_h = date_bbox[3] - date_bbox[1]
         gap = 8
         stack_h = clock_h + gap + date_h
-        # Vertically center the stack against the logo band.
         band_top = LOGO_TOP
         band_h = max(header_bottom - LOGO_TOP, stack_h)
         stack_y = band_top + (band_h - stack_h) // 2
@@ -200,11 +259,7 @@ class InfoScreen:
 
 
 def open_framebuffer(device: str, wait: float = 0.0) -> Framebuffer:
-    """Open the framebuffer, optionally retrying until it appears.
-
-    During early boot the splash can start before the kernel has created
-    /dev/fb1, so wait up to `wait` seconds for it.
-    """
+    """Open the framebuffer, optionally retrying until it appears."""
     deadline = time.monotonic() + wait
     while True:
         try:
@@ -234,12 +289,12 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    # The LCD's SPI driver loads late in boot (fb1 appears ~15-20s in), so the
-    # service can start before the device exists — wait for it. Manual one-shot
-    # modes fail fast instead of hanging.
+    cfg = load_config()
+    status_path = str(cfg.status_path)
+
     manual = args.once or args.offline or args.splash
     fb = open_framebuffer(args.device, wait=0.0 if manual else 30.0)
-    screen = InfoScreen(fb)
+    screen = InfoScreen(fb, status_path=status_path)
 
     if args.offline:
         fb.show(screen.render_offline())
@@ -256,17 +311,11 @@ def main() -> None:
         fb.show(screen.render())
         return
 
-    # Poll CUPS for every network printer and auto-add any that are missing.
-    # Discovery browses the network (several seconds), so run it in a
-    # background thread to keep the display responsive; names appear once
-    # the scan finishes.
     def resolve_printers():
         screen.printer_names = printers.ensure_printers()
 
     threading.Thread(target=resolve_printers, daemon=True).start()
 
-    # The Plymouth splash covers the boot window; the app goes straight to the
-    # live info screen and refreshes on the interval.
     try:
         while running["go"]:
             start = time.monotonic()
@@ -274,9 +323,6 @@ def main() -> None:
             elapsed = time.monotonic() - start
             time.sleep(max(0.0, args.interval - elapsed))
     finally:
-        # Graceful stop or unhandled crash: leave a disconnected screen behind.
-        # (A hard kill -9 / segfault can't run this — systemd ExecStopPost
-        # paints the same screen for that case.)
         try:
             fb.show(screen.render_offline())
         except Exception:

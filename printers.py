@@ -215,3 +215,17 @@ def ensure_printer() -> str | None:
     """Back-compat: first network printer display name after ensure_printers()."""
     names = ensure_printers()
     return names[0] if names else None
+
+
+def inventory_payload() -> list[dict[str, str]]:
+    """CUPS network printer inventory for heartbeat (server may ignore for now)."""
+    items: list[dict[str, str]] = []
+    for queue, uri in configured_network_queues():
+        items.append(
+            {
+                "cups_name": queue,
+                "uri": uri,
+                "display_name": _display_name(queue),
+            }
+        )
+    return items

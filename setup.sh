@@ -7,7 +7,9 @@
 #   1. installs the Python/font dependencies the app needs,
 #   2. enables SPI + the mhs35 display overlay in the boot config,
 #   3. installs the mhs35 device-tree overlay if the OS doesn't have it,
-#   4. installs and enables the systemd service that drives the display.
+#   4. creates /etc/vesyl-print + /var/lib/vesyl-print,
+#   5. installs and enables the LCD + cloud agent systemd services,
+#   6. installs the vesyl-print CLI wrapper.
 #
 # Usage:  sudo ./setup.sh
 #
@@ -26,9 +28,13 @@ RUN_USER="${SUDO_USER:-}"
 if [[ -z "$RUN_USER" || "$RUN_USER" == "root" ]]; then
     RUN_USER="$(stat -c '%U' "$REPO_DIR")"
 fi
+RUN_GROUP="$(id -gn "$RUN_USER")"
 
-SERVICE_NAME="printserve-display"
-UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+DISPLAY_SERVICE="printserve-display"
+AGENT_SERVICE="vesyl-print-agent"
+DISPLAY_UNIT="/etc/systemd/system/${DISPLAY_SERVICE}.service"
+AGENT_UNIT="/etc/systemd/system/${AGENT_SERVICE}.service"
+CLI_PATH="/usr/local/bin/vesyl-print"
 
 echo "==> Repo:        $REPO_DIR"
 echo "==> Run as user: $RUN_USER"
@@ -81,10 +87,6 @@ ensure_line "dtparam=spi=on"
 ensure_line "dtoverlay=mhs35:rotate=90"
 
 # --- 3b. boot splash (replace the Raspberry Pi Plymouth splash) ------------
-# The LCD's SPI driver loads ~15-20s into boot; until then the panel can't
-# show anything. Once it appears, Plymouth's splash is what's on screen until
-# the app starts, so we swap in a VESYL splash. Plymouth caches theme assets
-# from the initramfs, so the image change only takes effect after rebuilding.
 PIX_THEME=/usr/share/plymouth/themes/pix
 if [[ -d "$PIX_THEME" && -f "$REPO_DIR/assets/plymouth-splash.png" ]]; then
     if ! cmp -s "$REPO_DIR/assets/plymouth-splash.png" "$PIX_THEME/splash.png"; then
@@ -101,9 +103,41 @@ else
     echo "==> Skipping splash (pix theme or splash asset not found)"
 fi
 
-# --- 4. systemd service ----------------------------------------------------
-echo "==> Installing systemd unit: $UNIT_PATH"
-cat > "$UNIT_PATH" <<UNIT
+# --- 4. config + state dirs ------------------------------------------------
+echo "==> Creating /etc/vesyl-print and /var/lib/vesyl-print"
+install -d -o "$RUN_USER" -g "$RUN_GROUP" -m 0755 /etc/vesyl-print
+install -d -o "$RUN_USER" -g "$RUN_GROUP" -m 0755 /var/lib/vesyl-print
+install -d -o "$RUN_USER" -g "$RUN_GROUP" -m 0755 /var/lib/vesyl-print/queue
+install -d -o "$RUN_USER" -g "$RUN_GROUP" -m 0755 /var/lib/vesyl-print/processed
+
+if [[ ! -f /etc/vesyl-print/config.json ]]; then
+    cat > /etc/vesyl-print/config.json <<'CFG'
+{
+  "api_base_url": "https://wms.api.staging.vesyl.com",
+  "cable_url": "wss://wms.api.staging.vesyl.com/print/cable",
+  "heartbeat_seconds": 30,
+  "pull_interval_seconds": 5,
+  "pull_jobs_enabled": false
+}
+CFG
+    chown "$RUN_USER:$RUN_GROUP" /etc/vesyl-print/config.json
+    chmod 0644 /etc/vesyl-print/config.json
+    echo "   wrote /etc/vesyl-print/config.json"
+else
+    echo "   config.json already present"
+fi
+
+# --- 5. CLI wrapper --------------------------------------------------------
+echo "==> Installing CLI: $CLI_PATH"
+cat > "$CLI_PATH" <<WRAP
+#!/usr/bin/env bash
+exec /usr/bin/python3 "$REPO_DIR/cli.py" "\$@"
+WRAP
+chmod 0755 "$CLI_PATH"
+
+# --- 6. systemd services ---------------------------------------------------
+echo "==> Installing systemd unit: $DISPLAY_UNIT"
+cat > "$DISPLAY_UNIT" <<UNIT
 [Unit]
 Description=VESYL Print — LCD system info display
 # Wait until Plymouth has quit before painting, so the app doesn't fight the
@@ -124,16 +158,42 @@ RestartSec=3
 WantedBy=multi-user.target
 UNIT
 
+echo "==> Installing systemd unit: $AGENT_UNIT"
+cat > "$AGENT_UNIT" <<UNIT
+[Unit]
+Description=VESYL Print — cloud agent (heartbeat / pairing)
+After=network-online.target cups.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$RUN_USER
+WorkingDirectory=$REPO_DIR
+ExecStart=/usr/bin/python3 $REPO_DIR/agent.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
+systemctl enable "$DISPLAY_SERVICE"
+systemctl enable "$AGENT_SERVICE"
 
 echo
 echo "==> Done."
-echo "   Service '$SERVICE_NAME' is enabled and will start on boot."
+echo "   Services enabled: $DISPLAY_SERVICE, $AGENT_SERVICE"
+echo "   CLI: $CLI_PATH"
+echo "   Pair with:  vesyl-print claim <CODE>"
+echo "   Status:     vesyl-print status --check"
 if [[ -e /dev/fb1 ]]; then
-    echo "   /dev/fb1 present — starting now."
-    systemctl restart "$SERVICE_NAME"
+    echo "   /dev/fb1 present — starting services now."
+    systemctl restart "$DISPLAY_SERVICE"
+    systemctl restart "$AGENT_SERVICE"
 else
     echo "   /dev/fb1 not present yet — REBOOT to load the display driver:"
     echo "     sudo reboot"
+    systemctl restart "$AGENT_SERVICE" || true
 fi

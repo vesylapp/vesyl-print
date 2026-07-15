@@ -10,9 +10,9 @@ After=plymouth-quit-wait.service
 [Service]
 Type=simple
 User=vesyl
-WorkingDirectory=/home/vesyl/printserve
-ExecStart=/usr/bin/python3 /home/vesyl/printserve/main.py
-ExecStopPost=/usr/bin/python3 /home/vesyl/printserve/main.py --offline
+WorkingDirectory=/home/vesyl/vesyl-print
+ExecStart=/usr/bin/python3 /home/vesyl/vesyl-print/main.py
+ExecStopPost=/usr/bin/python3 /home/vesyl/vesyl-print/main.py --offline
 Restart=on-failure
 RestartSec=3
 

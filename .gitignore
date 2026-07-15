@@ -149,6 +149,12 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+# Vesyl print secrets / local captures (never commit tokens)
+credentials.json
+**/credentials.json
+lcd-screenshot.png
+/tmp/
+
 # Environments
 .env
 .envrc
