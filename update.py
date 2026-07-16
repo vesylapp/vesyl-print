@@ -437,7 +437,7 @@ def restart_services(helper: Path | None = None) -> None:
             timeout=60,
         )
         return
-    for unit in ("vesyl-print-agent", "printserve-display"):
+    for unit in ("vesyl-print-agent", "vesyl-print-display"):
         try:
             subprocess.run(
                 ["systemctl", "restart", unit],

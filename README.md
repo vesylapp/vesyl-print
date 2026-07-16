@@ -6,7 +6,7 @@ Raspberry Pi **print node** for VESYL: LCD status display, CUPS printer discover
 
 | Component | Role |
 |-----------|------|
-| **LCD** (`main.py` / `printserve-display.service`) | Clock, IP, CPU temp, CUPS printers, cloud pairing state |
+| **LCD** (`main.py` / `vesyl-print-display.service`) | Clock, IP, CPU temp, CUPS printers, cloud pairing state |
 | **Agent** (`agent.py` / `vesyl-print-agent.service`) | Heartbeats + `whoami`; writes status for the LCD |
 | **CLI** (`vesyl-print`) | `claim`, `enroll`, `status`, `unpair` |
 
@@ -171,7 +171,7 @@ Paths (on a provisioned Pi):
 ## Services
 
 ```bash
-sudo systemctl status printserve-display
+sudo systemctl status vesyl-print-display
 sudo systemctl status vesyl-print-agent
 journalctl -u vesyl-print-agent -f
 ```
@@ -179,6 +179,8 @@ journalctl -u vesyl-print-agent -f
 Agent logs never include `device_token`.
 
 ## OTA updates (app)
+
+Long-term plan (app + OS layers, control plane, roadmap): **[OTA_UPDATES.md](./OTA_UPDATES.md)**.
 
 Appliances update over **outbound HTTPS only** — no `git pull` on customer devices.
 

@@ -31,7 +31,7 @@ if [[ -z "$RUN_USER" || "$RUN_USER" == "root" ]]; then
 fi
 RUN_GROUP="$(id -gn "$RUN_USER")"
 
-DISPLAY_SERVICE="printserve-display"
+DISPLAY_SERVICE="vesyl-print-display"
 AGENT_SERVICE="vesyl-print-agent"
 DISPLAY_UNIT="/etc/systemd/system/${DISPLAY_SERVICE}.service"
 AGENT_UNIT="/etc/systemd/system/${AGENT_SERVICE}.service"

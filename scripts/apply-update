@@ -33,7 +33,7 @@ case "$cmd" in
     ;;
   restart)
     systemctl restart vesyl-print-agent.service || true
-    systemctl restart printserve-display.service || true
+    systemctl restart vesyl-print-display.service || true
     echo "restarted services"
     ;;
   rollback)
