@@ -15,7 +15,6 @@ Control plane (plan choice **A**): heartbeat JSON may include::
     {
       "ok": true,
       "desired_agent_version": "0.4.0",
-      "update_channel": "stable",
       "update_url": "https://…/manifest.json"   // optional
     }
 
@@ -939,7 +938,8 @@ def maybe_update_from_heartbeat(
         return st
 
     desired = hb.get("desired_agent_version") or hb.get("desired_version")
-    channel = hb.get("update_channel") or getattr(cfg, "update_channel", "stable")
+    # Channel is local-only (not sent by wms-api); kept for optional status display.
+    channel = getattr(cfg, "update_channel", None) or "stable"
     st.channel = str(channel) if channel else None
 
     if not desired:

@@ -182,7 +182,7 @@ class CloudClient:
 
         Response may include OTA control fields (plan A)::
 
-            desired_agent_version, update_channel, update_url
+            desired_agent_version, update_url
         """
         body: dict[str, Any] = {}
         if agent_version is not None:
