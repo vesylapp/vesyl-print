@@ -955,6 +955,9 @@ def maybe_update_from_heartbeat(
     helper = _default_apply_helper()
     try:
         st.status = STATUS_DOWNLOADING
+        # Persist early so the LCD can show "Updating…" during the download.
+        if status_path is not None:
+            write_update_status(Path(status_path), st)
         log.info("applying update %s from %s", desired, manifest_url)
         manifest = fetch_manifest(manifest_url)
         if version_cmp(manifest.version, desired) != 0:

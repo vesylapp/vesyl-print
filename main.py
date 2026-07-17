@@ -1,7 +1,8 @@
 """VESYL print device — system info + cloud pairing status display.
 
-Renders time, host info, printers and cloud pairing state to the 3.5" LCD
-(/dev/fb1) and refreshes once a second. Run with:  python3 main.py
+Renders time, host info, printers, cloud pairing state, agent version, and
+OTA progress to the 3.5" LCD (/dev/fb1) and refreshes once a second.
+Run with:  python3 main.py
 """
 
 from __future__ import annotations
@@ -11,13 +12,22 @@ import os
 import signal
 import threading
 import time
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 import printers
 import statusio
 import sysinfo
-from config import load_config
+import update as update_mod
+from config import AGENT_VERSION, load_config
+from display_status import (
+    DOWN,
+    OK,
+    WARN,
+    format_agent_version,
+    ota_display_message,
+)
 from framebuffer import Framebuffer
 from stream_lcd import (
     DEFAULT_FPS,
@@ -42,9 +52,6 @@ BG = (16, 18, 24)
 ACCENT = (237, 252, 51)  # VESYL yellow-green, matches logo mark
 FG = (235, 238, 245)
 MUTED = (140, 148, 165)
-OK = (80, 220, 120)  # online / paired cloud
-DOWN = (232, 72, 72)  # disconnected / revoked
-WARN = (255, 180, 60)  # unpaired
 
 
 def load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
@@ -52,7 +59,12 @@ def load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
 
 
 class InfoScreen:
-    def __init__(self, fb: Framebuffer, status_path: str | None = None):
+    def __init__(
+        self,
+        fb: Framebuffer,
+        status_path: str | None = None,
+        update_status_path: str | None = None,
+    ):
         self.fb = fb
         self.w, self.h = fb.size
         self.f_clock = load_font(FONT_BOLD, 28)
@@ -66,6 +78,14 @@ class InfoScreen:
         # Filled by the background CUPS discovery thread after startup.
         self.printer_names: list[str] = []
         self.status_path = status_path
+        if update_status_path:
+            self.update_status_path = update_status_path
+        elif status_path:
+            self.update_status_path = str(
+                Path(status_path).parent / "update_status.json"
+            )
+        else:
+            self.update_status_path = None
 
     def _load_logo(self) -> Image.Image | None:
         try:
@@ -80,6 +100,19 @@ class InfoScreen:
             return None
         return statusio.read_status(self.status_path)
 
+    def _update_status(self) -> update_mod.UpdateStatus | None:
+        if not self.update_status_path:
+            return None
+        return update_mod.read_update_status(Path(self.update_status_path))
+
+    def _display_version(self, st: statusio.AgentStatus | None) -> str:
+        if st and st.agent_version:
+            return format_agent_version(st.agent_version)
+        try:
+            return format_agent_version(update_mod.package_version())
+        except Exception:
+            return format_agent_version(AGENT_VERSION)
+
     def render(self) -> Image.Image:
         """Live screen: host info, printers, cloud pairing status."""
         img, d = self._new()
@@ -91,12 +124,19 @@ class InfoScreen:
         if pairing == "revoked":
             return self._render_revoked(img, d, body_top, st)
         if pairing != "paired":
-            return self._render_unpaired(img, d, body_top)
+            return self._render_unpaired(img, d, body_top, st)
 
         return self._render_paired(img, d, body_top, st, cloud)
 
-    def _render_unpaired(self, img, d, body_top: int) -> Image.Image:
+    def _render_unpaired(
+        self, img, d, body_top: int, st: statusio.AgentStatus | None = None
+    ) -> Image.Image:
         y = body_top
+        ota = ota_display_message(self._update_status())
+        if ota:
+            label, color = ota
+            self._centered(d, label, self.f_label, y=y, fill=color)
+            y += 28
         self._centered(d, "Unpaired", self.f_label, y=y, fill=WARN)
         y += 28
         self._centered(
@@ -107,13 +147,18 @@ class InfoScreen:
         y += 56
         self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=y)
 
-        self._status(d, "unpaired", WARN)
+        self._draw_footer(d, st, default_label="unpaired", default_color=WARN)
         return img
 
     def _render_revoked(
         self, img, d, body_top: int, st: statusio.AgentStatus | None
     ) -> Image.Image:
         y = body_top
+        ota = ota_display_message(self._update_status())
+        if ota:
+            label, color = ota
+            self._centered(d, label, self.f_label, y=y, fill=color)
+            y += 28
         self._centered(d, "Revoked", self.f_label, y=y, fill=DOWN)
         y += 28
         self._centered(d, "re-pair required", self.f_hint, y=y, fill=MUTED)
@@ -127,7 +172,7 @@ class InfoScreen:
             y += 56
         self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=y)
 
-        self._status(d, "revoked", DOWN)
+        self._draw_footer(d, st, default_label="revoked", default_color=DOWN)
         return img
 
     def _render_paired(
@@ -146,9 +191,26 @@ class InfoScreen:
         org = (st.organization_name if st else None) or "—"
         wh = (st.warehouse_name if st else None) or "—"
 
+        ust = self._update_status()
+        ota = ota_display_message(ust)
+        y = body_top
+        # Prominent OTA banner so operators see progress / failure immediately.
+        if ota:
+            label, color = ota
+            self._centered(d, label, self.f_label, y=y, fill=color)
+            y += 26
+            if ust and ust.last_error and ust.status in (
+                update_mod.STATUS_FAILED,
+                update_mod.STATUS_ROLLED_BACK,
+            ):
+                err = self._fit(d, ust.last_error, self.f_hint, self.w - 32)
+                self._centered(d, err, self.f_hint, y=y, fill=MUTED)
+                y += 20
+            y += 6
+
         # Fixed pitch so each label/value block has air above the next label
         # (even spacing used to squeeze rows when printers ate the footer).
-        row_pitch = 56
+        row_pitch = 52 if ota else 56
         rows = [
             ("ORGANIZATION", org),
             ("WAREHOUSE", wh),
@@ -156,19 +218,23 @@ class InfoScreen:
             ("CPU TEMP", sysinfo.cpu_temp_c()),
         ]
         for i, (label, value) in enumerate(rows):
-            self._row(d, label, value, y=body_top + i * row_pitch)
+            self._row(d, label, value, y=y + i * row_pitch)
 
         max_name_w = self.w - 120
         for i, raw in enumerate(self.printer_names):
             name = self._fit(d, raw, self.f_footer, max_name_w)
             tw = d.textlength(name, font=self.f_footer)
-            y = list_bottom - (n_printers - 1 - i) * printer_line_h
-            d.text((self.w - 16 - tw, y), name, font=self.f_footer, fill=MUTED)
+            py = list_bottom - (n_printers - 1 - i) * printer_line_h
+            d.text((self.w - 16 - tw, py), name, font=self.f_footer, fill=MUTED)
 
-        if cloud == "online":
-            self._status(d, "cloud", OK)
+        if ota:
+            self._draw_footer(d, st, default_label=ota[0], default_color=ota[1])
+        elif cloud == "online":
+            self._draw_footer(d, st, default_label="cloud", default_color=OK)
         else:
-            self._status(d, "cloud offline", DOWN)
+            self._draw_footer(
+                d, st, default_label="cloud offline", default_color=DOWN
+            )
         return img
 
     def render_splash(self) -> Image.Image:
@@ -237,8 +303,38 @@ class InfoScreen:
         d.rectangle([40, divider_y, self.w - 40, divider_y + 2], fill=ACCENT)
         return divider_y + 16
 
+    def _draw_footer(
+        self,
+        d,
+        st: statusio.AgentStatus | None,
+        *,
+        default_label: str,
+        default_color: tuple[int, int, int],
+    ) -> None:
+        """Footer: agent version left, status (OTA or cloud) with dot on the right."""
+        ota = ota_display_message(self._update_status())
+        if ota:
+            label, color = ota
+        else:
+            label, color = default_label, default_color
+
+        version = self._display_version(st)
+        if version:
+            d.text((16, self.h - 28), version, font=self.f_footer, fill=MUTED)
+            # Keep status from overlapping the version label.
+            ver_w = d.textlength(version, font=self.f_footer)
+            max_status_w = self.w - 16 - 24 - (16 + ver_w + 12)
+        else:
+            max_status_w = self.w - 48
+
+        label = self._fit(d, label, self.f_footer, max(40, max_status_w))
+        tw = d.textlength(label, font=self.f_footer)
+        tx = self.w - 16 - tw
+        d.text((tx, self.h - 28), label, font=self.f_footer, fill=MUTED)
+        d.ellipse([tx - 20, self.h - 26, tx - 8, self.h - 14], fill=color)
+
     def _status(self, d, text, color):
-        """Right-aligned footer: label with a colored dot to its left."""
+        """Right-aligned footer without version (splash/offline helpers)."""
         tw = d.textlength(text, font=self.f_footer)
         tx = self.w - 16 - tw
         d.text((tx, self.h - 28), text, font=self.f_footer, fill=MUTED)
@@ -328,10 +424,15 @@ def main() -> None:
 
     cfg = load_config()
     status_path = str(cfg.status_path)
+    update_status_path = str(cfg.update_status_path)
 
     manual = args.once or args.offline or args.splash
     fb = open_framebuffer(args.device, wait=0.0 if manual else 30.0)
-    screen = InfoScreen(fb, status_path=status_path)
+    screen = InfoScreen(
+        fb,
+        status_path=status_path,
+        update_status_path=update_status_path,
+    )
 
     if args.offline:
         fb.show(screen.render_offline())

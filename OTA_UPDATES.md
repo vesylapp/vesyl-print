@@ -345,7 +345,7 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 
 ### Open (must land for fleet OTA)
 
-- [ ] LCD “Updating…” / failed update messaging  
+- [x] LCD “Updating…” / failed update messaging (+ agent version on footer)  
 - [ ] Fleet metrics: version histogram, failure rate  
 - [ ] Optional: mirror GitHub Release assets to `releases.vesyl.com` if customers block github.com  
 
@@ -477,7 +477,7 @@ keep app OTA as the daily driver.
 
 ### Phase 3 — Fleet polish
 
-- [ ] LCD update state  
+- [x] LCD update state (`Updating…` / `Update failed` / `Rolled back` + version)  
 - [ ] Maintenance windows / rate limits  
 - [ ] Metrics dashboards  
 

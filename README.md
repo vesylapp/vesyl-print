@@ -6,7 +6,7 @@ Raspberry Pi **print node** for VESYL: LCD status display, CUPS printer discover
 
 | Component | Role |
 |-----------|------|
-| **LCD** (`main.py` / `vesyl-print-display.service`) | Clock, IP, CPU temp, CUPS printers, cloud pairing state |
+| **LCD** (`main.py` / `vesyl-print-display.service`) | Clock, IP, CPU temp, CUPS printers, cloud pairing, agent version, OTA progress |
 | **Agent** (`agent.py` / `vesyl-print-agent.service`) | Heartbeats + `whoami`; writes status for the LCD |
 | **CLI** (`vesyl-print`) | `claim`, `enroll`, `status`, `unpair` |
 
@@ -323,26 +323,35 @@ Unit tests mock HTTP; no network or real tokens required.
 
 ## LCD pairing states
 
+Footer always shows **agent version** on the left (e.g. `v0.3.0`).
+
 | State | Footer / message |
 |-------|------------------|
 | Unpaired | `unpaired` + `vesyl-print claim <CODE>` |
 | Paired + cloud OK | green `cloud` + org / warehouse |
 | Paired + cloud down | red `cloud offline` (last org/warehouse kept) |
 | Revoked (401) | `revoked` + re-pair hint |
+| OTA downloading | amber `Updating X.Y.Z…` banner + footer |
+| OTA installing / health | amber `Installing…` / `Verifying…` |
+| OTA failed | red `Update failed` (+ short error when present) |
+| OTA rolled back | amber `Rolled back` |
+
+OTA labels come from `/var/lib/vesyl-print/update_status.json` (written by the agent).
 
 ## Repo layout
 
 ```
-config.py      # paths, api_base_url, env
-auth.py        # credentials 0600
-cloud.py       # claim / enroll / whoami / heartbeat / ws_ticket
-agent.py       # heartbeat + pull + cable session
-cable.py       # ActionCable PrintNodeChannel client
-jobs.py        # durable queue + print pipeline
-statusio.py    # status.json for LCD
-cli.py         # vesyl-print entry
-main.py        # LCD
-printers.py    # CUPS discovery + inventory_payload()
+config.py         # paths, api_base_url, env
+auth.py           # credentials 0600
+cloud.py          # claim / enroll / whoami / heartbeat / ws_ticket
+agent.py          # heartbeat + pull + cable session
+cable.py          # ActionCable PrintNodeChannel client
+jobs.py           # durable queue + print pipeline
+statusio.py       # status.json for LCD
+display_status.py # OTA/version labels for LCD
+cli.py            # vesyl-print entry
+main.py           # LCD
+printers.py       # CUPS discovery + inventory_payload()
 requirements.txt  # websocket-client for cable
 ```
 
