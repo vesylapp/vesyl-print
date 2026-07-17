@@ -23,7 +23,23 @@ Raspberry Pi **print node** for VESYL: LCD status display, CUPS printer discover
 
 ## Install
 
-On the Pi (from this repo):
+### Fresh Pi (one-time)
+
+On a new board (network + root), identity + MHS35 LCD vendor setup:
+
+```bash
+# from a copy of this repo, or curl the raw script
+sudo ./scripts/bootstrap-fresh-pi.sh
+```
+
+That script: generates SSH host keys, writes `/etc/appliance-id`, sets
+`hostname` to `VESYL-PRINT-<last 6 hex of UUID>`, clones
+[goodtft/LCD-show](https://github.com/goodtft/LCD-show) and runs `MHS35-show`,
+then reboots.
+
+### App stack
+
+On the Pi (from this repo), after the board is up:
 
 ```bash
 sudo ./setup.sh
