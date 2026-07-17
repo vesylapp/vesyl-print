@@ -8,7 +8,7 @@ install layout, or OS strategy changes.
 |--|--|
 | **Owner** | Print / device platform |
 | **Last reviewed** | 2026-07-16 |
-| **Status** | App OTA client + GitHub Releases CI publish; wms-api desired-version still open |
+| **Status** | App OTA client + GitHub Releases CI + wms-api heartbeat OTA directives (fleet/node pin) |
 | **Related code** | `update.py`, `scripts/build-release.sh`, `scripts/apply-update`, `.github/workflows/release.yml`, `agent.py`, `cli.py`, `config.py`, `setup.sh`, `keys/` |
 
 ---
@@ -323,8 +323,9 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 
 ### Open (must land for fleet OTA)
 
-- [ ] wms-api: accept `update` on heartbeat; return `desired_agent_version` / channel / url  
-- [ ] Policy: global / org / node pin + admin UI or GraphQL  
+- [x] wms-api: accept `update` on heartbeat; return `desired_agent_version` / channel / url  
+  (`Print::UpdateDirective`, `print_nodes.desired_agent_version`, settings `PRINT_DESIRED_AGENT_VERSION`)  
+- [ ] Policy: org pin + admin UI / GraphQL (node column exists for per-node pin)  
 - [ ] Migrate production units to `/opt/vesyl-print/current` (factory `setup.sh`)  
 - [ ] Post-update health gate (whoami success before declaring success; auto-rollback on failure)  
 - [ ] Pause job pull during install; avoid updating mid-job  
@@ -450,10 +451,10 @@ keep app OTA as the daily driver.
 
 ### Phase 2 — Cloud control plane (wms-api)
 
-- [ ] Heartbeat response fields live in all envs  
-- [ ] Node/org desired version policy  
-- [ ] Admin visibility (versions, failures)  
-- [ ] Staged rollout  
+- [x] Heartbeat accepts `update` status; returns OTA plan-A fields  
+- [x] Fleet default via `PRINT_DESIRED_AGENT_VERSION` + per-node `desired_agent_version`  
+- [ ] GraphQL / admin UI to set pins and view update_status  
+- [ ] Org-level policy + staged rollout  
 
 ### Phase 3 — Fleet polish
 
