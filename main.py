@@ -311,7 +311,7 @@ class InfoScreen:
         default_label: str,
         default_color: tuple[int, int, int],
     ) -> None:
-        """Footer: agent version left, status (OTA or cloud) with dot on the right."""
+        """Footer right cluster: ``vX.Y.Z  ● status`` (version left of status dot)."""
         ota = ota_display_message(self._update_status())
         if ota:
             label, color = ota
@@ -319,19 +319,25 @@ class InfoScreen:
             label, color = default_label, default_color
 
         version = self._display_version(st)
-        if version:
-            d.text((16, self.h - 28), version, font=self.f_footer, fill=MUTED)
-            # Keep status from overlapping the version label.
-            ver_w = d.textlength(version, font=self.f_footer)
-            max_status_w = self.w - 16 - 24 - (16 + ver_w + 12)
-        else:
-            max_status_w = self.w - 48
-
+        ver_w = d.textlength(version, font=self.f_footer) if version else 0
+        # Room for optional version + gap + dot (12px) + gap before label.
+        reserved = (ver_w + 8 + 12 + 8) if version else (12 + 8)
+        max_status_w = self.w - 16 - 16 - reserved
         label = self._fit(d, label, self.f_footer, max(40, max_status_w))
         tw = d.textlength(label, font=self.f_footer)
+
+        # Right edge: status text; immediately left: colored dot; left of that: version.
         tx = self.w - 16 - tw
+        dot_l, dot_r = tx - 20, tx - 8
         d.text((tx, self.h - 28), label, font=self.f_footer, fill=MUTED)
-        d.ellipse([tx - 20, self.h - 26, tx - 8, self.h - 14], fill=color)
+        d.ellipse([dot_l, self.h - 26, dot_r, self.h - 14], fill=color)
+        if version:
+            d.text(
+                (dot_l - 8 - ver_w, self.h - 28),
+                version,
+                font=self.f_footer,
+                fill=MUTED,
+            )
 
     def _status(self, d, text, color):
         """Right-aligned footer without version (splash/offline helpers)."""

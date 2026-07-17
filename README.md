@@ -323,7 +323,7 @@ Unit tests mock HTTP; no network or real tokens required.
 
 ## LCD pairing states
 
-Footer always shows **agent version** on the left (e.g. `v0.3.0`).
+Footer shows **agent version** just left of the status dot (e.g. `v0.3.0 ● cloud`).
 
 | State | Footer / message |
 |-------|------------------|

@@ -342,10 +342,10 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 - [x] Migrate production units to `/opt/vesyl-print/current` (factory `setup.sh`)  
 - [x] Post-update health gate (whoami / local checks; auto-rollback on failure)  
 - [x] Pause job pull during install; avoid updating mid-job  
+- [x] LCD “Updating…” / failed update messaging (+ agent version on footer)  
 
 ### Open (must land for fleet OTA)
 
-- [x] LCD “Updating…” / failed update messaging (+ agent version on footer)  
 - [ ] Fleet metrics: version histogram, failure rate  
 - [ ] Optional: mirror GitHub Release assets to `releases.vesyl.com` if customers block github.com  
 
