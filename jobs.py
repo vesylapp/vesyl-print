@@ -183,25 +183,38 @@ def default_lp(
     return m.group(1).rstrip("()") if m else None
 
 
+# Paper-out / jam recovery can take a long time; keep watching CUPS while the
+# job remains in not-completed so we still report ``printed`` after refill.
+_DEFAULT_CUPS_WAIT_S = 24 * 60 * 60.0  # 24h hard ceiling
+_CUPS_WAIT_LOG_EVERY_S = 60.0
+
+
 def wait_cups_job(
     request_id: str,
     *,
-    timeout_s: float = 180.0,
-    poll_s: float = 1.0,
+    timeout_s: float = _DEFAULT_CUPS_WAIT_S,
+    poll_s: float = 2.0,
+    on_tick: Callable[[], None] | None = None,
 ) -> str:
-    """Poll CUPS until the job leaves the active queue.
+    """Poll CUPS until the job leaves the active (not-completed) queue.
+
+    Stays in the loop for up to ``timeout_s`` while the job is still active so
+    out-of-paper / jam recovery still transitions delivered → printed.
 
     Returns:
-      ``printed`` — job no longer in not-completed and not listed as canceled/aborted
-      ``error`` — CUPS reports canceled/aborted/held permanently (best-effort)
-      ``unknown`` — timeout or no tracking available (caller leaves status as delivered)
+      ``printed`` — job left not-completed without cancel/abort markers
+      ``error`` — CUPS reports canceled/aborted (best-effort)
+      ``unknown`` — hard timeout, or CUPS queries failed repeatedly
     """
     if not request_id:
         return "unknown"
 
-    deadline = time.monotonic() + max(5.0, timeout_s)
+    deadline = time.monotonic() + max(30.0, timeout_s)
     # Job id for lpstat filters is often "Printer-N" or "Printer-N.1"
     job_key = request_id.split()[0]
+    consecutive_query_failures = 0
+    last_log = 0.0
+    started = time.monotonic()
 
     while time.monotonic() < deadline:
         try:
@@ -211,9 +224,19 @@ def wait_cups_job(
                 text=True,
                 timeout=15,
             )
+            consecutive_query_failures = 0
         except (OSError, subprocess.SubprocessError) as e:
+            consecutive_query_failures += 1
             log.debug("lpstat not-completed failed: %s", e)
-            return "unknown"
+            if consecutive_query_failures >= 5:
+                log.warning(
+                    "CUPS lpstat failed %d times for %s — leaving delivered",
+                    consecutive_query_failures,
+                    job_key,
+                )
+                return "unknown"
+            time.sleep(max(0.5, poll_s))
+            continue
 
         active_out = (active.stdout or "") + (active.stderr or "")
         if job_key not in active_out:
@@ -234,13 +257,33 @@ def wait_cups_job(
                 # crude: if aborted/canceled near the job id, treat as error
                 idx = done_out.find(job_key)
                 snippet = done_out[idx : idx + 400].lower()
-                if any(k in snippet for k in ("canceled", "cancelled", "aborted", "stopped")):
+                if any(k in snippet for k in ("canceled", "cancelled", "aborted")):
                     return "error"
             return "printed"
 
+        now = time.monotonic()
+        if now - last_log >= _CUPS_WAIT_LOG_EVERY_S:
+            log.info(
+                "CUPS job %s still active after %.0fs (waiting for printer)",
+                job_key,
+                now - started,
+            )
+            last_log = now
+
+        # Keep admin inventory fresh while this thread is blocked on paper-out.
+        if on_tick is not None:
+            try:
+                on_tick()
+            except Exception:
+                log.debug("wait_cups_job on_tick failed", exc_info=True)
+
         time.sleep(max(0.25, poll_s))
 
-    log.warning("CUPS job %s still active after %.0fs — leaving delivered", job_key, timeout_s)
+    log.warning(
+        "CUPS job %s still active after %.0fs — leaving delivered",
+        job_key,
+        timeout_s,
+    )
     return "unknown"
 
 
@@ -454,11 +497,15 @@ def process_job(
     report_state: StateFn = noop_state,
     fetch_url: Callable[[str], bytes] | None = None,
     work_dir: Path | None = None,
+    on_wait_tick: Callable[[], None] | None = None,
 ) -> str:
     """Run the full durable pipeline for one job.
 
     Returns final local result: ``printed``, ``delivered`` (no CUPS tracking),
     or raises JobError after reporting error.
+
+    ``on_wait_tick`` is invoked periodically while waiting on CUPS completion
+    (e.g. paper-out recovery) so the agent can keep reporting printer inventory.
     """
     store.ensure()
     job_id = job.id
@@ -505,7 +552,7 @@ def process_job(
 
         final = "delivered"
         if cups_job:
-            outcome = wait_cups_job(cups_job)
+            outcome = wait_cups_job(cups_job, on_tick=on_wait_tick)
             if outcome == "printed":
                 try:
                     report_state(job, "printed", cups_id)
@@ -518,7 +565,7 @@ def process_job(
                 )
             else:
                 log.info(
-                    "job %s CUPS tracking unavailable for %s — left delivered",
+                    "job %s CUPS tracking timed out for %s — left delivered",
                     job_id,
                     cups_id,
                 )
@@ -567,6 +614,7 @@ def drain_queue(
     ack: AckFn = noop_ack,
     report_state: StateFn = noop_state,
     fetch_url: Callable[[str], bytes] | None = None,
+    on_wait_tick: Callable[[], None] | None = None,
 ) -> list[tuple[str, str]]:
     """Process every queue/*.json (crash recovery). Returns [(job_id, result)]."""
     store.ensure()
@@ -586,6 +634,7 @@ def drain_queue(
                 ack=ack,
                 report_state=report_state,
                 fetch_url=fetch_url,
+                on_wait_tick=on_wait_tick,
             )
             results.append((job_id, state))
         except JobError as e:
@@ -603,10 +652,17 @@ def receive_job(
     ack: AckFn = noop_ack,
     report_state: StateFn = noop_state,
     fetch_url: Callable[[str], bytes] | None = None,
+    on_wait_tick: Callable[[], None] | None = None,
 ) -> str:
     """Entry point for a newly delivered job (pull/push later)."""
     return process_job(
-        job, store, lp=lp, ack=ack, report_state=report_state, fetch_url=fetch_url
+        job,
+        store,
+        lp=lp,
+        ack=ack,
+        report_state=report_state,
+        fetch_url=fetch_url,
+        on_wait_tick=on_wait_tick,
     )
 
 

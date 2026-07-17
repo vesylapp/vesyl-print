@@ -279,6 +279,47 @@ def run_once(
         return st
 
 
+def _inventory_wait_tick(
+    cable_session: cable.PrintCableSession | None,
+    *,
+    client: CloudClient | None = None,
+    device_token: str | None = None,
+) -> Callable[[], None]:
+    """Build on_wait_tick that re-reports CUPS status while a job is held.
+
+    Prefer ActionCable report_printers; fall back to REST heartbeat when the
+    cable is down so admin still sees out-of-paper / jam during long waits.
+    """
+    last = {"t": 0.0}
+    min_interval = 10.0
+
+    def tick() -> None:
+        now = time.monotonic()
+        if now - last["t"] < min_interval:
+            return
+        last["t"] = now
+        try:
+            inv = printers.inventory_payload()
+        except Exception:
+            log.debug("wait-tick inventory failed", exc_info=True)
+            return
+        if cable_session is not None and cable_session.subscribed:
+            if cable_session.perform("report_printers", printers=inv):
+                return
+        if client is not None and device_token:
+            try:
+                client.heartbeat(
+                    device_token,
+                    agent_version=AGENT_VERSION,
+                    hostname=sysinfo.hostname(),
+                    printers=inv,
+                )
+            except Exception:
+                log.debug("wait-tick REST inventory failed", exc_info=True)
+
+    return tick
+
+
 def drain_local_queue(
     cfg: Config,
     *,
@@ -300,7 +341,14 @@ def drain_local_queue(
             client, device_token, cable_session=cable_session
         )
 
-    results = jobs.drain_queue(store, ack=ack, report_state=report_state)
+    results = jobs.drain_queue(
+        store,
+        ack=ack,
+        report_state=report_state,
+        on_wait_tick=_inventory_wait_tick(
+            cable_session, client=client, device_token=device_token
+        ),
+    )
     for job_id, result in results:
         log.info("drain %s → %s", job_id, result)
 
@@ -340,6 +388,9 @@ def pull_and_process(
     ack, report_state = cloud_job_hooks(
         client, device_token, cable_session=cable_session
     )
+    on_wait_tick = _inventory_wait_tick(
+        cable_session, client=client, device_token=device_token
+    )
 
     for payload in payloads:
         try:
@@ -353,6 +404,7 @@ def pull_and_process(
                 store,
                 ack=ack,
                 report_state=report_state,
+                on_wait_tick=on_wait_tick,
             )
         except JobError as e:
             log.error("job %s failed: %s", job.id, e.message)
@@ -382,7 +434,15 @@ def process_job_payload(
         client, device_token, cable_session=cable_session
     )
     try:
-        jobs.receive_job(job, store, ack=ack, report_state=report_state)
+        jobs.receive_job(
+            job,
+            store,
+            ack=ack,
+            report_state=report_state,
+            on_wait_tick=_inventory_wait_tick(
+                cable_session, client=client, device_token=device_token
+            ),
+        )
     except JobError as e:
         log.error("job %s failed: %s", job.id, e.message)
     except Exception:
