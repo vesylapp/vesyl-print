@@ -8,8 +8,8 @@ install layout, or OS strategy changes.
 |--|--|
 | **Owner** | Print / device platform |
 | **Last reviewed** | 2026-07-16 |
-| **Status** | App OTA client implemented; cloud desired-version + CI publish still open |
-| **Related code** | `update.py`, `scripts/apply-update`, `agent.py`, `cli.py`, `config.py`, `setup.sh`, `keys/` |
+| **Status** | App OTA client + GitHub Releases CI publish; wms-api desired-version still open |
+| **Related code** | `update.py`, `scripts/build-release.sh`, `scripts/apply-update`, `.github/workflows/release.yml`, `agent.py`, `cli.py`, `config.py`, `setup.sh`, `keys/` |
 
 ---
 
@@ -35,7 +35,7 @@ install layout, or OS strategy changes.
 | Constraint | Design implication |
 |------------|-------------------|
 | Customer LAN, often locked down | Outbound HTTPS only; no inbound OTA listener |
-| May block GitHub | Artifacts on VESYL CDN (`releases.vesyl.com` or equivalent), not `git pull` |
+| May block GitHub | Prefer allowlisting `github.com` object storage for releases; future: mirror to `releases.vesyl.com` |
 | Possible TLS inspection | Signature verification is mandatory even with HTTPS |
 | Pi + SPI LCD + CUPS | Kernel/driver updates are high-risk; image A/B later |
 | Multi-tenant cloud | Desired version / channel from **wms-api**, not a public “latest” free-for-all |
@@ -44,7 +44,9 @@ install layout, or OS strategy changes.
 
 ```text
 HTTPS egress → API host(s)     e.g. wms.api.vesyl.com, wms-api.vesyl.dev (lab)
-HTTPS egress → release host    e.g. releases.vesyl.com
+HTTPS egress → github.com      (GitHub Releases assets — current CDN)
+# optional later:
+# HTTPS egress → releases.vesyl.com
 ```
 
 Demo LCD stream (`:8765`) is **not** part of OTA; keep off production images or document separately.
@@ -105,13 +107,24 @@ the install root when configured.
 
 ### 4.2 Artifact format
 
-CI publishes on tag `vX.Y.Z` (or mainline release process):
+**CDN:** [GitHub Releases](https://github.com/benwyrosdick/vesyl-print/releases) (for now).
 
-| File | Purpose |
-|------|---------|
+CI (`.github/workflows/release.yml`) runs on tag `vX.Y.Z` and uploads:
+
+| Asset | Purpose |
+|-------|---------|
 | `vesyl-print-X.Y.Z-linux-aarch64.tar.gz` | App tree |
-| `vesyl-print-X.Y.Z.manifest.json` | Metadata + sha256 + signature |
-| optional `.sig` | Alternate detached signature (if we add later) |
+| `vesyl-print-X.Y.Z.manifest.json` | Metadata + sha256 + Ed25519 signature |
+
+**URLs (device default `releases_base_url`):**
+
+```text
+https://github.com/benwyrosdick/vesyl-print/releases/download/vX.Y.Z/vesyl-print-X.Y.Z.manifest.json
+https://github.com/benwyrosdick/vesyl-print/releases/download/vX.Y.Z/vesyl-print-X.Y.Z-linux-aarch64.tar.gz
+```
+
+Build locally: `./scripts/build-release.sh [VERSION]` with
+`UPDATE_PRIVATE_KEY` or `UPDATE_PRIVATE_KEY_FILE` set.
 
 **Manifest fields (contract):**
 
@@ -120,11 +133,10 @@ CI publishes on tag `vX.Y.Z` (or mainline release process):
   "version": "0.4.0",
   "channel": "stable",
   "min_agent_version": "0.3.0",
-  "artifact_url": "https://releases.vesyl.com/print/vesyl-print-0.4.0-linux-aarch64.tar.gz",
+  "artifact_url": "https://github.com/benwyrosdick/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0-linux-aarch64.tar.gz",
   "artifact_sha256": "<64 hex>",
   "signature": "<base64 Ed25519>",
-  "released_at": "2026-07-16T00:00:00Z",
-  "changelog": "…"
+  "released_at": "2026-07-16T00:00:00Z"
 }
 ```
 
@@ -214,7 +226,7 @@ separate `GET /print/v1/update` for v1).
   "last_seen_at": "…",
   "desired_agent_version": "0.4.0",
   "update_channel": "stable",
-  "update_url": "https://releases.vesyl.com/print/vesyl-print-0.4.0.manifest.json"
+  "update_url": "https://github.com/benwyrosdick/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json"
 }
 ```
 
@@ -222,7 +234,7 @@ separate `GET /print/v1/update` for v1).
 |-------|----------|--------|
 | `desired_agent_version` | no | Omit or null → no update |
 | `update_channel` | no | Default `stable` on device |
-| `update_url` | no | Full manifest URL; if omitted, device builds URL from `releases_base_url` + version |
+| `update_url` | no | Full manifest URL; if omitted, device builds GitHub Releases URL from `releases_base_url` + version |
 
 **Policy sources (server-side, to implement / keep in sync):**
 
@@ -241,7 +253,7 @@ When the server does not yet send these fields, the agent stays idle (safe).
 {
   "auto_update_enabled": true,
   "update_channel": "stable",
-  "releases_base_url": "https://releases.vesyl.com/print",
+  "releases_base_url": "https://github.com/benwyrosdick/vesyl-print/releases/download",
   "update_require_signature": true,
   "update_public_key_path": "/etc/vesyl-print/keys/update_public.pem"
 }
@@ -251,7 +263,7 @@ When the server does not yet send these fields, the agent stays idle (safe).
 |-----|---------|---------|
 | `auto_update_enabled` | `true` | If false, log desired version but do not install |
 | `update_channel` | `stable` | Informational / future channel latest index |
-| `releases_base_url` | `https://releases.vesyl.com/print` | Manifest URL prefix |
+| `releases_base_url` | GitHub `…/releases/download` | Prefix; device appends `/vX.Y.Z/vesyl-print-X.Y.Z.manifest.json` |
 | `update_require_signature` | `true` | Lab may set false only with care |
 | `update_public_key_path` | empty | Explicit PEM path |
 
@@ -288,6 +300,8 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 | Config | `config.py` |
 | CLI | `cli.py` `version` / `update *` |
 | Provisioning | `setup.sh` (helper + sudoers + optional public key) |
+| Build + sign | `scripts/build-release.sh` |
+| CI publish | `.github/workflows/release.yml` → GitHub Releases |
 | Signing docs | `keys/README.md` |
 | Tests | `tests/test_update.py` |
 
@@ -295,7 +309,7 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 
 ## 5. What is done vs open
 
-### Done (device)
+### Done (device + publish)
 
 - [x] Dual-slot install + rollback APIs  
 - [x] Manifest parse, sha256 download verify  
@@ -304,10 +318,11 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 - [x] CLI check / apply / rollback  
 - [x] `setup.sh` installs apply-update + sudoers  
 - [x] Unit tests for extract, flip, rollback, checksum, heartbeat idle paths  
+- [x] CI: build tarball + signed manifest; upload to **GitHub Releases** (CDN)  
+- [x] Public key at `keys/update_public.pem` (private key = repo secret `UPDATE_PRIVATE_KEY`)  
 
 ### Open (must land for fleet OTA)
 
-- [ ] CI: build aarch64 tarball, write manifest, sign, upload to CDN  
 - [ ] wms-api: accept `update` on heartbeat; return `desired_agent_version` / channel / url  
 - [ ] Policy: global / org / node pin + admin UI or GraphQL  
 - [ ] Migrate production units to `/opt/vesyl-print/current` (factory `setup.sh`)  
@@ -315,6 +330,7 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 - [ ] Pause job pull during install; avoid updating mid-job  
 - [ ] LCD “Updating…” / failed update messaging  
 - [ ] Fleet metrics: version histogram, failure rate  
+- [ ] Optional: mirror GitHub Release assets to `releases.vesyl.com` if customers block github.com  
 
 ### Explicitly deferred
 
@@ -421,13 +437,14 @@ keep app OTA as the daily driver.
 
 - [x] Single version file  
 - [x] Heartbeat reports `agent_version`  
-- [ ] Tag / release branch policy documented in CI  
+- [x] Tag `v*.*.*` → GitHub Actions release workflow  
 - [ ] Customer firewall one-pager linked from onboarding  
 
 ### Phase 1 — Device app OTA (this repo)
 
 - [x] `update.py` + CLI + agent heartbeat hook (plan A)  
 - [x] apply-update + sudoers via `setup.sh`  
+- [x] CI publish to GitHub Releases  
 - [ ] Factory path always uses `/opt/vesyl-print/current`  
 - [ ] Health-check + automatic rollback  
 

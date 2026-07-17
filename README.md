@@ -199,10 +199,23 @@ Agent logs never include `device_token`.
 Long-term plan (app + OS layers, control plane, roadmap): **[OTA_UPDATES.md](./OTA_UPDATES.md)**.
 
 Appliances update over **outbound HTTPS only** — no `git pull` on customer devices.
+Artifacts ship on **GitHub Releases** (CDN).
+
+### Publish a release
+
+```bash
+# 1) Set repo secret UPDATE_PRIVATE_KEY (Ed25519 PEM; public half = keys/update_public.pem)
+# 2) Bump VERSION, commit, tag, push:
+git tag v0.4.0
+git push origin v0.4.0
+# CI builds + signs + uploads tarball + manifest to the GitHub Release
+```
+
+Local build (optional): `UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 0.4.0`
 
 ### How it works
 
-1. CI publishes a signed release tarball + `*.manifest.json` to `releases_base_url`.
+1. Tag `vX.Y.Z` → CI uploads signed tarball + manifest to GitHub Releases.
 2. Agent heartbeats report `agent_version` (+ optional `update` status).
 3. Heartbeat **response** may include (plan A):
 
@@ -211,18 +224,18 @@ Appliances update over **outbound HTTPS only** — no `git pull` on customer dev
   "ok": true,
   "desired_agent_version": "0.4.0",
   "update_channel": "stable",
-  "update_url": "https://releases.vesyl.com/print/vesyl-print-0.4.0.manifest.json"
+  "update_url": "https://github.com/benwyrosdick/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json"
 }
 ```
 
-4. Agent downloads the artifact, verifies **SHA-256 + Ed25519** signature, unpacks to a new slot under `/opt/vesyl-print/releases/<ver>/`, flips `current`, restarts services.
+4. Agent downloads, verifies **SHA-256 + Ed25519**, installs under `/opt/vesyl-print/releases/<ver>/`, flips `current`, restarts services.
 
 ### CLI
 
 ```bash
 vesyl-print version
 vesyl-print update check
-vesyl-print update apply --manifest-url https://…/vesyl-print-0.4.0.manifest.json
+vesyl-print update apply --manifest-url https://github.com/benwyrosdick/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json
 vesyl-print update apply --file ./release.tar.gz --manifest ./release.manifest.json
 vesyl-print update rollback [--version 0.3.0] --restart
 ```
@@ -233,7 +246,7 @@ vesyl-print update rollback [--version 0.3.0] --restart
 {
   "auto_update_enabled": true,
   "update_channel": "stable",
-  "releases_base_url": "https://releases.vesyl.com/print",
+  "releases_base_url": "https://github.com/benwyrosdick/vesyl-print/releases/download",
   "update_require_signature": true,
   "update_public_key_path": "/etc/vesyl-print/keys/update_public.pem"
 }
@@ -242,19 +255,14 @@ vesyl-print update rollback [--version 0.3.0] --restart
 Install layout: `/opt/vesyl-print/current` → `releases/<version>` (lab: `$state_dir/app`).  
 Credentials and `/var/lib/vesyl-print` are never part of the tarball.
 
-`setup.sh` installs:
-
-- `/usr/local/lib/vesyl-print/apply-update` (root helper)
-- `/etc/sudoers.d/vesyl-print` — service user may run **only** that helper with `NOPASSWD`
-- optional `/etc/vesyl-print/keys/update_public.pem` if present in the repo
-
-See `keys/README.md` for signing. Requires `python3-cryptography` for signature verify.
+`setup.sh` installs apply-update, sudoers, and `keys/update_public.pem` when present.
+Requires `python3-cryptography` for signature verify. See `keys/README.md`.
 
 ### Customer firewall
 
 ```text
 HTTPS out → wms.api.* / wms-api.* (API + pairing)
-HTTPS out → releases.vesyl.com (or your artifact host)
+HTTPS out → github.com (GitHub Releases assets)
 ```
 
 ## Stream the LCD (demo)

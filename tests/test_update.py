@@ -65,6 +65,17 @@ class TestVersion(unittest.TestCase):
         self.assertEqual(update_mod.version_cmp("0.3.0", "0.4.0"), -1)
         self.assertEqual(update_mod.version_cmp("1.0.0", "0.9.9"), 1)
 
+    def test_github_manifest_url(self):
+        base = "https://github.com/benwyrosdick/vesyl-print/releases/download"
+        self.assertEqual(
+            update_mod.default_manifest_url(base, "0.4.0", "stable"),
+            f"{base}/v0.4.0/vesyl-print-0.4.0.manifest.json",
+        )
+        self.assertEqual(
+            update_mod.default_artifact_url(base, "0.4.0"),
+            f"{base}/v0.4.0/vesyl-print-0.4.0-linux-aarch64.tar.gz",
+        )
+
 
 class TestManifest(unittest.TestCase):
     def test_parse_and_canonical(self):

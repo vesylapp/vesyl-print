@@ -25,7 +25,10 @@ AGENT_VERSION = _read_version_file()
 
 # Preferred for Pis: direct API host (paths are /print/v1/...).
 DEFAULT_API_BASE_URL = "https://wms-api.vesyl.dev"
-DEFAULT_RELEASES_BASE_URL = "https://releases.vesyl.com/print"
+# GitHub Releases act as the artifact CDN (see OTA_UPDATES.md / release workflow).
+DEFAULT_RELEASES_BASE_URL = (
+    "https://github.com/benwyrosdick/vesyl-print/releases/download"
+)
 
 ENV_API_URL = "VESYL_PRINT_API_URL"
 ENV_CONFIG_DIR = "VESYL_PRINT_CONFIG_DIR"

@@ -117,13 +117,30 @@ class ReleaseManifest:
         )
 
     def canonical_bytes(self) -> bytes:
-        """Stable JSON for signing: all fields except signature, sorted keys."""
-        body = {k: v for k, v in self.raw.items() if k != "signature" and v is not None}
-        # Ensure required fields present for stable signing even if raw was sparse
-        body.setdefault("version", self.version)
-        body.setdefault("channel", self.channel)
-        body.setdefault("artifact_url", self.artifact_url)
-        body.setdefault("artifact_sha256", self.artifact_sha256)
+        """Stable JSON for signing: all fields except signature, sorted keys.
+
+        Must match ``scripts/build-release.sh`` (sort_keys, compact separators,
+        omit nulls and the signature field only).
+        """
+        if self.raw:
+            body = {
+                k: v
+                for k, v in self.raw.items()
+                if k != "signature" and v is not None
+            }
+        else:
+            body = {
+                "version": self.version,
+                "channel": self.channel,
+                "artifact_url": self.artifact_url,
+                "artifact_sha256": self.artifact_sha256,
+            }
+            if self.min_agent_version:
+                body["min_agent_version"] = self.min_agent_version
+            if self.released_at:
+                body["released_at"] = self.released_at
+            if self.changelog:
+                body["changelog"] = self.changelog
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -325,13 +342,39 @@ def fetch_manifest(url: str) -> ReleaseManifest:
     return ReleaseManifest.from_dict(data)
 
 
-def default_manifest_url(releases_base_url: str, version: str, channel: str) -> str:
-    base = releases_base_url.rstrip("/") + "/"
-    # Prefer versioned manifest; channel index is optional.
-    return urljoin(base, f"vesyl-print-{version}.manifest.json")
+def default_manifest_url(releases_base_url: str, version: str, channel: str = "stable") -> str:
+    """Resolve manifest URL for a version.
+
+    GitHub Releases (CDN)::
+
+        {base}/vX.Y.Z/vesyl-print-X.Y.Z.manifest.json
+        base = https://github.com/OWNER/REPO/releases/download
+
+    Flat CDN host::
+
+        {base}/vesyl-print-X.Y.Z.manifest.json
+    """
+    base = releases_base_url.rstrip("/")
+    ver = version.lstrip("v")
+    tag = ver if version.startswith("v") else f"v{ver}"
+    name = f"vesyl-print-{ver}.manifest.json"
+    if "github.com" in base and "/releases/download" in base:
+        return f"{base}/{tag}/{name}"
+    return f"{base}/{name}"
+
+
+def default_artifact_url(releases_base_url: str, version: str, arch: str = "linux-aarch64") -> str:
+    base = releases_base_url.rstrip("/")
+    ver = version.lstrip("v")
+    tag = f"v{ver}"
+    name = f"vesyl-print-{ver}-{arch}.tar.gz"
+    if "github.com" in base and "/releases/download" in base:
+        return f"{base}/{tag}/{name}"
+    return f"{base}/{name}"
 
 
 def channel_latest_url(releases_base_url: str, channel: str) -> str:
+    """Optional channel pointer (flat CDN only; not used for GitHub tags)."""
     base = releases_base_url.rstrip("/") + "/"
     return urljoin(base, f"{channel}/latest.manifest.json")
 

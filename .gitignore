@@ -154,6 +154,10 @@ credentials.json
 **/credentials.json
 lcd-screenshot.png
 /tmp/
+dist/
+# Never commit OTA private keys (public PEM in keys/ is fine)
+*update_private.pem
+*_private.pem
 
 # Environments
 .env
