@@ -45,7 +45,16 @@ On the Pi (from this repo), after the board is up:
 sudo ./setup.sh
 ```
 
-This installs dependencies, display overlay, config dirs, CLI, and both systemd units.
+This installs dependencies, display overlay, config dirs, CLI, OTA helper, and
+both systemd units. The app is copied into the dual-slot layout:
+
+```text
+/opt/vesyl-print/current → releases/<VERSION>/
+```
+
+Services and `vesyl-print` CLI run from `current` so OTA can flip the symlink
+without rewriting unit files. Site config stays in `/etc/vesyl-print`; runtime
+state in `/var/lib/vesyl-print`.
 
 ## Config
 

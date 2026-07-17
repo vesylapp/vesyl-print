@@ -101,9 +101,10 @@ Lab/dev without root:
 - `/etc/vesyl-print/config.json` (site-specific)
 - `/var/lib/vesyl-print/**` (queue, processed, status)
 
-Systemd units should eventually run from `current` (migration path below).
-Today many lab devices still run from a git checkout; OTA still stages under
-the install root when configured.
+Systemd units run from `current` after `setup.sh` (factory path). Lab can still
+use a git checkout as the *source* tree; setup copies it into
+`/opt/vesyl-print/releases/<VERSION>` and points `current` there. OTA stages
+new versions beside it under the same install root.
 
 ### 4.2 Artifact format
 
@@ -320,13 +321,12 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 - [x] Unit tests for extract, flip, rollback, checksum, heartbeat idle paths  
 - [x] CI: build tarball + signed manifest; upload to **GitHub Releases** (CDN)  
 - [x] Public key at `keys/update_public.pem` (private key = repo secret `UPDATE_PRIVATE_KEY`)  
+- [x] wms-api: accept `update` on heartbeat; return `desired_agent_version` / channel / url  
+  (`Print::UpdateDirective`, `print_nodes.desired_agent_version`, settings `PRINT_DESIRED_AGENT_VERSION`)  
 
 ### Open (must land for fleet OTA)
 
-- [x] wms-api: accept `update` on heartbeat; return `desired_agent_version` / channel / url  
-  (`Print::UpdateDirective`, `print_nodes.desired_agent_version`, settings `PRINT_DESIRED_AGENT_VERSION`)  
-- [ ] Policy: org pin + admin UI / GraphQL (node column exists for per-node pin)  
-- [ ] Migrate production units to `/opt/vesyl-print/current` (factory `setup.sh`)  
+- [x] Migrate production units to `/opt/vesyl-print/current` (factory `setup.sh`)  
 - [ ] Post-update health gate (whoami success before declaring success; auto-rollback on failure)  
 - [ ] Pause job pull during install; avoid updating mid-job  
 - [ ] LCD “Updating…” / failed update messaging  
@@ -335,6 +335,7 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 
 ### Explicitly deferred
 
+- [ ] Policy: org pin + admin UI / GraphQL (node column exists for per-node pin)  
 - [ ] OS A/B image OTA (RAUC/Mender)  
 - [ ] Offline USB update workflow for air-gapped sites  
 - [ ] Cosign/Sigstore keyless signing  
@@ -446,7 +447,7 @@ keep app OTA as the daily driver.
 - [x] `update.py` + CLI + agent heartbeat hook (plan A)  
 - [x] apply-update + sudoers via `setup.sh`  
 - [x] CI publish to GitHub Releases  
-- [ ] Factory path always uses `/opt/vesyl-print/current`  
+- [x] Factory path always uses `/opt/vesyl-print/current`  
 - [ ] Health-check + automatic rollback  
 
 ### Phase 2 — Cloud control plane (wms-api)
