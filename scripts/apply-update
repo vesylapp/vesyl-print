@@ -34,8 +34,10 @@ case "$cmd" in
   restart)
     # --no-block: agent calls this to restart itself; waiting would hang until
     # SIGTERM and look like an OTA failure to the parent process.
-    systemctl restart --no-block vesyl-print-agent.service || true
+    # Restart display *before* agent so LCD always loads the new slot even if
+    # the agent unit stop races this script.
     systemctl restart --no-block vesyl-print-display.service || true
+    systemctl restart --no-block vesyl-print-agent.service || true
     echo "restarted services"
     ;;
   rollback)
