@@ -1053,11 +1053,42 @@ def maybe_update_from_heartbeat(
             restart_services(helper)
         except Exception as e:
             log.info("post-activate restart: %s (ignored if self-stop)", e)
+        # Always return pending_health after a successful activate.
+        return st
     except UpdateError as e:
+        # If activate already flipped current, keep pending_health (not failed).
+        if st.status == STATUS_PENDING_HEALTH:
+            log.warning("update error after activate (keeping pending_health): %s", e.message)
+            return st
         st.status = STATUS_FAILED
         st.last_error = e.message
         log.error("update failed: %s", e.message)
     except Exception as e:
+        if st.status == STATUS_PENDING_HEALTH:
+            log.warning("update error after activate (keeping pending_health): %s", e)
+            return st
+        # Race: activate wrote pending_health to disk, then restart killed us
+        # mid-except. Prefer not to mark failed if slot already matches target.
+        try:
+            cur = current_release_version(install_root)
+            if st.target_version and cur and version_cmp(cur, st.target_version) == 0:
+                log.warning(
+                    "exception after activate of %s (keeping pending_health): %s",
+                    st.target_version,
+                    e,
+                )
+                mark_pending_health(
+                    st,
+                    target_version=st.target_version,
+                    previous_version=st.previous_version,
+                    gate_seconds=health_gate_seconds(cfg),
+                    channel=st.channel,
+                )
+                if status_path is not None:
+                    write_update_status(Path(status_path), st)
+                return st
+        except Exception:
+            pass
         st.status = STATUS_FAILED
         st.last_error = str(e)
         log.exception("update failed")

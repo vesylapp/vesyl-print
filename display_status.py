@@ -29,6 +29,26 @@ def format_agent_version(version: str | None) -> str:
     return v
 
 
+def _looks_like_post_activate_glitch(ust: update_mod.UpdateStatus) -> bool:
+    """True when activate likely succeeded but status was marked failed (self-restart).
+
+    Classic case: ``apply-update restart`` SIGTERMs the agent while it is still
+    waiting; status becomes ``failed`` even though ``current`` already points at
+    the new release. LCD should show Verifying…, not Update failed.
+    """
+    target = (ust.target_version or "").strip()
+    if not target:
+        return False
+    err = (ust.last_error or "").lower()
+    if "sigterm" in err or "apply-update" in err and "restart" in err:
+        return True
+    # After activate we set current_version == target before restart.
+    cur = (ust.current_version or "").strip()
+    if cur and update_mod.version_cmp(cur, target) == 0:
+        return True
+    return False
+
+
 def ota_display_message(
     ust: update_mod.UpdateStatus | None,
 ) -> tuple[str, tuple[int, int, int]] | None:
@@ -48,6 +68,10 @@ def ota_display_message(
         label = f"Verifying {target}…".strip() if target else "Verifying…"
         return label, WARN
     if s == update_mod.STATUS_FAILED:
+        # Don't flash red "Update failed" for self-restart false negatives.
+        if _looks_like_post_activate_glitch(ust):
+            label = f"Verifying {target}…".strip() if target else "Verifying…"
+            return label, WARN
         return "Update failed", DOWN
     if s == update_mod.STATUS_ROLLED_BACK:
         return "Rolled back", WARN

@@ -18,7 +18,7 @@ def _read_version_file() -> str:
                 return v
     except OSError:
         pass
-    return "0.3.2"
+    return "0.3.3"
 
 
 AGENT_VERSION = _read_version_file()

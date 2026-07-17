@@ -103,6 +103,17 @@ def run_once(
     client = client or CloudClient(cfg.api_base_url)
     creds = auth.load_credentials(cfg.credentials_path)
 
+    # Promote sticky false "failed" (self-restart SIGTERM) to pending_health
+    # *before* whoami so the LCD never paints red "Update failed" mid-OTA.
+    try:
+        early = update_mod.read_update_status(cfg.update_status_path)
+        if early and early.status == update_mod.STATUS_FAILED:
+            recovered = update_mod.recover_false_update_failure(early, cfg=cfg)
+            if recovered.status == update_mod.STATUS_PENDING_HEALTH:
+                update_mod.write_update_status(cfg.update_status_path, recovered)
+    except Exception:
+        log.debug("early update-status recovery failed", exc_info=True)
+
     if not creds:
         # Unpaired: still complete post-update health (local slot checks only).
         update_status = update_mod.read_update_status(cfg.update_status_path)
