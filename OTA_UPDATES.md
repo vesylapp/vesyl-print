@@ -173,13 +173,25 @@ heartbeat and from the CLI.
 10. Activate:
       - preferred: sudo -n apply-update activate <release> <current>
       - else: atomic symlink flip as the service user (lab install root)
-11. Restart services (apply-update restart or systemctl)
-12. Persist update_status.json; next heartbeats report status
-13. On failure: leave previous current; status=failed; no half-open symlink
+11. Persist `update_status.json` with `status=pending_health`,
+    `previous_version`, and `health_deadline_at` (default 120s)
+12. Restart services (apply-update restart or systemctl)
+13. New agent process runs the **health gate**:
+      - local: `current` has agent/main + VERSION matches target
+      - if paired: `GET /print/v1/whoami` must reach the API (`ok` or
+        `unauthorized` both count — proves the new code talks to cloud)
+      - if unpaired: local checks only
+14. Health OK → `status=idle` (OTA success)
+15. Health not ready → stay `pending_health` and retry each cycle
+16. Hard local failure **or** deadline exceeded → auto-rollback to
+    `previous_version`, restart services, `status=rolled_back`
+17. Pre-activate failure: leave previous `current`; `status=failed`;
+    no half-open symlink
 ```
 
 **Rollback:** `vesyl-print update rollback` flips `current` to the previous
-release directory (or an explicit version).
+release directory (or an explicit version). Auto-rollback after a failed
+health gate uses the same path.
 
 ### 4.4 Privileges (`setup.sh`)
 
@@ -323,11 +335,11 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 - [x] Public key at `keys/update_public.pem` (private key = repo secret `UPDATE_PRIVATE_KEY`)  
 - [x] wms-api: accept `update` on heartbeat; return `desired_agent_version` / channel / url  
   (`Print::UpdateDirective`, `print_nodes.desired_agent_version`, settings `PRINT_DESIRED_AGENT_VERSION`)  
+- [x] Migrate production units to `/opt/vesyl-print/current` (factory `setup.sh`)  
+- [x] Post-update health gate (whoami / local checks; auto-rollback on failure)  
 
 ### Open (must land for fleet OTA)
 
-- [x] Migrate production units to `/opt/vesyl-print/current` (factory `setup.sh`)  
-- [ ] Post-update health gate (whoami success before declaring success; auto-rollback on failure)  
 - [ ] Pause job pull during install; avoid updating mid-job  
 - [ ] LCD “Updating…” / failed update messaging  
 - [ ] Fleet metrics: version histogram, failure rate  
@@ -404,7 +416,9 @@ keep app OTA as the daily driver.
 | Bad signature / checksum | Do not flip `current`; `update.status=failed` |
 | Download interrupted | No activate; retry on later heartbeat |
 | Disk full | Fail before extract; report error |
-| Activate succeeds, agent crash-loops | Manual/auto rollback to previous slot (auto health-gate still open) |
+| Activate succeeds, whoami never succeeds | Auto-rollback after `update_health_gate_seconds` (default 120) |
+| Activate succeeds, slot missing entrypoints | Immediate auto-rollback (hard local fail) |
+| Agent crash-loops before health gate runs | No process to roll back; support: `vesyl-print update rollback --restart` |
 | Server omits desired version | No update attempt |
 | `auto_update_enabled: false` | Log desired only; support can apply via CLI on-site |
 | GitHub blocked, CDN allowed | Still works if artifacts on CDN |
@@ -448,7 +462,7 @@ keep app OTA as the daily driver.
 - [x] apply-update + sudoers via `setup.sh`  
 - [x] CI publish to GitHub Releases  
 - [x] Factory path always uses `/opt/vesyl-print/current`  
-- [ ] Health-check + automatic rollback  
+- [x] Health-check + automatic rollback (`pending_health` → whoami/local)  
 
 ### Phase 2 — Cloud control plane (wms-api)
 

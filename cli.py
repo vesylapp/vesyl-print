@@ -224,6 +224,10 @@ def cmd_version(args: argparse.Namespace) -> int:
         print(f"update_status:  {ust.status}")
         if ust.target_version:
             print(f"target_version: {ust.target_version}")
+        if ust.previous_version:
+            print(f"previous_slot:  {ust.previous_version}")
+        if ust.health_deadline_at:
+            print(f"health_deadline:{ust.health_deadline_at}")
         if ust.last_error:
             print(f"last_error:     {ust.last_error}")
     return 0

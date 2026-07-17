@@ -95,6 +95,19 @@ def run_once(cfg: Config, client: CloudClient | None = None) -> statusio.AgentSt
     creds = auth.load_credentials(cfg.credentials_path)
 
     if not creds:
+        # Unpaired: still complete post-update health (local slot checks only).
+        update_status = update_mod.read_update_status(cfg.update_status_path)
+        if update_status and update_status.status == update_mod.STATUS_PENDING_HEALTH:
+            try:
+                update_status = update_mod.process_pending_health(
+                    update_status,
+                    cfg=cfg,
+                    whoami_result="skipped",
+                )
+                update_mod.write_update_status(cfg.update_status_path, update_status)
+            except Exception:
+                log.exception("post-update health gate failed")
+
         existing = statusio.read_status(cfg.status_path)
         if existing and existing.pairing == "revoked":
             st = existing
@@ -106,19 +119,66 @@ def run_once(cfg: Config, client: CloudClient | None = None) -> statusio.AgentSt
         statusio.write_status(cfg.status_path, st)
         return st
 
+    whoami_result = "skipped"
+    whoami_error: str | None = None
     try:
         who = client.whoami(creds.device_token)
         creds = auth.merge_whoami(creds, who)
         auth.save_credentials(cfg.credentials_path, creds)
+        whoami_result = "ok"
     except CloudError as e:
         if e.unauthorized:
+            whoami_result = "unauthorized"
+            # Still run health gate (API reached) before clearing credentials.
+            update_status = update_mod.read_update_status(cfg.update_status_path)
+            if update_status and update_status.status == update_mod.STATUS_PENDING_HEALTH:
+                try:
+                    ust = update_mod.process_pending_health(
+                        update_status,
+                        cfg=cfg,
+                        whoami_result=whoami_result,
+                        whoami_error=e.message,
+                    )
+                    update_mod.write_update_status(cfg.update_status_path, ust)
+                except Exception:
+                    log.exception("post-update health gate failed")
             _handle_unauthorized(cfg, creds)
             return statusio.read_status(cfg.status_path) or _status_from_creds(
                 None, pairing="revoked", cloud="offline"
             )
+        whoami_result = "error"
+        whoami_error = e.message
         log.warning("whoami failed: %s", e.message)
     except Exception as e:
+        whoami_result = "error"
+        whoami_error = str(e)
         log.warning("whoami failed: %s", e)
+
+    # Post-update health gate: declare OTA success only after whoami (or local
+    # checks if unpaired). Auto-rollback if the new slot is unhealthy.
+    update_status = update_mod.read_update_status(cfg.update_status_path)
+    if update_status and update_status.status == update_mod.STATUS_PENDING_HEALTH:
+        try:
+            update_status = update_mod.process_pending_health(
+                update_status,
+                cfg=cfg,
+                whoami_result=whoami_result,
+                whoami_error=whoami_error,
+            )
+            update_mod.write_update_status(cfg.update_status_path, update_status)
+            if update_status.status == update_mod.STATUS_ROLLED_BACK:
+                log.warning(
+                    "OTA health gate rolled back: %s", update_status.last_error
+                )
+                # Services restart after rollback; this process may be dying.
+                return _status_from_creds(
+                    creds,
+                    pairing="paired",
+                    cloud="online" if whoami_result == "ok" else "offline",
+                    last_error=update_status.last_error,
+                )
+        except Exception:
+            log.exception("post-update health gate failed")
 
     printers_payload = None
     try:
@@ -126,7 +186,6 @@ def run_once(cfg: Config, client: CloudClient | None = None) -> statusio.AgentSt
     except Exception:
         log.debug("printer inventory unavailable", exc_info=True)
 
-    update_status = update_mod.read_update_status(cfg.update_status_path)
     update_payload = None
     if update_status:
         update_payload = update_status.to_dict()
@@ -156,6 +215,7 @@ def run_once(cfg: Config, client: CloudClient | None = None) -> statusio.AgentSt
                 cfg=cfg,
                 status=update_status,
                 auto_apply=bool(getattr(cfg, "auto_update_enabled", True)),
+                status_path=cfg.update_status_path,
             )
             update_mod.write_update_status(cfg.update_status_path, ust)
         except Exception:

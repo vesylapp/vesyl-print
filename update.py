@@ -59,14 +59,34 @@ class UpdateError(Exception):
         self.code = code
 
 
+# After activate + restart, wait this long for whoami (or local checks if unpaired)
+# before auto-rolling back to the previous slot.
+DEFAULT_HEALTH_GATE_SECONDS = 120
+
+# Status lifecycle:
+#   idle → downloading → installing → pending_health → idle
+#                                      ↘ failed | rolled_back
+STATUS_IDLE = "idle"
+STATUS_CHECKING = "checking"
+STATUS_DOWNLOADING = "downloading"
+STATUS_INSTALLING = "installing"
+STATUS_PENDING_HEALTH = "pending_health"
+STATUS_FAILED = "failed"
+STATUS_ROLLED_BACK = "rolled_back"
+
+
 @dataclass
 class UpdateStatus:
-    status: str = "idle"  # idle|checking|downloading|installing|failed|rolled_back
+    status: str = STATUS_IDLE
     current_version: str = ""
     target_version: str | None = None
     last_error: str | None = None
     last_checked_at: str | None = None
     channel: str | None = None
+    # Health gate: slot we left so we can auto-rollback if the new agent is unhealthy.
+    previous_version: str | None = None
+    health_deadline_at: str | None = None
+    health_attempts: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,6 +96,9 @@ class UpdateStatus:
             "last_error": self.last_error,
             "last_checked_at": self.last_checked_at,
             "channel": self.channel,
+            "previous_version": self.previous_version,
+            "health_deadline_at": self.health_deadline_at,
+            "health_attempts": self.health_attempts,
         }
 
 
@@ -207,12 +230,30 @@ def current_release_dir(install_root: Path) -> Path | None:
     return None
 
 
+def current_release_version(install_root: Path) -> str | None:
+    cur = current_release_dir(install_root)
+    if cur and _VERSION_RE.match(cur.name):
+        return cur.name
+    return None
+
+
 def list_releases(install_root: Path) -> list[str]:
     rel = install_root / "releases"
     if not rel.is_dir():
         return []
     vers = [p.name for p in rel.iterdir() if p.is_dir() and _VERSION_RE.match(p.name)]
     return sorted(vers, key=parse_version)
+
+
+def health_gate_seconds(cfg: Any | None = None) -> int:
+    if cfg is not None:
+        raw = getattr(cfg, "update_health_gate_seconds", None)
+        if raw is not None:
+            try:
+                return max(15, int(raw))
+            except (TypeError, ValueError):
+                pass
+    return DEFAULT_HEALTH_GATE_SECONDS
 
 
 # --- crypto ----------------------------------------------------------------
@@ -448,7 +489,12 @@ def flip_current(install_root: Path, version: str) -> Path:
     return release_dir
 
 
-def rollback(install_root: Path, to_version: str | None = None) -> str:
+def rollback(
+    install_root: Path,
+    to_version: str | None = None,
+    *,
+    apply_helper: Path | None = None,
+) -> str:
     """Flip current to previous release (or explicit version)."""
     releases = list_releases(install_root)
     if not releases:
@@ -464,7 +510,32 @@ def rollback(install_root: Path, to_version: str | None = None) -> str:
         if not older:
             raise UpdateError("no previous release for rollback", code="no_rollback")
         target = older[-1]
-    flip_current(install_root, target)
+
+    release_dir = install_root / "releases" / target
+    current = install_root / "current"
+    helper = apply_helper if apply_helper is not None else _default_apply_helper()
+    if helper and helper.is_file():
+        try:
+            subprocess.run(
+                [
+                    "sudo",
+                    "-n",
+                    str(helper),
+                    "activate",
+                    str(release_dir),
+                    str(current),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            # Lab installs / unit tests: fall back to in-process symlink flip.
+            log.warning("apply-update activate failed (%s); flipping current in-process", e)
+            flip_current(install_root, target)
+    else:
+        flip_current(install_root, target)
     log.info("rolled back to %s", target)
     return target
 
@@ -503,7 +574,12 @@ def apply_release(
     restart: bool = False,
     apply_helper: Path | None = None,
 ) -> Path:
-    """Full path: verify manifest → download → extract → flip current."""
+    """Full path: verify manifest → download → extract → flip current.
+
+    Does **not** run the post-update health gate. Callers that restart services
+    should persist ``pending_health`` via :func:`mark_pending_health` *before*
+    restart so the new process can verify and auto-rollback.
+    """
     if manifest.min_agent_version:
         if version_cmp(package_version(), manifest.min_agent_version) < 0:
             raise UpdateError(
@@ -575,35 +651,234 @@ def apply_release(
     return release_dir
 
 
+def mark_pending_health(
+    st: UpdateStatus,
+    *,
+    target_version: str,
+    previous_version: str | None,
+    gate_seconds: int | None = None,
+    channel: str | None = None,
+) -> UpdateStatus:
+    """Record that activate succeeded; health gate must pass before idle."""
+    seconds = max(15, int(gate_seconds if gate_seconds is not None else DEFAULT_HEALTH_GATE_SECONDS))
+    st.status = STATUS_PENDING_HEALTH
+    st.current_version = target_version
+    st.target_version = target_version
+    st.previous_version = previous_version
+    st.health_deadline_at = _utc_now_plus(seconds)
+    st.health_attempts = 0
+    st.last_error = None
+    st.last_checked_at = _utc_now()
+    if channel is not None:
+        st.channel = channel
+    return st
+
+
+def _module_runs_from_slot(install_root: Path) -> bool:
+    """True when this process loaded update.py from install_root/current."""
+    try:
+        here = Path(__file__).resolve().parent
+        cur = (install_root / "current").resolve()
+        return here == cur or cur in here.parents
+    except OSError:
+        return False
+
+
+def local_slot_healthy(install_root: Path, expected_version: str | None) -> tuple[bool, str | None]:
+    """Fast checks on the active release dir (no network)."""
+    cur = current_release_dir(install_root)
+    if cur is None:
+        return False, "current symlink missing or broken"
+    if not (cur / "agent.py").is_file() and not (cur / "main.py").is_file():
+        return False, "current slot missing agent.py/main.py"
+    if expected_version:
+        ver_file = cur / "VERSION"
+        slot_ver = cur.name
+        if ver_file.is_file():
+            try:
+                slot_ver = ver_file.read_text(encoding="utf-8").strip() or slot_ver
+            except OSError:
+                pass
+        if version_cmp(slot_ver, expected_version) != 0 and cur.name != expected_version:
+            return (
+                False,
+                f"slot version {slot_ver!r} != expected {expected_version!r}",
+            )
+        # After a real service restart, code is loaded from current — require match.
+        # Lab/unit tests import update.py from the git tree; skip that check there.
+        if _module_runs_from_slot(install_root):
+            running = package_version()
+            if version_cmp(running, expected_version) != 0:
+                return (
+                    False,
+                    f"running package_version {running!r} != expected {expected_version!r}",
+                )
+    return True, None
+
+
+def _deadline_passed(deadline_iso: str | None, now_iso: str | None = None) -> bool:
+    if not deadline_iso:
+        return False
+    now = now_iso or _utc_now()
+    # ISO-8601 comparable when both are UTC with same shape
+    try:
+        return now >= deadline_iso
+    except TypeError:
+        return False
+
+
+def process_pending_health(
+    st: UpdateStatus,
+    *,
+    cfg: Any,
+    whoami_result: str = "skipped",
+    # whoami_result: "ok" | "unauthorized" | "error" | "skipped"
+    whoami_error: str | None = None,
+    install_root: Path | None = None,
+    apply_helper: Path | None = None,
+    restart_on_rollback: bool = True,
+    now_iso: str | None = None,
+) -> UpdateStatus:
+    """Post-update health gate.
+
+    Called by the agent after restart into a new slot. Declares success only
+    after local slot checks pass and (when paired) whoami reaches the API.
+
+    On hard failure or deadline expiry: auto-rollback to ``previous_version``
+    when available, set status ``rolled_back``, and restart services.
+    """
+    if st.status != STATUS_PENDING_HEALTH:
+        return st
+
+    root = Path(install_root) if install_root else resolve_install_root(cfg)
+    now = now_iso or _utc_now()
+    st.last_checked_at = now
+    st.health_attempts = int(st.health_attempts or 0) + 1
+    expected = st.target_version or st.current_version
+
+    ok_local, local_err = local_slot_healthy(root, expected)
+    # whoami: success if API answered (ok or 401 re-pair — code path works)
+    cloud_ok = whoami_result in ("ok", "unauthorized", "skipped")
+    if whoami_result == "error":
+        cloud_ok = False
+
+    if ok_local and cloud_ok:
+        log.info(
+            "post-update health ok version=%s attempts=%s whoami=%s",
+            expected,
+            st.health_attempts,
+            whoami_result,
+        )
+        st.status = STATUS_IDLE
+        st.current_version = package_version()
+        st.previous_version = None
+        st.health_deadline_at = None
+        st.last_error = None
+        return st
+
+    reason_parts: list[str] = []
+    if not ok_local and local_err:
+        reason_parts.append(local_err)
+    if whoami_result == "error":
+        reason_parts.append(whoami_error or "whoami failed")
+    reason = "; ".join(reason_parts) or "health check failed"
+    st.last_error = reason
+
+    past_deadline = _deadline_passed(st.health_deadline_at, now)
+    # Local slot broken (wrong version / missing entrypoints) → fail fast.
+    hard_fail = not ok_local
+
+    if not past_deadline and not hard_fail:
+        log.warning(
+            "post-update health not ready yet (%s); will retry until %s",
+            reason,
+            st.health_deadline_at,
+        )
+        return st
+
+    # Deadline or hard local failure → rollback if we can.
+    prev = st.previous_version
+    helper = apply_helper if apply_helper is not None else _default_apply_helper()
+    if prev and prev != expected:
+        try:
+            log.error(
+                "post-update health failed (%s) — rolling back to %s",
+                reason,
+                prev,
+            )
+            rolled = rollback(root, to_version=prev, apply_helper=helper)
+            st.status = STATUS_ROLLED_BACK
+            st.current_version = rolled
+            st.target_version = expected
+            st.previous_version = None
+            st.health_deadline_at = None
+            st.last_error = f"health failed: {reason}; rolled back to {rolled}"
+            if restart_on_rollback:
+                try:
+                    restart_services(helper)
+                except Exception as e:
+                    log.warning("restart after rollback failed: %s", e)
+            return st
+        except UpdateError as e:
+            log.error("auto-rollback failed: %s", e.message)
+            st.status = STATUS_FAILED
+            st.last_error = f"health failed: {reason}; rollback error: {e.message}"
+            return st
+        except Exception as e:
+            log.exception("auto-rollback failed")
+            st.status = STATUS_FAILED
+            st.last_error = f"health failed: {reason}; rollback error: {e}"
+            return st
+
+    st.status = STATUS_FAILED
+    st.health_deadline_at = None
+    st.last_error = f"health failed: {reason} (no previous slot to roll back to)"
+    log.error(st.last_error)
+    return st
+
+
 def maybe_update_from_heartbeat(
     hb: dict[str, Any],
     *,
     cfg: Any,
     status: UpdateStatus | None = None,
     auto_apply: bool = True,
+    status_path: Path | None = None,
 ) -> UpdateStatus:
-    """Inspect heartbeat response (plan A) and optionally apply update."""
+    """Inspect heartbeat response (plan A) and optionally apply update.
+
+    After a successful activate, status becomes ``pending_health`` (not idle).
+    The agent must call :func:`process_pending_health` after restart.
+    """
     st = status or UpdateStatus(current_version=package_version())
     st.current_version = package_version()
     st.last_checked_at = _utc_now()
+
+    # Never start another OTA while health gate is open.
+    if st.status == STATUS_PENDING_HEALTH:
+        log.info("update deferred: pending_health for %s", st.target_version)
+        return st
 
     desired = hb.get("desired_agent_version") or hb.get("desired_version")
     channel = hb.get("update_channel") or getattr(cfg, "update_channel", "stable")
     st.channel = str(channel) if channel else None
 
     if not desired:
-        st.status = "idle"
+        if st.status not in (STATUS_FAILED, STATUS_ROLLED_BACK, STATUS_PENDING_HEALTH):
+            st.status = STATUS_IDLE
         st.target_version = None
         return st
 
     desired = str(desired).strip()
     st.target_version = desired
     if version_cmp(desired, st.current_version) == 0:
-        st.status = "idle"
+        if st.status not in (STATUS_FAILED, STATUS_ROLLED_BACK):
+            st.status = STATUS_IDLE
         return st
 
     if not auto_apply or not getattr(cfg, "auto_update_enabled", True):
-        st.status = "idle"
+        if st.status not in (STATUS_FAILED, STATUS_ROLLED_BACK, STATUS_PENDING_HEALTH):
+            st.status = STATUS_IDLE
         log.info("update available: %s → %s (auto_update disabled)", st.current_version, desired)
         return st
 
@@ -615,13 +890,22 @@ def maybe_update_from_heartbeat(
     elif releases_base:
         manifest_url = default_manifest_url(releases_base, desired, str(channel or "stable"))
     else:
-        st.status = "failed"
+        st.status = STATUS_FAILED
         st.last_error = "desired version set but no update_url or releases_base_url"
         log.warning(st.last_error)
         return st
 
+    install_root = resolve_install_root(cfg)
+    previous = current_release_version(install_root)
+    # If running from a slot that isn't version-named, keep package_version as prev.
+    if previous is None:
+        prev_pkg = package_version()
+        if prev_pkg and version_cmp(prev_pkg, desired) != 0:
+            previous = prev_pkg
+
+    helper = _default_apply_helper()
     try:
-        st.status = "downloading"
+        st.status = STATUS_DOWNLOADING
         log.info("applying update %s from %s", desired, manifest_url)
         manifest = fetch_manifest(manifest_url)
         if version_cmp(manifest.version, desired) != 0:
@@ -637,37 +921,54 @@ def maybe_update_from_heartbeat(
             except UpdateError:
                 pem = None
         require_sig = getattr(cfg, "update_require_signature", True)
-        st.status = "installing"
+        st.status = STATUS_INSTALLING
+        # Persist installing so a crash mid-apply is visible in update_status.json
+        if status_path is not None:
+            write_update_status(Path(status_path), st)
+
         apply_release(
             manifest,
-            install_root=resolve_install_root(cfg),
+            install_root=install_root,
             public_key_pem=pem,
             require_signature=require_sig and pem is not None,
-            restart=True,
-            apply_helper=_default_apply_helper(),
+            restart=False,
+            apply_helper=helper,
         )
-        st.status = "idle"
-        st.current_version = manifest.version
-        st.last_error = None
+        mark_pending_health(
+            st,
+            target_version=manifest.version,
+            previous_version=previous if previous != manifest.version else None,
+            gate_seconds=health_gate_seconds(cfg),
+            channel=str(channel) if channel else None,
+        )
+        if status_path is not None:
+            write_update_status(Path(status_path), st)
+        log.info(
+            "activated %s — pending_health until whoami (deadline %s)",
+            manifest.version,
+            st.health_deadline_at,
+        )
+        restart_services(helper)
     except UpdateError as e:
-        st.status = "failed"
+        st.status = STATUS_FAILED
         st.last_error = e.message
         log.error("update failed: %s", e.message)
     except Exception as e:
-        st.status = "failed"
+        st.status = STATUS_FAILED
         st.last_error = str(e)
         log.exception("update failed")
     return st
 
 
 def _default_apply_helper() -> Path | None:
-    candidates = [
-        Path("/usr/local/lib/vesyl-print/apply-update"),
-        Path(__file__).resolve().parent / "scripts" / "apply-update",
-    ]
-    for p in candidates:
-        if p.is_file():
-            return p
+    """Prefer the root-installed helper only (NOPASSWD sudoers on appliances).
+
+    Do not auto-pick the repo copy of ``scripts/apply-update`` — that requires
+    root and breaks lab/unit-test flips under a writable install root.
+    """
+    installed = Path("/usr/local/lib/vesyl-print/apply-update")
+    if installed.is_file():
+        return installed
     return None
 
 
@@ -675,6 +976,14 @@ def _utc_now() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _utc_now_plus(seconds: int) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (
+        datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=seconds)
+    ).isoformat()
 
 
 def write_update_status(path: Path, status: UpdateStatus) -> None:
@@ -693,11 +1002,19 @@ def read_update_status(path: Path) -> UpdateStatus | None:
         return None
     if not isinstance(data, dict):
         return None
+    attempts = data.get("health_attempts") or 0
+    try:
+        attempts_i = int(attempts)
+    except (TypeError, ValueError):
+        attempts_i = 0
     return UpdateStatus(
-        status=str(data.get("status") or "idle"),
+        status=str(data.get("status") or STATUS_IDLE),
         current_version=str(data.get("current_version") or package_version()),
         target_version=data.get("target_version"),
         last_error=data.get("last_error"),
         last_checked_at=data.get("last_checked_at"),
         channel=data.get("channel"),
+        previous_version=data.get("previous_version"),
+        health_deadline_at=data.get("health_deadline_at"),
+        health_attempts=attempts_i,
     )

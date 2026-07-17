@@ -250,5 +250,177 @@ class TestChecksum(unittest.TestCase):
                 )
 
 
+class TestHealthGate(unittest.TestCase):
+    def _two_slots(self, td_path: Path) -> Path:
+        install_root = td_path / "opt"
+        for ver in ("0.3.0", "0.4.0"):
+            tarball = _build_release_tree(td_path / ver, ver)
+            release_dir = install_root / "releases" / ver
+            update_mod.extract_tarball(tarball, release_dir)
+            update_mod.write_version_file(release_dir, ver)
+        update_mod.flip_current(install_root, "0.4.0")
+        return install_root
+
+    def test_pending_health_success_whoami_ok(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            install_root = self._two_slots(td_path)
+            cfg = Config(
+                api_base_url="https://example.test",
+                state_dir=td_path / "state",
+                update_health_gate_seconds=60,
+            )
+            st = update_mod.UpdateStatus(
+                status=update_mod.STATUS_PENDING_HEALTH,
+                current_version="0.4.0",
+                target_version="0.4.0",
+                previous_version="0.3.0",
+                health_deadline_at=update_mod._utc_now_plus(60),
+            )
+            out = update_mod.process_pending_health(
+                st,
+                cfg=cfg,
+                whoami_result="ok",
+                install_root=install_root,
+                restart_on_rollback=False,
+            )
+            self.assertEqual(out.status, update_mod.STATUS_IDLE)
+            self.assertIsNone(out.previous_version)
+            self.assertIsNone(out.health_deadline_at)
+            self.assertEqual((install_root / "current").resolve().name, "0.4.0")
+
+    def test_pending_health_retries_before_deadline(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            install_root = self._two_slots(td_path)
+            cfg = Config(api_base_url="https://example.test", state_dir=td_path / "state")
+            st = update_mod.UpdateStatus(
+                status=update_mod.STATUS_PENDING_HEALTH,
+                current_version="0.4.0",
+                target_version="0.4.0",
+                previous_version="0.3.0",
+                health_deadline_at=update_mod._utc_now_plus(120),
+            )
+            out = update_mod.process_pending_health(
+                st,
+                cfg=cfg,
+                whoami_result="error",
+                whoami_error="connection refused",
+                install_root=install_root,
+                restart_on_rollback=False,
+            )
+            self.assertEqual(out.status, update_mod.STATUS_PENDING_HEALTH)
+            self.assertEqual(out.health_attempts, 1)
+            self.assertEqual((install_root / "current").resolve().name, "0.4.0")
+
+    def test_pending_health_rollback_after_deadline(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            install_root = self._two_slots(td_path)
+            cfg = Config(api_base_url="https://example.test", state_dir=td_path / "state")
+            st = update_mod.UpdateStatus(
+                status=update_mod.STATUS_PENDING_HEALTH,
+                current_version="0.4.0",
+                target_version="0.4.0",
+                previous_version="0.3.0",
+                health_deadline_at="2000-01-01T00:00:00+00:00",  # long past
+            )
+            with mock.patch.object(update_mod, "restart_services"):
+                out = update_mod.process_pending_health(
+                    st,
+                    cfg=cfg,
+                    whoami_result="error",
+                    whoami_error="timeout",
+                    install_root=install_root,
+                    restart_on_rollback=True,
+                )
+            self.assertEqual(out.status, update_mod.STATUS_ROLLED_BACK)
+            self.assertEqual((install_root / "current").resolve().name, "0.3.0")
+            self.assertIn("rolled back", out.last_error or "")
+
+    def test_hard_local_fail_rolls_back_immediately(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            install_root = self._two_slots(td_path)
+            # Break the active slot entrypoints
+            cur = (install_root / "current").resolve()
+            (cur / "agent.py").unlink()
+            (cur / "main.py").unlink()
+            cfg = Config(api_base_url="https://example.test", state_dir=td_path / "state")
+            st = update_mod.UpdateStatus(
+                status=update_mod.STATUS_PENDING_HEALTH,
+                current_version="0.4.0",
+                target_version="0.4.0",
+                previous_version="0.3.0",
+                health_deadline_at=update_mod._utc_now_plus(120),
+            )
+            out = update_mod.process_pending_health(
+                st,
+                cfg=cfg,
+                whoami_result="ok",
+                install_root=install_root,
+                restart_on_rollback=False,
+            )
+            self.assertEqual(out.status, update_mod.STATUS_ROLLED_BACK)
+            self.assertEqual((install_root / "current").resolve().name, "0.3.0")
+
+    def test_unpaired_skipped_whoami_succeeds_local(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            install_root = self._two_slots(td_path)
+            cfg = Config(api_base_url="https://example.test", state_dir=td_path / "state")
+            st = update_mod.UpdateStatus(
+                status=update_mod.STATUS_PENDING_HEALTH,
+                current_version="0.4.0",
+                target_version="0.4.0",
+                previous_version="0.3.0",
+                health_deadline_at=update_mod._utc_now_plus(60),
+            )
+            out = update_mod.process_pending_health(
+                st,
+                cfg=cfg,
+                whoami_result="skipped",
+                install_root=install_root,
+                restart_on_rollback=False,
+            )
+            self.assertEqual(out.status, update_mod.STATUS_IDLE)
+
+    def test_maybe_update_defers_while_pending_health(self):
+        cfg = Config(
+            api_base_url="https://example.test",
+            auto_update_enabled=True,
+            releases_base_url="https://releases.example/print",
+        )
+        st = update_mod.UpdateStatus(
+            status=update_mod.STATUS_PENDING_HEALTH,
+            current_version="0.4.0",
+            target_version="0.4.0",
+            previous_version="0.3.0",
+        )
+        out = update_mod.maybe_update_from_heartbeat(
+            {"desired_agent_version": "9.9.9"},
+            cfg=cfg,
+            status=st,
+            auto_apply=True,
+        )
+        self.assertEqual(out.status, update_mod.STATUS_PENDING_HEALTH)
+        self.assertEqual(out.target_version, "0.4.0")
+
+    def test_mark_pending_health_fields(self):
+        st = update_mod.UpdateStatus()
+        update_mod.mark_pending_health(
+            st,
+            target_version="0.5.0",
+            previous_version="0.4.0",
+            gate_seconds=90,
+            channel="stable",
+        )
+        self.assertEqual(st.status, update_mod.STATUS_PENDING_HEALTH)
+        self.assertEqual(st.previous_version, "0.4.0")
+        self.assertEqual(st.target_version, "0.5.0")
+        self.assertIsNotNone(st.health_deadline_at)
+        self.assertEqual(st.channel, "stable")
+
+
 if __name__ == "__main__":
     unittest.main()

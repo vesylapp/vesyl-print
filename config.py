@@ -105,6 +105,8 @@ class Config:
     releases_base_url: str = DEFAULT_RELEASES_BASE_URL
     update_require_signature: bool = True
     update_public_key_path: str = ""  # empty → keys/update_public.pem
+    # Seconds after activate to pass whoami/local health before auto-rollback.
+    update_health_gate_seconds: int = 120
     config_dir: Path = field(default_factory=resolve_config_dir)
     state_dir: Path = field(default_factory=resolve_state_dir)
 
@@ -171,6 +173,11 @@ def _apply_file(data: dict[str, Any], cfg: Config) -> None:
         cfg.update_require_signature = bool(data["update_require_signature"])
     if kp := data.get("update_public_key_path"):
         cfg.update_public_key_path = str(kp)
+    if "update_health_gate_seconds" in data:
+        try:
+            cfg.update_health_gate_seconds = max(15, int(data["update_health_gate_seconds"]))
+        except (TypeError, ValueError):
+            pass
 
 
 def load_config(

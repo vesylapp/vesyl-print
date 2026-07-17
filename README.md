@@ -237,7 +237,11 @@ Local build (optional): `UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 
 }
 ```
 
-4. Agent downloads, verifies **SHA-256 + Ed25519**, installs under `/opt/vesyl-print/releases/<ver>/`, flips `current`, restarts services.
+4. Agent downloads, verifies **SHA-256 + Ed25519**, installs under `/opt/vesyl-print/releases/<ver>/`, flips `current`.
+5. Status becomes `pending_health` (not success yet); services restart.
+6. New agent runs the **health gate**: local slot checks + `whoami` when paired.
+   On success → `idle`. On hard failure or deadline (`update_health_gate_seconds`,
+   default 120s) → auto-rollback to the previous slot and restart.
 
 ### CLI
 
@@ -257,7 +261,8 @@ vesyl-print update rollback [--version 0.3.0] --restart
   "update_channel": "stable",
   "releases_base_url": "https://github.com/benwyrosdick/vesyl-print/releases/download",
   "update_require_signature": true,
-  "update_public_key_path": "/etc/vesyl-print/keys/update_public.pem"
+  "update_public_key_path": "/etc/vesyl-print/keys/update_public.pem",
+  "update_health_gate_seconds": 120
 }
 ```
 
