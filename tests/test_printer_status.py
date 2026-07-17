@@ -84,6 +84,108 @@ class TestCupsStatusParse(unittest.TestCase):
         self.assertEqual(items[0]["status_reasons"], ["media-empty"])
 
 
+class TestIppStatusParse(unittest.TestCase):
+    """lpstat only shows idle/printing — media-empty comes from IPP attrs."""
+
+    def test_ipp_processing_with_media_empty(self):
+        text = """
+        printer-state (enum) = processing
+        printer-state-reasons (1setOf keyword) = media-empty,media-needed
+        printer-state-message (textWithoutLanguage) =
+        queued-job-count (integer) = 1
+        """
+        parsed = printers._parse_ipp_printer_attrs(text)
+        self.assertEqual(parsed["status"], "stopped")
+        self.assertIn("media-empty", parsed["status_reasons"])
+        self.assertEqual(parsed["status_message"], "Out of paper")
+
+    def test_ipp_processing_media_empty_error_single(self):
+        text = """
+        printer-state (enum) = processing
+        printer-state-reasons (keyword) = media-empty-error
+        printer-state-message (textWithoutLanguage) = The printer is out of paper.
+        queued-job-count (integer) = 1
+        """
+        parsed = printers._parse_ipp_printer_attrs(text)
+        self.assertEqual(parsed["status"], "stopped")
+        self.assertEqual(parsed["status_message"], "The printer is out of paper.")
+
+    def test_ipp_idle_none(self):
+        text = """
+        printer-state (enum) = idle
+        printer-state-reasons (keyword) = none
+        printer-state-message (textWithoutLanguage) =
+        queued-job-count (integer) = 0
+        """
+        parsed = printers._parse_ipp_printer_attrs(text)
+        self.assertEqual(parsed["status"], "idle")
+        self.assertEqual(parsed["status_reasons"], [])
+        self.assertIsNone(parsed["status_message"])
+
+    def test_ipp_numeric_state_and_jam(self):
+        text = """
+        printer-state (enum) = 5
+        printer-state-reasons (keyword) = media-jam-error
+        """
+        parsed = printers._parse_ipp_printer_attrs(text)
+        self.assertEqual(parsed["status"], "stopped")
+        self.assertEqual(parsed["status_message"], "Paper jam")
+
+    def test_job_reasons_media_empty(self):
+        text = """
+        job-id (integer) = 42
+        job-state (enum) = processing
+        job-printer-state-reasons (1setOf keyword) = media-empty-error
+        job-state-reasons (keyword) = job-printing
+        """
+        info = printers._parse_ipp_jobs_attrs(text)
+        self.assertIn("media-empty-error", info["status_reasons"])
+        # job-printing is benign and filtered
+        self.assertNotIn("job-printing", info["status_reasons"])
+
+    def test_cups_queue_status_prefers_ipp(self):
+        ipp_dump = """
+        printer-state (enum) = processing
+        printer-state-reasons (keyword) = media-empty
+        printer-state-message (textWithoutLanguage) =
+        queued-job-count (integer) = 1
+        """
+        with mock.patch("printers._ipptool", side_effect=[ipp_dump, ""]), mock.patch(
+            "printers._run", return_value="printer Z is now printing Z-1.\n"
+        ):
+            st = printers.cups_queue_status("Z")
+        self.assertEqual(st["status"], "stopped")
+        self.assertEqual(st["status_message"], "Out of paper")
+        self.assertIn("media-empty", st["status_reasons"])
+
+    def test_device_uri_merge_when_local_reasons_empty(self):
+        local = """
+        printer-state (enum) = processing
+        printer-state-reasons (keyword) = none
+        queued-job-count (integer) = 1
+        """
+        device = """
+        printer-state (enum) = stopped
+        printer-state-reasons (keyword) = media-empty-error
+        printer-state-message (textWithoutLanguage) = Out of paper
+        """
+
+        def fake_ipptool(uri, test_body, timeout=5.0):
+            if "localhost" in uri and "Get-Jobs" in test_body:
+                return ""
+            if "localhost" in uri:
+                return local
+            return device
+
+        with mock.patch("printers._ipptool", side_effect=fake_ipptool):
+            st = printers.cups_queue_status(
+                "Brother_X", device_uri="ipps://brother.local/ipp/print"
+            )
+        self.assertEqual(st["status"], "stopped")
+        self.assertIn("media-empty-error", st["status_reasons"])
+        self.assertEqual(st["status_message"], "Out of paper")
+
+
 class TestWaitCupsJob(unittest.TestCase):
     def test_returns_printed_when_job_leaves_active(self):
         calls = {"n": 0}

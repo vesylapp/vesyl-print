@@ -9,12 +9,17 @@ network printer. Requires membership in the 'lpadmin' group to add printers
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
+import tempfile
+from pathlib import Path
 
 # Test page sent to a printer right after the app auto-provisions it.
 TEST_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "base.jpg")
+
+log = logging.getLogger("vesyl-print.printers")
 
 # CUPS device-URI schemes that indicate a printer reached over the network
 # (as opposed to usb://, parallel://, serial://, file://, ...).
@@ -217,7 +222,7 @@ def ensure_printer() -> str | None:
     return names[0] if names else None
 
 
-# CUPS printer-state-reasons → operator-facing labels (subset of IPP).
+# CUPS / IPP printer-state-reasons → operator-facing labels (subset of IPP).
 _REASON_LABELS: dict[str, str] = {
     "media-empty": "Out of paper",
     "media-empty-error": "Out of paper",
@@ -233,6 +238,8 @@ _REASON_LABELS: dict[str, str] = {
     "door-open": "Door open",
     "door-open-error": "Door open",
     "cover-open": "Cover open",
+    "input-tray-missing": "Tray missing",
+    "output-tray-missing": "Output tray missing",
     "paused": "Paused",
     "offline": "Offline",
     "offline-report": "Offline",
@@ -242,6 +249,11 @@ _REASON_LABELS: dict[str, str] = {
     "shutdown": "Shutdown",
     "timed-out": "Timed out",
     "stopped": "Stopped",
+    # Job-level reasons that surface during paper-out holds
+    "job-hold-until-specified": "Held",
+    "resources-are-not-ready": "Resources not ready",
+    "printer-stopped": "Printer stopped",
+    "printer-stopped-partly": "Printer stopped",
 }
 
 # Reasons that mean the queue is effectively offline (not just stopped).
@@ -255,24 +267,99 @@ _OFFLINE_REASONS = frozenset(
     }
 )
 
+# Actionable device conditions → force status "stopped" for admin.
+_ACTIONABLE_REASON_PREFIXES = (
+    "media-empty",
+    "media-needed",
+    "media-jam",
+    "toner-empty",
+    "marker-supply-empty",
+    "door-open",
+    "cover-open",
+    "input-tray-missing",
+    "output-tray-missing",
+    "paused",
+    "stopped",
+    "printer-stopped",
+    "resources-are-not-ready",
+)
+
 # Noise IPP always reports when healthy — ignore for status_message.
 _BENIGN_REASONS = frozenset(
     {
         "none",
         "-",
         "",
-        "media-empty-warning",  # keep real empty errors only via labels above
+        # Informational CUPS progress tokens — not operator faults.
+        "cups-waiting-for-job-completed",
+        "job-printing",
+        "job-completed-successfully",
+        "processing-to-stop-point",
+        "moving-to-paused",
     }
 )
+
+# IPP printer-state enum → our status strings.
+_IPP_STATE_MAP = {
+    "3": "idle",
+    "idle": "idle",
+    "4": "printing",
+    "processing": "printing",
+    "5": "stopped",
+    "stopped": "stopped",
+}
+
+# Embedded Get-Printer-Attributes test used with ipptool (no external file dep).
+_IPP_GET_PRINTER_TEST = """\
+{
+OPERATION Get-Printer-Attributes
+GROUP operation-attributes-tag
+ATTR charset attributes-charset utf-8
+ATTR naturalLanguage attributes-natural-language en
+ATTR uri printer-uri $uri
+ATTR keyword requested-attributes printer-state,printer-state-reasons,printer-state-message,queued-job-count,printer-is-accepting-jobs
+}
+"""
+
+_IPP_GET_JOBS_TEST = """\
+{
+OPERATION Get-Jobs
+GROUP operation-attributes-tag
+ATTR charset attributes-charset utf-8
+ATTR naturalLanguage attributes-natural-language en
+ATTR uri printer-uri $uri
+ATTR keyword which-jobs not-completed
+ATTR keyword requested-attributes job-id,job-state,job-state-reasons,job-printer-state-reasons,job-printer-state-message,job-state-message
+}
+"""
 
 
 def _normalize_reason(raw: str) -> str:
     r = raw.strip().lower().replace("_", "-")
-    # CUPS sometimes suffixes "-error" / "-report" — keep as-is for label map.
-    return r
+    # Strip surrounding quotes from ipptool dumps.
+    return r.strip("\"'")
 
 
-def _human_status_message(reasons: list[str]) -> str | None:
+def _dedupe_reasons(reasons: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for r in reasons:
+        if r in _BENIGN_REASONS or r in seen:
+            continue
+        seen.add(r)
+        out.append(r)
+    return out
+
+
+def _human_status_message(
+    reasons: list[str], *, state_message: str | None = None
+) -> str | None:
+    """Prefer explicit IPP printer-state-message, else map reasons to labels."""
+    if state_message:
+        msg = state_message.strip()
+        if msg and msg.lower() not in ("none", "-", "n/a"):
+            return msg
+
     labels: list[str] = []
     seen: set[str] = set()
     for r in reasons:
@@ -280,7 +367,10 @@ def _human_status_message(reasons: list[str]) -> str | None:
             continue
         label = _REASON_LABELS.get(r)
         if label is None:
-            # Fall back to a cleaned reason token.
+            # media-empty-warning etc. → try base token before -warning/-report
+            base = re.sub(r"-(warning|report|error)$", "", r)
+            label = _REASON_LABELS.get(base)
+        if label is None:
             label = r.replace("-", " ").strip()
             if label.endswith(" error"):
                 label = label[: -len(" error")]
@@ -293,20 +383,226 @@ def _human_status_message(reasons: list[str]) -> str | None:
     return "; ".join(labels)
 
 
-def _parse_lpstat_printer_block(text: str, queue: str) -> tuple[str, list[str]]:
-    """Parse ``lpstat -p <queue> -l`` into (status, reasons).
+def _reason_is_actionable(reason: str) -> bool:
+    if reason in _BENIGN_REASONS:
+        return False
+    if reason.endswith("-error"):
+        return True
+    return any(
+        reason == p or reason.startswith(p + "-") for p in _ACTIONABLE_REASON_PREFIXES
+    )
 
-    Status values match wms-api ``Constants::Print::PrinterStates``:
-    idle | printing | stopped | offline | unknown
+
+def _status_from_state_and_reasons(
+    base_status: str, reasons: list[str]
+) -> str:
+    """Upgrade idle/printing → stopped/offline when device conditions present."""
+    if any(r in _OFFLINE_REASONS for r in reasons):
+        return "offline"
+    if any(_reason_is_actionable(r) for r in reasons):
+        return "stopped"
+    return base_status if base_status in (
+        "idle", "printing", "stopped", "offline", "unknown"
+    ) else "unknown"
+
+
+def _parse_ipp_attr_values(text: str, attr_name: str) -> list[str]:
+    """Extract values for an attribute from ``ipptool -tv`` output.
+
+    Handles:
+      attr (keyword) = media-empty
+      attr (1setOf keyword) = media-empty,media-needed
+      attr (enum) = processing
+      attr (textWithoutLanguage) = Out of paper
+
+    Line-based: empty values like ``message = `` must not swallow the next
+    attribute (``\\s*`` after ``=`` would otherwise consume the newline).
+    """
+    values: list[str] = []
+    # Only horizontal whitespace after '=' so blank values stay blank.
+    pat = re.compile(
+        rf"^\s*{re.escape(attr_name)}\s*\([^)]*\)\s*=[ \t]*(.*)$",
+        re.IGNORECASE,
+    )
+    for line in (text or "").splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        if not raw:
+            continue
+        # 1setOf often comma-separated on one line.
+        for p in re.split(r"\s*,\s*", raw):
+            p = p.strip().strip("\"'")
+            if p:
+                values.append(p)
+    return values
+
+
+def _parse_ipp_printer_attrs(text: str) -> dict[str, object]:
+    """Parse Get-Printer-Attributes ipptool -tv dump → status fields."""
+    states = _parse_ipp_attr_values(text, "printer-state")
+    reason_raw = _parse_ipp_attr_values(text, "printer-state-reasons")
+    messages = _parse_ipp_attr_values(text, "printer-state-message")
+    queued = _parse_ipp_attr_values(text, "queued-job-count")
+
+    base = "unknown"
+    if states:
+        token = states[0].strip().lower()
+        # enum may be "processing" or integer "4"
+        base = _IPP_STATE_MAP.get(token, "unknown")
+        if base == "unknown" and token.isdigit():
+            base = _IPP_STATE_MAP.get(token, "unknown")
+
+    reasons = _dedupe_reasons([_normalize_reason(r) for r in reason_raw])
+    state_message = messages[0].strip() if messages else None
+    if state_message in ("",):
+        state_message = None
+
+    queued_n = 0
+    if queued:
+        try:
+            queued_n = int(queued[0])
+        except ValueError:
+            queued_n = 0
+
+    status = _status_from_state_and_reasons(base, reasons)
+    return {
+        "status": status,
+        "status_reasons": reasons,
+        "status_message": _human_status_message(reasons, state_message=state_message),
+        "queued_job_count": queued_n,
+        "base_status": base,
+    }
+
+
+def _parse_ipp_jobs_attrs(text: str) -> dict[str, object]:
+    """Pull condition reasons from active jobs (paper-out often lives here)."""
+    reasons: list[str] = []
+    for attr in (
+        "job-printer-state-reasons",
+        "job-state-reasons",
+        "job-printer-state-message",
+        "job-state-message",
+    ):
+        for v in _parse_ipp_attr_values(text, attr):
+            # Messages may be free text; still try to normalize token-ish values.
+            if " " in v and attr.endswith("message"):
+                # Free-text message — keep as pseudo-reason only if known phrase.
+                low = v.strip().lower()
+                if "out of paper" in low or "paper empty" in low or "no paper" in low:
+                    reasons.append("media-empty")
+                elif "paper jam" in low or "jam" in low:
+                    reasons.append("media-jam")
+                elif "door" in low or "cover" in low:
+                    reasons.append("door-open")
+                continue
+            reasons.append(_normalize_reason(v))
+    return {"status_reasons": _dedupe_reasons(reasons)}
+
+
+def _ipptool(uri: str, test_body: str, *, timeout: float = 5.0) -> str:
+    """Run ipptool -tv against *uri* with an inline test file; return stdout."""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".test", prefix="vesyl-ipp-", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(test_body)
+            path = f.name
+        try:
+            result = subprocess.run(
+                ["ipptool", "-tv", "-T", str(max(1, int(timeout))), uri, path],
+                capture_output=True,
+                text=True,
+                timeout=timeout + 2.0,
+            )
+            return (result.stdout or "") + (result.stderr or "")
+        finally:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("ipptool %s failed: %s", uri, e)
+        return ""
+
+
+def _ipp_local_uri(queue: str) -> str:
+    # CUPS always exposes local queues on the loopback IPP service.
+    return f"ipp://localhost/printers/{queue}"
+
+
+def _ipp_query_queue(queue: str, device_uri: str | None = None) -> dict[str, object] | None:
+    """Best-effort IPP status for a CUPS queue (+ optional device URI merge)."""
+    local_uri = _ipp_local_uri(queue)
+    raw = _ipptool(local_uri, _IPP_GET_PRINTER_TEST, timeout=4.0)
+    if not raw or "printer-state" not in raw:
+        return None
+
+    parsed = _parse_ipp_printer_attrs(raw)
+
+    # Active jobs often carry media-empty / jam when the queue still says
+    # "processing" with reasons=none (common on driverless IPP Everywhere).
+    jobs_raw = _ipptool(local_uri, _IPP_GET_JOBS_TEST, timeout=4.0)
+    if jobs_raw:
+        job_info = _parse_ipp_jobs_attrs(jobs_raw)
+        job_reasons = list(job_info.get("status_reasons") or [])
+        if job_reasons:
+            merged = _dedupe_reasons(list(parsed["status_reasons"]) + job_reasons)
+            parsed["status_reasons"] = merged
+            parsed["status"] = _status_from_state_and_reasons(
+                str(parsed.get("base_status") or parsed["status"]), merged
+            )
+            parsed["status_message"] = _human_status_message(
+                merged,
+                state_message=str(parsed["status_message"])
+                if parsed.get("status_message")
+                else None,
+            )
+
+    # When the local queue still has no actionable reason, ask the device itself.
+    # Skip implicitclass / non-IPP backends (no Get-Printer-Attributes).
+    if device_uri and not any(_reason_is_actionable(r) for r in parsed["status_reasons"]):
+        scheme = device_uri.split(":", 1)[0].lower()
+        if scheme in ("ipp", "ipps", "http", "https"):
+            dev_raw = _ipptool(device_uri, _IPP_GET_PRINTER_TEST, timeout=3.0)
+            if dev_raw and "printer-state" in dev_raw:
+                dev = _parse_ipp_printer_attrs(dev_raw)
+                dev_reasons = list(dev.get("status_reasons") or [])
+                if dev_reasons:
+                    merged = _dedupe_reasons(
+                        list(parsed["status_reasons"]) + dev_reasons
+                    )
+                    parsed["status_reasons"] = merged
+                    # Prefer device base state when more severe / informative.
+                    base = str(
+                        dev.get("base_status")
+                        or parsed.get("base_status")
+                        or parsed["status"]
+                    )
+                    parsed["status"] = _status_from_state_and_reasons(base, merged)
+                    msg = dev.get("status_message") or parsed.get("status_message")
+                    parsed["status_message"] = _human_status_message(
+                        merged,
+                        state_message=str(msg) if msg else None,
+                    )
+
+    return {
+        "status": parsed["status"],
+        "status_reasons": parsed["status_reasons"],
+        "status_message": parsed["status_message"],
+    }
+
+
+def _parse_lpstat_printer_block(text: str, queue: str) -> tuple[str, list[str]]:
+    """Parse ``lpstat -p <queue> -l`` into (status, reasons) — fallback only.
+
+    ``lpstat`` rarely exposes media-empty; prefer IPP via :func:`_ipp_query_queue`.
+    Status values match wms-api ``Constants::Print::PrinterStates``.
     """
     if not text or not text.strip():
         return "unknown", []
 
-    # First line is typically:
-    #   printer NAME is idle.  enabled since ...
-    #   printer NAME now printing NAME-42.  enabled since ...
-    #   printer NAME disabled since ... -
-    #   printer NAME is offline.  ...
     first = ""
     for line in text.splitlines():
         if line.strip():
@@ -315,15 +611,12 @@ def _parse_lpstat_printer_block(text: str, queue: str) -> tuple[str, list[str]]:
     low = first.lower()
 
     reasons: list[str] = []
-    # Reason / alert lines are indented under the printer block.
     for line in text.splitlines()[1:]:
         stripped = line.strip()
         if not stripped:
             continue
-        # Stop if another printer block starts (shouldn't happen with -p NAME).
         if stripped.lower().startswith("printer ") and not line[:1].isspace():
             break
-        # "Alert: media-empty-error" / "Alerts: media-empty, paused"
         if stripped.lower().startswith("alert"):
             _, _, rest = stripped.partition(":")
             for part in re.split(r"[,;]+", rest):
@@ -331,13 +624,11 @@ def _parse_lpstat_printer_block(text: str, queue: str) -> tuple[str, list[str]]:
                 if r and r not in _BENIGN_REASONS:
                     reasons.append(r)
             continue
-        # Bare reason tokens CUPS prints as the disable reason body.
         if ":" not in stripped and " " not in stripped:
             r = _normalize_reason(stripped)
             if r and r not in _BENIGN_REASONS:
                 reasons.append(r)
             continue
-        # "Reason: Out of paper" / "State Reason: media-empty"
         if "reason" in stripped.lower() and ":" in stripped:
             _, _, rest = stripped.partition(":")
             for part in re.split(r"[,;]+", rest):
@@ -345,67 +636,43 @@ def _parse_lpstat_printer_block(text: str, queue: str) -> tuple[str, list[str]]:
                 if r and r not in _BENIGN_REASONS:
                     reasons.append(r)
 
-    # Dedupe preserving order
-    seen: set[str] = set()
-    uniq_reasons: list[str] = []
-    for r in reasons:
-        if r not in seen:
-            seen.add(r)
-            uniq_reasons.append(r)
-    reasons = uniq_reasons
+    reasons = _dedupe_reasons(reasons)
 
-    status = "unknown"
+    base = "unknown"
     if " is offline" in low or low.endswith(" offline.") or " offline " in low:
-        status = "offline"
+        base = "offline"
     elif "disabled" in low:
-        status = "stopped"
+        base = "stopped"
     elif "now printing" in low or " is printing" in low or "printing" in low:
-        status = "printing"
+        base = "printing"
     elif " is idle" in low or low.endswith(" idle."):
-        status = "idle"
+        base = "idle"
     elif "stopped" in low:
-        status = "stopped"
+        base = "stopped"
+    elif first and "enable" in low:
+        base = "idle"
 
-    # Reasons can force a more severe status even when CUPS still says idle
-    # (some drivers report media-empty while idle until a job is sent).
-    if any(r in _OFFLINE_REASONS for r in reasons):
-        status = "offline"
-    elif reasons and status in ("idle", "unknown", "printing"):
-        # Condition present (paper out, jam, door, …) → stopped so admin acts.
-        # Even if CUPS still says "printing", the job is held at the device.
-        actionable = {
-            "Out of paper",
-            "Paper jam",
-            "Door open",
-            "Cover open",
-            "Toner empty",
-            "Paused",
-        }
-        error_like = any(
-            r.endswith("-error")
-            or (r in _REASON_LABELS and _REASON_LABELS[r] in actionable)
-            for r in reasons
-        )
-        if error_like:
-            status = "stopped"
-
-    if status == "unknown" and queue:
-        # Last resort: any non-empty first line implies the queue exists.
-        if first:
-            status = "idle" if "enable" in low else "unknown"
-
-    return status, reasons
+    return _status_from_state_and_reasons(base, reasons), reasons
 
 
-def cups_queue_status(queue: str) -> dict[str, object]:
-    """Live CUPS status for one queue: status, status_reasons, status_message."""
+def cups_queue_status(
+    queue: str, *, device_uri: str | None = None
+) -> dict[str, object]:
+    """Live CUPS/IPP status for one queue: status, status_reasons, status_message.
+
+    Prefers IPP Get-Printer-Attributes (via ``ipptool``) so media-empty / jam
+    surface correctly. ``lpstat -p`` only reports idle/printing and is fallback.
+    """
+    ipp = _ipp_query_queue(queue, device_uri=device_uri)
+    if ipp is not None:
+        return ipp
+
     out = _run(["lpstat", "-p", queue, "-l"], 5)
     status, reasons = _parse_lpstat_printer_block(out, queue)
-    message = _human_status_message(reasons)
     return {
         "status": status,
         "status_reasons": reasons,
-        "status_message": message,
+        "status_message": _human_status_message(reasons),
     }
 
 
@@ -418,7 +685,7 @@ def inventory_payload() -> list[dict[str, object]]:
     """
     items: list[dict[str, object]] = []
     for queue, uri in configured_network_queues():
-        st = cups_queue_status(queue)
+        st = cups_queue_status(queue, device_uri=uri)
         items.append(
             {
                 "cups_name": queue,
