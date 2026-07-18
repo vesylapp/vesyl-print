@@ -1,32 +1,49 @@
-"""VESYL print device — system info + cloud pairing status display.
+"""VESYL print device — multi-page LCD status display.
 
-Renders time, host info, printers, cloud pairing state, agent version, and
-OTA progress to the 3.5" LCD (/dev/fb1) and refreshes once a second.
+Paired: Ops (default) → Network → System; tap cycles; 10s idle returns to Ops.
+Unpaired / revoked: engineer network view for connect + claim.
+
+Renders to the 3.5" LCD (/dev/fb1) at ~1 Hz.
 Run with:  python3 main.py
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import signal
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
 import printers
 import statusio
 import sysinfo
+import touch as touch_mod
 import update as update_mod
 from config import AGENT_VERSION, load_config
 from display_status import (
     DOWN,
+    IDLE_HOME_SECONDS,
     OK,
+    PAGE_NETWORK,
+    PAGE_OPS,
+    PAGE_SYSTEM,
+    PAIRED_PAGES,
     WARN,
+    PageState,
+    count_queue_jobs,
     format_agent_version,
+    heartbeat_age_label,
+    identity_line,
+    jobs_strip_label,
     ota_display_message,
+    printer_status_color,
+    printer_status_label,
 )
 from framebuffer import Framebuffer
 from stream_lcd import (
@@ -36,6 +53,8 @@ from stream_lcd import (
     DEFAULT_SCALE,
     LcdStreamServer,
 )
+
+log = logging.getLogger("vesyl-print.display")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -53,6 +72,9 @@ ACCENT = (237, 252, 51)  # VESYL yellow-green, matches logo mark
 FG = (235, 238, 245)
 MUTED = (140, 148, 165)
 
+# Background inventory refresh (CUPS/IPP can be slow).
+_PRINTER_REFRESH_S = 8.0
+
 
 def load_font(path: str, size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(path, size)
@@ -64,6 +86,10 @@ class InfoScreen:
         fb: Framebuffer,
         status_path: str | None = None,
         update_status_path: str | None = None,
+        queue_dir: str | Path | None = None,
+        *,
+        initial_page: str = PAGE_OPS,
+        idle_home_seconds: float = IDLE_HOME_SECONDS,
     ):
         self.fb = fb
         self.w, self.h = fb.size
@@ -75,9 +101,16 @@ class InfoScreen:
         self.f_footer = load_font(FONT_PATH, 16)
         self.f_hint = load_font(FONT_PATH, 15)
         self.logo = self._load_logo()
-        # Filled by the background CUPS discovery thread after startup.
+        # Filled by the background CUPS discovery / status thread.
         self.printer_names: list[str] = []
+        self.printer_rows: list[dict[str, Any]] = []
         self.status_path = status_path
+        self.queue_dir = Path(queue_dir) if queue_dir else None
+        self.idle_home_seconds = idle_home_seconds
+        self._pages = PageState(
+            initial_page, idle_seconds=idle_home_seconds
+        )
+        self._page_lock = threading.Lock()
         if update_status_path:
             self.update_status_path = update_status_path
         elif status_path:
@@ -113,8 +146,34 @@ class InfoScreen:
         except Exception:
             return format_agent_version(AGENT_VERSION)
 
+    # ── page navigation ──────────────────────────────────────────────
+
+    @property
+    def page(self) -> str:
+        return self._pages.page
+
+    def note_tap(self, *, paired: bool | None = None) -> None:
+        """Advance page on touch when paired. Unpaired ignores taps."""
+        if paired is None:
+            st = self._agent_status()
+            paired = bool(st and st.pairing == "paired")
+        with self._page_lock:
+            self._pages.note_tap(paired=paired, now_mono=time.monotonic())
+
+    def set_page(self, page: str) -> None:
+        with self._page_lock:
+            self._pages.set_page(page, now_mono=time.monotonic())
+
+    def _sync_page_idle(self, pairing: str) -> str:
+        """Apply idle-home and return the page to render (ops if not paired)."""
+        with self._page_lock:
+            return self._pages.sync(
+                paired=(pairing == "paired"),
+                now_mono=time.monotonic(),
+            )
+
     def render(self) -> Image.Image:
-        """Live screen: host info, printers, cloud pairing status."""
+        """Live screen: pairing-aware multi-page UI."""
         img, d = self._new()
         body_top = self._live_header(img, d)
         st = self._agent_status()
@@ -126,7 +185,14 @@ class InfoScreen:
         if pairing != "paired":
             return self._render_unpaired(img, d, body_top, st)
 
-        return self._render_paired(img, d, body_top, st, cloud)
+        page = self._sync_page_idle(pairing)
+        if page == PAGE_NETWORK:
+            return self._render_network(img, d, body_top, st, cloud)
+        if page == PAGE_SYSTEM:
+            return self._render_system(img, d, body_top, st, cloud)
+        return self._render_ops(img, d, body_top, st, cloud)
+
+    # ── unpaired / revoked (engineer network) ───────────────────────
 
     def _render_unpaired(
         self, img, d, body_top: int, st: statusio.AgentStatus | None = None
@@ -138,14 +204,16 @@ class InfoScreen:
             self._centered(d, label, self.f_label, y=y, fill=color)
             y += 28
         self._centered(d, "Unpaired", self.f_label, y=y, fill=WARN)
-        y += 28
+        y += 26
         self._centered(
             d, "claim: vesyl-print claim <CODE>", self.f_hint, y=y, fill=MUTED
         )
-        y += 36
+        y += 32
         self._row(d, "HOSTNAME", sysinfo.hostname(), y=y)
-        y += 56
+        y += 52
         self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=y)
+        y += 52
+        self._row(d, "TAILSCALE", sysinfo.tailscale_ip(), y=y)
 
         self._draw_footer(d, st, default_label="unpaired", default_color=WARN)
         return img
@@ -160,73 +228,47 @@ class InfoScreen:
             self._centered(d, label, self.f_label, y=y, fill=color)
             y += 28
         self._centered(d, "Revoked", self.f_label, y=y, fill=DOWN)
-        y += 28
+        y += 24
         self._centered(d, "re-pair required", self.f_hint, y=y, fill=MUTED)
-        y += 26
+        y += 22
         self._centered(
             d, "vesyl-print claim <CODE>", self.f_hint, y=y, fill=MUTED
         )
-        y += 36
+        y += 28
         if st and st.organization_name:
             self._row(d, "WAS", st.organization_name, y=y)
-            y += 56
+            y += 48
         self._row(d, "IP ADDRESS", sysinfo.primary_ip(), y=y)
+        y += 48
+        self._row(d, "TAILSCALE", sysinfo.tailscale_ip(), y=y)
 
         self._draw_footer(d, st, default_label="revoked", default_color=DOWN)
         return img
 
-    def _render_paired(
-        self,
-        img,
-        d,
-        body_top: int,
-        st: statusio.AgentStatus | None,
-        cloud: str,
-    ) -> Image.Image:
-        # Printer list sits above the status line (right side).
-        printer_line_h = 18
-        n_printers = len(self.printer_names)
-        list_bottom = self.h - 48
+    # ── paired pages ─────────────────────────────────────────────────
 
-        org = (st.organization_name if st else None) or "—"
-        wh = (st.warehouse_name if st else None) or "—"
-
+    def _ota_banner(self, d, y: int) -> int:
+        """Paint OTA banner if active; return new y."""
         ust = self._update_status()
         ota = ota_display_message(ust)
-        y = body_top
-        # Prominent OTA banner so operators see progress / failure immediately.
-        if ota:
-            label, color = ota
-            self._centered(d, label, self.f_label, y=y, fill=color)
-            y += 26
-            if ust and ust.last_error and ust.status in (
-                update_mod.STATUS_FAILED,
-                update_mod.STATUS_ROLLED_BACK,
-            ):
-                err = self._fit(d, ust.last_error, self.f_hint, self.w - 32)
-                self._centered(d, err, self.f_hint, y=y, fill=MUTED)
-                y += 20
-            y += 6
+        if not ota:
+            return y
+        label, color = ota
+        self._centered(d, label, self.f_label, y=y, fill=color)
+        y += 26
+        if ust and ust.last_error and ust.status in (
+            update_mod.STATUS_FAILED,
+            update_mod.STATUS_ROLLED_BACK,
+        ):
+            err = self._fit(d, ust.last_error, self.f_hint, self.w - 32)
+            self._centered(d, err, self.f_hint, y=y, fill=MUTED)
+            y += 20
+        return y + 4
 
-        # Fixed pitch so each label/value block has air above the next label
-        # (even spacing used to squeeze rows when printers ate the footer).
-        row_pitch = 52 if ota else 56
-        rows = [
-            ("ORGANIZATION", org),
-            ("WAREHOUSE", wh),
-            ("IP ADDRESS", sysinfo.primary_ip()),
-            ("TAILSCALE", sysinfo.tailscale_ip()),
-        ]
-        for i, (label, value) in enumerate(rows):
-            self._row(d, label, value, y=y + i * row_pitch)
-
-        max_name_w = self.w - 120
-        for i, raw in enumerate(self.printer_names):
-            name = self._fit(d, raw, self.f_footer, max_name_w)
-            tw = d.textlength(name, font=self.f_footer)
-            py = list_bottom - (n_printers - 1 - i) * printer_line_h
-            d.text((self.w - 16 - tw, py), name, font=self.f_footer, fill=MUTED)
-
+    def _cloud_footer(
+        self, d, st: statusio.AgentStatus | None, cloud: str
+    ) -> None:
+        ota = ota_display_message(self._update_status())
         if ota:
             self._draw_footer(d, st, default_label=ota[0], default_color=ota[1])
         elif cloud == "online":
@@ -235,7 +277,159 @@ class InfoScreen:
             self._draw_footer(
                 d, st, default_label="cloud offline", default_color=DOWN
             )
+
+    def _render_ops(
+        self,
+        img,
+        d,
+        body_top: int,
+        st: statusio.AgentStatus | None,
+        cloud: str,
+    ) -> Image.Image:
+        y = self._ota_banner(d, body_top)
+
+        ident = identity_line(
+            warehouse_name=st.warehouse_name if st else None,
+            organization_name=st.organization_name if st else None,
+            node_name=st.name if st else None,
+        )
+        ident = self._fit(d, ident, self.f_value, self.w - 32)
+        d.text((16, y), ident, font=self.f_value, fill=FG)
+        y += 34
+
+        d.text((16, y), "PRINTERS", font=self.f_label, fill=MUTED)
+        y += 24
+
+        rows = self._ops_printer_rows()
+        if not rows:
+            d.text((16, y), "No printers", font=self.f_footer, fill=MUTED)
+            y += 22
+        else:
+            line_h = 22
+            # Leave room for jobs strip + footer.
+            max_rows = max(1, (self.h - 48 - y - 28) // line_h)
+            for row in rows[:max_rows]:
+                name = str(row.get("name") or "—")
+                status = row.get("status")
+                message = row.get("message")
+                color = printer_status_color(
+                    str(status) if status is not None else None
+                )
+                label = printer_status_label(
+                    str(status) if status is not None else None,
+                    str(message) if message else None,
+                )
+                # Dot
+                d.ellipse([16, y + 2, 28, y + 14], fill=color)
+                name_fit = self._fit(d, name, self.f_footer, self.w // 2 - 20)
+                d.text((34, y), name_fit, font=self.f_footer, fill=FG)
+                right = self._fit(d, label, self.f_footer, self.w // 2 - 24)
+                tw = d.textlength(right, font=self.f_footer)
+                d.text(
+                    (self.w - 16 - tw, y),
+                    right,
+                    font=self.f_footer,
+                    fill=MUTED,
+                )
+                y += line_h
+
+        # Jobs strip near footer
+        queued = count_queue_jobs(self.queue_dir) if self.queue_dir else 0
+        jobs = jobs_strip_label(queued)
+        d.text((16, self.h - 52), jobs, font=self.f_footer, fill=MUTED)
+
+        self._cloud_footer(d, st, cloud)
         return img
+
+    def _ops_printer_rows(self) -> list[dict[str, Any]]:
+        if self.printer_rows:
+            return self.printer_rows
+        return [
+            {"name": n, "status": None, "message": None}
+            for n in self.printer_names
+        ]
+
+    def _render_network(
+        self,
+        img,
+        d,
+        body_top: int,
+        st: statusio.AgentStatus | None,
+        cloud: str,
+    ) -> Image.Image:
+        y = self._ota_banner(d, body_top)
+        if st and (st.warehouse_name or st.organization_name or st.name):
+            ident = identity_line(
+                warehouse_name=st.warehouse_name,
+                organization_name=st.organization_name,
+                node_name=st.name,
+            )
+            ident = self._fit(d, ident, self.f_hint, self.w - 32)
+            self._centered(d, ident, self.f_hint, y=y, fill=MUTED)
+            y += 22
+
+        row_pitch = 52
+        rows = [
+            ("HOSTNAME", sysinfo.hostname()),
+            ("IP ADDRESS", sysinfo.primary_ip()),
+            ("TAILSCALE", sysinfo.tailscale_ip()),
+        ]
+        for i, (label, value) in enumerate(rows):
+            self._row(d, label, value, y=y + i * row_pitch)
+
+        self._centered(
+            d,
+            "tap · next  ·  home in 10s",
+            self.f_hint,
+            y=self.h - 52,
+            fill=MUTED,
+        )
+        self._cloud_footer(d, st, cloud)
+        return img
+
+    def _render_system(
+        self,
+        img,
+        d,
+        body_top: int,
+        st: statusio.AgentStatus | None,
+        cloud: str,
+    ) -> Image.Image:
+        y = self._ota_banner(d, body_top)
+        version = self._display_version(st) or "—"
+        hb = heartbeat_age_label(st.last_heartbeat_at if st else None)
+        temp = sysinfo.cpu_temp_c()
+        cloud_label = "online" if cloud == "online" else (
+            "offline" if cloud == "offline" else "unknown"
+        )
+
+        row_pitch = 50
+        rows = [
+            ("VERSION", version),
+            ("HEARTBEAT", hb),
+            ("CPU TEMP", temp),
+            ("CLOUD", cloud_label),
+        ]
+        for i, (label, value) in enumerate(rows):
+            self._row(d, label, value, y=y + i * row_pitch)
+
+        err_y = y + len(rows) * row_pitch
+        if st and st.last_error and err_y < self.h - 56:
+            err = self._fit(d, st.last_error, self.f_hint, self.w - 32)
+            d.text((16, err_y), "ERROR", font=self.f_label, fill=MUTED)
+            d.text((16, err_y + 22), err, font=self.f_hint, fill=DOWN)
+
+        self._centered(
+            d,
+            "tap · next  ·  home in 10s",
+            self.f_hint,
+            y=self.h - 52,
+            fill=MUTED,
+        )
+        self._cloud_footer(d, st, cloud)
+        return img
+
+    # ── chrome helpers ───────────────────────────────────────────────
 
     def render_splash(self) -> Image.Image:
         """Static boot splash (logo + 'booting…')."""
@@ -379,6 +573,32 @@ def open_framebuffer(device: str, wait: float = 0.0) -> Framebuffer:
             time.sleep(0.5)
 
 
+def _refresh_printers(screen: InfoScreen, stop: threading.Event) -> None:
+    """Discover queues once, then periodically refresh status for Ops."""
+    try:
+        screen.printer_names = printers.ensure_printers()
+    except Exception:
+        log.exception("printer discovery failed")
+
+    while not stop.is_set():
+        try:
+            inv = printers.inventory_payload()
+            rows = [
+                {
+                    "name": str(item.get("display_name") or item.get("cups_name") or "—"),
+                    "status": item.get("status"),
+                    "message": item.get("status_message"),
+                }
+                for item in inv
+            ]
+            screen.printer_rows = rows
+            if rows:
+                screen.printer_names = [str(r["name"]) for r in rows]
+        except Exception:
+            log.debug("printer inventory refresh failed", exc_info=True)
+        stop.wait(_PRINTER_REFRESH_S)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="/dev/fb1")
@@ -395,6 +615,28 @@ def main() -> None:
         "--splash",
         action="store_true",
         help="render the boot splash once and exit",
+    )
+    ap.add_argument(
+        "--page",
+        choices=list(PAIRED_PAGES),
+        default=PAGE_OPS,
+        help="initial paired page (default: ops); also used with --once",
+    )
+    ap.add_argument(
+        "--touch-device",
+        default=None,
+        help="input event path (default: auto-detect ADS7846/touchscreen)",
+    )
+    ap.add_argument(
+        "--no-touch",
+        action="store_true",
+        help="disable touch page cycling",
+    )
+    ap.add_argument(
+        "--idle-home",
+        type=float,
+        default=IDLE_HOME_SECONDS,
+        help=f"seconds without touch before returning to ops (default {IDLE_HOME_SECONDS:g})",
     )
     ap.add_argument(
         "--stream",
@@ -431,6 +673,7 @@ def main() -> None:
     cfg = load_config()
     status_path = str(cfg.status_path)
     update_status_path = str(cfg.update_status_path)
+    queue_dir = cfg.queue_dir
 
     manual = args.once or args.offline or args.splash
     fb = open_framebuffer(args.device, wait=0.0 if manual else 30.0)
@@ -438,6 +681,9 @@ def main() -> None:
         fb,
         status_path=status_path,
         update_status_path=update_status_path,
+        queue_dir=queue_dir,
+        initial_page=args.page,
+        idle_home_seconds=args.idle_home,
     )
 
     if args.offline:
@@ -455,10 +701,18 @@ def main() -> None:
         fb.show(screen.render())
         return
 
-    def resolve_printers():
-        screen.printer_names = printers.ensure_printers()
+    stop_bg = threading.Event()
+    threading.Thread(
+        target=_refresh_printers,
+        args=(screen, stop_bg),
+        daemon=True,
+        name="vesyl-printers",
+    ).start()
 
-    threading.Thread(target=resolve_printers, daemon=True).start()
+    listener: touch_mod.TouchListener | None = None
+    if not args.no_touch:
+        listener = touch_mod.open_touch(device=args.touch_device)
+        listener.start()
 
     streamer: LcdStreamServer | None = None
     if args.stream:
@@ -474,13 +728,29 @@ def main() -> None:
     try:
         while running["go"]:
             start = time.monotonic()
+            if listener is not None and listener.poll_tap():
+                screen.note_tap()
             frame = screen.render()
             fb.show(frame)
             if streamer is not None:
                 streamer.publish(frame)
             elapsed = time.monotonic() - start
-            time.sleep(max(0.0, args.interval - elapsed))
+            # Wake sooner when a tap may be pending so page changes feel snappy.
+            sleep_for = max(0.0, args.interval - elapsed)
+            if listener is not None and sleep_for > 0.05:
+                # Slice sleep so we can pick up taps mid-interval.
+                end = time.monotonic() + sleep_for
+                while running["go"] and time.monotonic() < end:
+                    if listener.poll_tap():
+                        screen.note_tap()
+                        break
+                    time.sleep(min(0.05, end - time.monotonic()))
+            elif sleep_for > 0:
+                time.sleep(sleep_for)
     finally:
+        stop_bg.set()
+        if listener is not None:
+            listener.stop()
         if streamer is not None:
             streamer.stop()
         try:

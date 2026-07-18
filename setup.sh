@@ -77,9 +77,10 @@ if ! python3 -c "import websocket" 2>/dev/null; then
         echo "   WARNING: websocket-client install failed — cable push disabled (pull still works)"
 fi
 
-# The service user must be in 'video' to write /dev/fb1, and 'lpadmin' to
-# discover and add network printers to CUPS without sudo.
-usermod -aG video,lpadmin "$RUN_USER"
+# The service user must be in 'video' to write /dev/fb1, 'lpadmin' to
+# discover and add network printers to CUPS without sudo, and 'input' to
+# read the MHS-3.5" resistive touchscreen (/dev/input/event*) for page cycle.
+usermod -aG video,lpadmin,input "$RUN_USER"
 
 # --- 2. locate the boot config + overlays dir ------------------------------
 if [[ -f /boot/firmware/config.txt ]]; then

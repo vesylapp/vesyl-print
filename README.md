@@ -6,7 +6,7 @@ Raspberry Pi **print node** for VESYL: LCD status display, CUPS printer discover
 
 | Component | Role |
 |-----------|------|
-| **LCD** (`main.py` / `vesyl-print-display.service`) | Clock, LAN IP, Tailscale IP, CUPS printers, cloud pairing, agent version, OTA progress |
+| **LCD** (`main.py` / `vesyl-print-display.service`) | Multi-page status (ops / network / system); touch cycle; unpaired network view; OTA |
 | **Agent** (`agent.py` / `vesyl-print-agent.service`) | Heartbeats + `whoami`; writes status for the LCD |
 | **CLI** (`vesyl-print`) | `claim`, `enroll`, `status`, `unpair` |
 
@@ -321,15 +321,47 @@ python3 -m unittest discover -s tests -v
 
 Unit tests mock HTTP; no network or real tokens required.
 
-## LCD pairing states
+## LCD views
+
+The display service paints the MHS-3.5" panel (and optional MJPEG stream).
+
+### Unpaired / revoked (engineer)
+
+Single **network** screen: hostname, LAN IP, Tailscale IP, claim hint. No page
+cycle — always ready for install/support.
+
+### Paired (multi-page)
+
+| Page | Content |
+|------|---------|
+| **Ops** (home) | Warehouse · node, printer status dots, local job queue depth |
+| **Network** | Hostname, LAN IP, Tailscale |
+| **System** | Version, last heartbeat age, CPU temp, cloud, last error |
+
+**Touch:** tap the resistive panel to advance Ops → Network → System → Ops.
+After **10 seconds** without a tap, the UI returns to Ops.
+
+```bash
+python3 main.py --page network          # start on network (paired)
+python3 main.py --no-touch              # disable page cycle
+python3 main.py --touch-device /dev/input/event0
+python3 main.py --idle-home 10
+```
+
+Touch uses the ADS7846/XPT2046 event node under `/dev/input` (auto-detected).
+If no device is found, the LCD stays on the default page (Ops when paired).
+`setup.sh` adds the service user to the `input` group so it can read the device
+(re-login / restart the display unit after setup if touch was previously denied).
+
+### Pairing / footer states
 
 Footer shows **agent version** just left of the status dot (e.g. `v0.3.0 ● cloud`).
 
 | State | Footer / message |
 |-------|------------------|
 | Unpaired | `unpaired` + `vesyl-print claim <CODE>` |
-| Paired + cloud OK | green `cloud` + org / warehouse |
-| Paired + cloud down | red `cloud offline` (last org/warehouse kept) |
+| Paired + cloud OK | green `cloud` |
+| Paired + cloud down | red `cloud offline` |
 | Revoked (401) | `revoked` + re-pair hint |
 | OTA downloading | amber `Updating X.Y.Z…` banner + footer |
 | OTA installing / health | amber `Installing…` / `Verifying…` |
@@ -348,9 +380,10 @@ agent.py          # heartbeat + pull + cable session
 cable.py          # ActionCable PrintNodeChannel client
 jobs.py           # durable queue + print pipeline
 statusio.py       # status.json for LCD
-display_status.py # OTA/version labels for LCD
+display_status.py # OTA/version/page labels for LCD
+touch.py          # ADS7846 tap → page cycle
 cli.py            # vesyl-print entry
-main.py           # LCD
+main.py           # LCD (ops/network/system pages)
 printers.py       # CUPS discovery + inventory_payload()
 requirements.txt  # websocket-client for cable
 ```
