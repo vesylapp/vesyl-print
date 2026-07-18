@@ -10,7 +10,7 @@
 # Env:
 #   UPDATE_PRIVATE_KEY       PEM private key contents (CI secret)
 #   UPDATE_PRIVATE_KEY_FILE  Path to PEM private key
-#   GITHUB_REPOSITORY        owner/repo (default: benwyrosdick/vesyl-print)
+#   GITHUB_REPOSITORY        owner/repo (default: vesylapp/vesyl-print)
 #   RELEASE_CHANNEL          stable|beta (default: stable)
 #   OUT_DIR                  output directory (default: dist)
 #
@@ -36,7 +36,7 @@ fi
 CHANNEL="${RELEASE_CHANNEL:-stable}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/dist}"
 ARCH="linux-aarch64"
-GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-benwyrosdick/vesyl-print}"
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-vesylapp/vesyl-print}"
 TAG="v${VERSION}"
 ASSET_NAME="vesyl-print-${VERSION}-${ARCH}.tar.gz"
 MANIFEST_NAME="vesyl-print-${VERSION}.manifest.json"

@@ -108,7 +108,7 @@ new versions beside it under the same install root.
 
 ### 4.2 Artifact format
 
-**CDN:** [GitHub Releases](https://github.com/benwyrosdick/vesyl-print/releases) (for now).
+**CDN:** [GitHub Releases](https://github.com/vesylapp/vesyl-print/releases) (for now).
 
 CI (`.github/workflows/release.yml`) runs on tag `vX.Y.Z` and uploads:
 
@@ -120,8 +120,8 @@ CI (`.github/workflows/release.yml`) runs on tag `vX.Y.Z` and uploads:
 **URLs (device default `releases_base_url`):**
 
 ```text
-https://github.com/benwyrosdick/vesyl-print/releases/download/vX.Y.Z/vesyl-print-X.Y.Z.manifest.json
-https://github.com/benwyrosdick/vesyl-print/releases/download/vX.Y.Z/vesyl-print-X.Y.Z-linux-aarch64.tar.gz
+https://github.com/vesylapp/vesyl-print/releases/download/vX.Y.Z/vesyl-print-X.Y.Z.manifest.json
+https://github.com/vesylapp/vesyl-print/releases/download/vX.Y.Z/vesyl-print-X.Y.Z-linux-aarch64.tar.gz
 ```
 
 Build locally: `./scripts/build-release.sh [VERSION]` with
@@ -134,7 +134,7 @@ Build locally: `./scripts/build-release.sh [VERSION]` with
   "version": "0.4.0",
   "channel": "stable",
   "min_agent_version": "0.3.0",
-  "artifact_url": "https://github.com/benwyrosdick/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0-linux-aarch64.tar.gz",
+  "artifact_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0-linux-aarch64.tar.gz",
   "artifact_sha256": "<64 hex>",
   "signature": "<base64 Ed25519>",
   "released_at": "2026-07-16T00:00:00Z"
@@ -243,7 +243,7 @@ separate `GET /print/v1/update` for v1).
   "last_seen_at": "…",
   "desired_agent_version": "0.4.0",
   "update_channel": "stable",
-  "update_url": "https://github.com/benwyrosdick/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json"
+  "update_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json"
 }
 ```
 
@@ -270,7 +270,7 @@ When the server does not yet send these fields, the agent stays idle (safe).
 {
   "auto_update_enabled": true,
   "update_channel": "stable",
-  "releases_base_url": "https://github.com/benwyrosdick/vesyl-print/releases/download",
+  "releases_base_url": "https://github.com/vesylapp/vesyl-print/releases/download",
   "update_require_signature": true,
   "update_public_key_path": "/etc/vesyl-print/keys/update_public.pem"
 }

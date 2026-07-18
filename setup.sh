@@ -164,7 +164,7 @@ if [[ ! -f /etc/vesyl-print/config.json ]]; then
   "cable_enabled": true,
   "auto_update_enabled": true,
   "update_channel": "stable",
-  "releases_base_url": "https://github.com/benwyrosdick/vesyl-print/releases/download"
+  "releases_base_url": "https://github.com/vesylapp/vesyl-print/releases/download"
 }
 CFG
     chown "$RUN_USER:$RUN_GROUP" /etc/vesyl-print/config.json

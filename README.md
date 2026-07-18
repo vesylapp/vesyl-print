@@ -233,7 +233,7 @@ Local build (optional): `UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 
   "ok": true,
   "desired_agent_version": "0.4.0",
   "update_channel": "stable",
-  "update_url": "https://github.com/benwyrosdick/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json"
+  "update_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json"
 }
 ```
 
@@ -251,7 +251,7 @@ Local build (optional): `UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 
 ```bash
 vesyl-print version
 vesyl-print update check
-vesyl-print update apply --manifest-url https://github.com/benwyrosdick/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json
+vesyl-print update apply --manifest-url https://github.com/vesylapp/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json
 vesyl-print update apply --file ./release.tar.gz --manifest ./release.manifest.json
 vesyl-print update rollback [--version 0.3.0] --restart
 ```
@@ -262,7 +262,7 @@ vesyl-print update rollback [--version 0.3.0] --restart
 {
   "auto_update_enabled": true,
   "update_channel": "stable",
-  "releases_base_url": "https://github.com/benwyrosdick/vesyl-print/releases/download",
+  "releases_base_url": "https://github.com/vesylapp/vesyl-print/releases/download",
   "update_require_signature": true,
   "update_public_key_path": "/etc/vesyl-print/keys/update_public.pem",
   "update_health_gate_seconds": 120
