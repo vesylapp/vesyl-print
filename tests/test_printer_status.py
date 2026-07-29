@@ -76,12 +76,74 @@ class TestCupsStatusParse(unittest.TestCase):
                 "status_reasons": ["media-empty"],
                 "status_message": "Out of paper",
             },
+        ), mock.patch(
+            "printers.queue_supports_raw", return_value=False
         ):
             items = printers.inventory_payload()
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["status"], "stopped")
         self.assertEqual(items[0]["status_message"], "Out of paper")
         self.assertEqual(items[0]["status_reasons"], ["media-empty"])
+        self.assertFalse(items[0]["supports_raw"])
+
+    def test_inventory_payload_reports_supports_raw(self):
+        with mock.patch(
+            "printers.configured_network_queues",
+            return_value=[("Zebra_Raw", "socket://192.168.1.50:9100")],
+        ), mock.patch(
+            "printers._display_name", return_value="Zebra ZD420"
+        ), mock.patch(
+            "printers.cups_queue_status",
+            return_value={
+                "status": "idle",
+                "status_reasons": [],
+                "status_message": None,
+            },
+        ), mock.patch(
+            "printers._lpoption", return_value="Local Raw Printer"
+        ):
+            items = printers.inventory_payload()
+        self.assertEqual(len(items), 1)
+        self.assertTrue(items[0]["supports_raw"])
+        self.assertEqual(items[0]["uri"], "socket://192.168.1.50:9100")
+
+
+class TestQueueSupportsRaw(unittest.TestCase):
+    def test_socket_uri_is_raw(self):
+        with mock.patch("printers._lpoption", return_value=""):
+            self.assertTrue(
+                printers.queue_supports_raw(
+                    "Z", device_uri="socket://192.168.1.10:9100"
+                )
+            )
+
+    def test_ipp_everywhere_is_not_raw(self):
+        with mock.patch(
+            "printers._lpoption",
+            side_effect=lambda q, k: {
+                "printer-make-and-model": "Printer - IPP Everywhere",
+                "printer-info": "Brother HL",
+            }.get(k, ""),
+        ):
+            self.assertFalse(
+                printers.queue_supports_raw(
+                    "Brother", device_uri="ipp://brother.local/ipp/print"
+                )
+            )
+
+    def test_local_raw_printer_model(self):
+        with mock.patch(
+            "printers._lpoption",
+            side_effect=lambda q, k: {
+                "printer-make-and-model": "Local Raw Printer",
+                "printer-info": "Zebra",
+            }.get(k, ""),
+        ):
+            self.assertTrue(
+                printers.queue_supports_raw(
+                    "Zebra", device_uri="usb://Zebra/ZD420"
+                )
+            )
 
 
 class TestIppStatusParse(unittest.TestCase):

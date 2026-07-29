@@ -676,12 +676,56 @@ def cups_queue_status(
     }
 
 
+def _lpoption(queue: str, key: str) -> str:
+    """Single ``lpoptions -p`` value for a queue (quoted or bare)."""
+    out = _run(["lpoptions", "-p", queue], 3)
+    m = re.search(rf"{key}='([^']*)'", out) or re.search(rf"{key}=(\S+)", out)
+    return m.group(1).strip() if m else ""
+
+
+def queue_supports_raw(queue: str, *, device_uri: str | None = None) -> bool:
+    """Whether this CUPS queue is a sensible target for ``lp -o raw`` / ZPL.
+
+    Heuristic only — separate from the WMS user preference for "ZPL printer".
+    Driverless IPP Everywhere queues usually filter raw payloads, so they
+    report False. Dedicated raw queues (``Local Raw Printer``) and classic
+    thermal socket URIs (``socket://host:9100``) report True.
+    """
+    model = _lpoption(queue, "printer-make-and-model").lower()
+    # lpadmin -m raw → "Local Raw Printer"
+    if "raw" in model:
+        return True
+
+    # printer-info sometimes holds the model when make-and-model is generic.
+    info = _lpoption(queue, "printer-info").lower()
+    if "raw" in info:
+        return True
+
+    uri = (device_uri or "").strip()
+    if not uri:
+        for name, u in configured_network_queues():
+            if name == queue:
+                uri = u
+                break
+
+    if uri:
+        scheme = uri.split(":", 1)[0].lower()
+        # Port-9100 style raw TCP is the usual Zebra / thermal path.
+        if scheme == "socket":
+            return True
+        if "raw" in uri.lower():
+            return True
+
+    return False
+
+
 def inventory_payload() -> list[dict[str, object]]:
     """CUPS network printer inventory for heartbeat / report_printers.
 
     Each item includes:
       cups_name, uri, display_name, status,
-      status_reasons (list), status_message (str|None)
+      status_reasons (list), status_message (str|None),
+      supports_raw (bool) — CUPS/raw-path capability heuristic
     """
     items: list[dict[str, object]] = []
     for queue, uri in configured_network_queues():
@@ -694,6 +738,7 @@ def inventory_payload() -> list[dict[str, object]]:
                 "status": st["status"],
                 "status_reasons": st["status_reasons"],
                 "status_message": st["status_message"],
+                "supports_raw": queue_supports_raw(queue, device_uri=uri),
             }
         )
     return items

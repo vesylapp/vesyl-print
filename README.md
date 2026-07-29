@@ -181,8 +181,20 @@ vesyl-print print-test -f label.pdf -q My_CUPS_Queue --copies 1
 Jobs go through the durable pipeline:
 
 1. Write `queue/<job_id>.json` (fsync)
-2. Materialize content → `lp -d <cups_name>`
+2. Materialize content → `lp -d <cups_name>` (add `-o raw` for `raw_*` / ZPL)
 3. Marker `processed/<job_id>`, delete queue file
+
+Content types: `pdf_*`, `png_*`, `jpeg_*`/`jpg_*`, `raw_*` (ZPL/EPL), `local_path`.
+Raw payloads are written as `.zpl`/`.raw` **without** PDF/PNG magic sniffing and
+submitted with `lp -o raw`. Thermal printers usually need a **raw** CUPS queue
+(`lpadmin -m raw` or `socket://host:9100`); driverless IPP Everywhere often will
+not honor raw. Inventory reports `supports_raw` per queue for WMS.
+
+Local ZPL smoke test:
+
+```bash
+vesyl-print print-test -f label.zpl -q Zebra_Raw --raw
+```
 
 On agent start, any leftover `queue/*.json` is drained (crash recovery).
 

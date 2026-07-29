@@ -52,12 +52,13 @@ class TestDurableQueueOrdering(unittest.TestCase):
                 self.assertTrue(store.has_queue_file(j.id))
                 events.append("ack")
 
-            def lp(cups, path, *, title=None, copies=1):
+            def lp(cups, path, *, title=None, copies=1, raw=False):
                 self.assertTrue(store.has_queue_file(job.id))
                 self.assertIn("ack", events)
                 self.assertFalse(store.is_processed(job.id))
                 events.append("lp")
                 self.assertTrue(Path(path).is_file())
+                self.assertFalse(raw)
 
             def state(j, st, detail=None):
                 events.append(f"state:{st}")
@@ -119,7 +120,7 @@ class TestDrain(unittest.TestCase):
             store.write_queue(j2)
             printed: list[str] = []
 
-            def lp(cups, path, *, title=None, copies=1):
+            def lp(cups, path, *, title=None, copies=1, raw=False):
                 printed.append(path.name)
 
             results = drain_queue(store, lp=lp)
@@ -183,16 +184,49 @@ class TestContent(unittest.TestCase):
             self.assertFalse(is_temp)
             self.assertEqual(path, f.resolve())
 
-    def test_raw_rejected(self):
+    def test_raw_base64_writes_zpl_without_pdf_sniff(self):
+        zpl = b"^XA^FO50,50^FDHello^FS^XZ"
         job = PrintJob(
             id="raw1",
             cups_name="P",
             content_type="raw_base64",
-            content="QUJD",
+            content=base64.b64encode(zpl).decode(),
         )
-        with self.assertRaises(JobError) as cm:
-            jobs.materialize_content(job)
-        self.assertEqual(cm.exception.code, "unsupported_content")
+        with tempfile.TemporaryDirectory() as td:
+            path, is_temp = jobs.materialize_content(job, work_dir=Path(td))
+            self.assertTrue(is_temp)
+            self.assertEqual(path.suffix, ".zpl")
+            self.assertEqual(path.read_bytes(), zpl)
+
+    def test_raw_uri_writes_raw_suffix_for_non_zpl(self):
+        payload = b"\x1b@EPL2-not-zpl"
+        job = PrintJob(
+            id="raw2",
+            cups_name="P",
+            content_type="raw_uri",
+            content="https://example.test/label.bin",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path, is_temp = jobs.materialize_content(
+                job, work_dir=Path(td), fetch_url=lambda u: payload
+            )
+            self.assertTrue(is_temp)
+            self.assertEqual(path.suffix, ".raw")
+            self.assertEqual(path.read_bytes(), payload)
+
+    def test_raw_does_not_sniff_as_pdf(self):
+        """A raw payload that happens to start like PDF must stay raw."""
+        weird = b"%PDF-lookalike-but-raw"
+        job = PrintJob(
+            id="raw-pdfish",
+            cups_name="P",
+            content_type="raw_base64",
+            content=base64.b64encode(weird).decode(),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path, is_temp = jobs.materialize_content(job, work_dir=Path(td))
+            self.assertEqual(path.suffix, ".raw")
+            self.assertEqual(path.read_bytes(), weird)
 
     def test_sniff_overrides_wrong_pdf_label_for_png(self):
         """Server labeled pdf_* but payload is PNG — CUPS needs .png extension."""
@@ -210,6 +244,69 @@ class TestContent(unittest.TestCase):
             self.assertTrue(is_temp)
             self.assertEqual(path.suffix, ".png")
             self.assertEqual(path.read_bytes(), png)
+
+
+class TestRawLpPath(unittest.TestCase):
+    def test_process_job_passes_raw_to_lp(self):
+        zpl = b"^XA^FO50,50^A0N,30,30^FDTest^FS^XZ"
+        job = PrintJob(
+            id="raw-lp",
+            cups_name="Zebra_Raw",
+            content_type="raw_base64",
+            content=base64.b64encode(zpl).decode(),
+            options={"copies": 1},
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = _store(td)
+            seen: dict = {}
+
+            def lp(cups, path, *, title=None, copies=1, raw=False):
+                seen["cups"] = cups
+                seen["path"] = Path(path)
+                seen["raw"] = raw
+                seen["bytes"] = Path(path).read_bytes()
+                return "Zebra_Raw-9"
+
+            with mock.patch("jobs.wait_cups_job", return_value="printed"):
+                result = process_job(job, store, lp=lp)
+            self.assertEqual(result, "printed")
+            self.assertTrue(seen["raw"])
+            self.assertEqual(seen["cups"], "Zebra_Raw")
+            self.assertEqual(seen["bytes"], zpl)
+            self.assertEqual(seen["path"].suffix, ".zpl")
+
+    def test_default_lp_includes_o_raw(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "label.zpl"
+            f.write_bytes(b"^XA^XZ")
+            with mock.patch("jobs.subprocess.run") as run:
+                run.return_value = mock.Mock(
+                    returncode=0,
+                    stdout="request id is Zebra-1 (1 file(s))\n",
+                    stderr="",
+                )
+                rid = jobs.default_lp("Zebra", f, title="t", copies=1, raw=True)
+            self.assertEqual(rid, "Zebra-1")
+            cmd = run.call_args[0][0]
+            self.assertEqual(cmd[:4], ["lp", "-d", "Zebra", "-t"])
+            self.assertIn("-o", cmd)
+            self.assertEqual(cmd[cmd.index("-o") + 1], "raw")
+            self.assertEqual(cmd[-1], str(f))
+
+    def test_local_path_options_raw(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "x.zpl"
+            f.write_bytes(b"^XA^XZ")
+            job = jobs.job_from_local_file(f, "Q", raw=True)
+            self.assertTrue(jobs.is_raw_job(job))
+            store = _store(td)
+            flags: list[bool] = []
+
+            def lp(cups, path, *, title=None, copies=1, raw=False):
+                flags.append(raw)
+
+            process_job(job, store, lp=lp)
+            self.assertEqual(flags, [True])
 
 
 class TestReceiveIdempotent(unittest.TestCase):

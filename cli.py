@@ -401,12 +401,14 @@ def cmd_print_test(args: argparse.Namespace) -> int:
         queue = nets[0][0]
         print(f"Using CUPS queue: {queue}")
 
+    raw = bool(getattr(args, "raw", False))
     try:
         job = jobs.job_from_local_file(
             path,
             queue,
             title=args.title,
             copies=args.copies,
+            raw=raw,
         )
     except jobs.JobError as e:
         _die(e.message)
@@ -415,6 +417,7 @@ def cmd_print_test(args: argparse.Namespace) -> int:
     print(f"job_id:     {job.id}")
     print(f"file:       {path}")
     print(f"cups_name:  {queue}")
+    print(f"raw:        {raw}")
     print(f"queue_dir:  {store.queue_dir}")
 
     try:
@@ -494,7 +497,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--file",
         "-f",
         required=True,
-        help="Path to PDF/PNG/JPEG (or any file CUPS accepts)",
+        help="Path to PDF/PNG/JPEG/ZPL (or any file CUPS accepts)",
     )
     pt.add_argument(
         "--queue",
@@ -507,6 +510,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Number of copies (default 1)",
+    )
+    pt.add_argument(
+        "--raw",
+        action="store_true",
+        help="Submit with lp -o raw (ZPL/EPL thermal queues)",
     )
     pt.set_defaults(func=cmd_print_test)
 

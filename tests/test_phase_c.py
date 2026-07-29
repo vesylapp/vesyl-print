@@ -178,7 +178,7 @@ class TestPullAndProcess(unittest.TestCase):
             client.ack_job.side_effect = ack_job
             client.report_job_status.side_effect = report_job_status
 
-            def lp(cups, path, *, title=None, copies=1):
+            def lp(cups, path, *, title=None, copies=1, raw=False):
                 events.append("lp")
                 return None  # no CUPS job id → leave as delivered
 

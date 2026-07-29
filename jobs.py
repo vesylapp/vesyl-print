@@ -5,14 +5,16 @@ Ordering (at-least-once, crash-safe):
 1. If processed/<job_id> exists → already finished (idempotent), skip print
 2. If no queue file → write + fsync full job JSON to queue/<job_id>.json
 3. Only then call ack callback (when cloud supports it)
-4. Materialize content → lp -d <cups_name>
+4. Materialize content → lp -d <cups_name> (``-o raw`` for raw_*/ZPL)
 5. Report **delivered** when lp accepts the job
 6. Poll CUPS when possible → report **printed** or **error**
 7. On success path: write processed/<job_id>, delete queue file
 
 On agent start: drain_queue() recovers queue/*.json left from crashes.
 
-raw_* content types are rejected until a thermal/raw spike is documented.
+``raw_uri`` / ``raw_base64`` write a temp ``.zpl``/``.raw`` file (no PDF/PNG
+magic sniff) and submit with ``lp -o raw``. Thermal queues usually need a raw
+CUPS queue; driverless IPP Everywhere often will not honor raw.
 """
 
 from __future__ import annotations
@@ -44,11 +46,13 @@ _SUFFIX = {
     "jpeg_base64": ".jpg",
     "jpg_uri": ".jpg",
     "jpg_base64": ".jpg",
+    "raw_uri": ".raw",
+    "raw_base64": ".raw",
     "local_path": None,  # use source path as-is
 }
 
+_RAW_TYPES = frozenset({"raw_uri", "raw_base64"})
 _SUPPORTED = set(_SUFFIX) | {"local_path"}
-_RAW_TYPES = {"raw_uri", "raw_base64"}
 
 
 class JobError(Exception):
@@ -143,6 +147,7 @@ class LpRunner(Protocol):
         *,
         title: str | None,
         copies: int,
+        raw: bool = False,
     ) -> str | None: ...
 
 
@@ -157,8 +162,12 @@ def default_lp(
     *,
     title: str | None = None,
     copies: int = 1,
+    raw: bool = False,
 ) -> str | None:
     """Submit a file to CUPS via `lp`.
+
+    When ``raw`` is True, passes ``-o raw`` so CUPS does not filter/transform
+    the payload (required for ZPL/EPL on raw thermal queues).
 
     Returns the CUPS request id (e.g. ``Zebra_1-42``) when parseable, else None.
     Raises JobError on submission failure.
@@ -168,6 +177,8 @@ def default_lp(
         cmd.extend(["-n", str(copies)])
     if title:
         cmd.extend(["-t", title])
+    if raw:
+        cmd.extend(["-o", "raw"])
     cmd.append(str(path))
     try:
         result = subprocess.run(
@@ -388,7 +399,10 @@ def _utc_marker() -> str:
 
 
 def sniff_suffix(data: bytes) -> str | None:
-    """Detect file type from magic bytes (overrides wrong content_type labels)."""
+    """Detect file type from magic bytes (overrides wrong content_type labels).
+
+    Not used for ``raw_*`` — thermal payloads must not be reclassified as PDF/PNG.
+    """
     if data.startswith(b"%PDF"):
         return ".pdf"
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -396,6 +410,26 @@ def sniff_suffix(data: bytes) -> str | None:
     if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
         return ".jpg"
     return None
+
+
+def raw_file_suffix(data: bytes) -> str:
+    """Pick a temp extension for raw thermal bytes (ZPL → ``.zpl``, else ``.raw``)."""
+    head = data.lstrip()[:64]
+    # ZPL labels commonly start with ^XA (format start).
+    if head.startswith(b"^XA") or b"^XA" in head:
+        return ".zpl"
+    return ".raw"
+
+
+def is_raw_job(job: PrintJob) -> bool:
+    """True when the job must take the CUPS raw path (``lp -o raw``)."""
+    if job.content_type in _RAW_TYPES:
+        return True
+    # CLI print-test --raw / local overrides.
+    raw_opt = job.options.get("raw")
+    if raw_opt is True or raw_opt == 1 or str(raw_opt).lower() in ("1", "true", "yes"):
+        return True
+    return False
 
 
 def _write_temp_content(work_dir: Path, job_id: str, declared_suffix: str, data: bytes) -> Path:
@@ -414,6 +448,14 @@ def _write_temp_content(work_dir: Path, job_id: str, declared_suffix: str, data:
     return out
 
 
+def _write_raw_content(work_dir: Path, job_id: str, data: bytes) -> Path:
+    """Write raw thermal bytes without PDF/PNG magic sniffing."""
+    suffix = raw_file_suffix(data)
+    out = work_dir / f"{job_id}{suffix}"
+    out.write_bytes(data)
+    return out
+
+
 def materialize_content(
     job: PrintJob,
     *,
@@ -422,16 +464,12 @@ def materialize_content(
 ) -> tuple[Path, bool]:
     """Return (path, is_temp). Caller must delete temp files when is_temp.
 
-    Supports pdf/png/jpeg uri|base64 and local_path. raw_* raises JobError.
-    File extension is corrected from magic bytes when content_type disagrees
-    (e.g. pdf_uri that actually returns a PNG label).
+    Supports pdf/png/jpeg/raw uri|base64 and local_path.
+    Image/PDF extensions are corrected from magic bytes when content_type
+    disagrees (e.g. pdf_uri that actually returns a PNG label).
+    ``raw_*`` never sniffs as PDF/PNG — bytes go to ``.zpl`` / ``.raw``.
     """
     ctype = job.content_type
-    if ctype in _RAW_TYPES:
-        raise JobError(
-            f"content_type {ctype} not supported (raw/thermal spike required)",
-            code="unsupported_content",
-        )
     if ctype not in _SUPPORTED:
         raise JobError(f"unsupported content_type: {ctype}", code="unsupported_content")
 
@@ -447,6 +485,7 @@ def materialize_content(
         work_dir.mkdir(parents=True, exist_ok=True)
 
     declared = _SUFFIX.get(ctype) or ".bin"
+    is_raw = ctype in _RAW_TYPES
 
     if ctype.endswith("_base64"):
         try:
@@ -459,6 +498,8 @@ def materialize_content(
             raise JobError(f"invalid base64 content: {e}", code="content_bad") from e
         if not data:
             raise JobError("empty base64 content", code="content_bad")
+        if is_raw:
+            return _write_raw_content(work_dir, job.id, data), True
         return _write_temp_content(work_dir, job.id, declared, data), True
 
     # *_uri
@@ -469,6 +510,8 @@ def materialize_content(
         raise JobError(f"fetch failed: {e}", code="content_fetch") from e
     if not data:
         raise JobError("empty content from uri", code="content_bad")
+    if is_raw:
+        return _write_raw_content(work_dir, job.id, data), True
     return _write_temp_content(work_dir, job.id, declared, data), True
 
 
@@ -543,7 +586,13 @@ def process_job(
         copies = int(job.options.get("copies") or 1)
         if copies < 1:
             copies = 1
-        cups_id = lp(job.cups_name, path, title=job.title, copies=copies)
+        cups_id = lp(
+            job.cups_name,
+            path,
+            title=job.title,
+            copies=copies,
+            raw=is_raw_job(job),
+        )
         cups_job = cups_id if isinstance(cups_id, str) and cups_id.strip() else None
         try:
             report_state(job, "delivered", cups_job)
@@ -673,18 +722,25 @@ def job_from_local_file(
     job_id: str | None = None,
     title: str | None = None,
     copies: int = 1,
+    raw: bool = False,
 ) -> PrintJob:
-    """Build a PrintJob that prints an existing file (CLI print-test)."""
+    """Build a PrintJob that prints an existing file (CLI print-test).
+
+    Pass ``raw=True`` (or ``print-test --raw``) to submit with ``lp -o raw``.
+    """
     p = Path(path).expanduser().resolve()
     if not p.is_file():
         raise JobError(f"file not found: {p}", code="content_missing")
+    opts: dict[str, Any] = {"copies": copies}
+    if raw:
+        opts["raw"] = True
     return PrintJob(
         id=job_id or str(uuid.uuid4()),
         cups_name=cups_name,
         content_type="local_path",
         content=str(p),
         title=title or f"vesyl-print test {p.name}",
-        options={"copies": copies},
+        options=opts,
     )
 
 
