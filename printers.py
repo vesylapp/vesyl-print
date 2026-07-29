@@ -1,20 +1,32 @@
 """Discover and provision network printers via CUPS.
 
 On startup the app polls CUPS for discoverable network printers and adds
-any that are not already configured (driverless / IPP Everywhere), naming
-each queue after the printer model. The live display lists every configured
-network printer. Requires membership in the 'lpadmin' group to add printers
-(no sudo needed).
+any that are not already configured:
+
+1. IPP / driverless (``lpinfo`` + ``lpadmin -m everywhere``)
+2. Port-9100 AppSocket scan for Zebra thermal printers not advertised via IPP —
+   identify via the printer's HTTP homepage, then add as
+   ``socket://IP:9100`` with the raw driver (HP JetDirect / AppSocket)
+
+The live display lists every configured network printer. Requires membership
+in the ``lpadmin`` group to add printers (no sudo needed).
 """
 
 from __future__ import annotations
 
+import concurrent.futures
+import ipaddress
 import logging
 import os
 import re
+import socket
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
+from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Test page sent to a printer right after the app auto-provisions it.
 TEST_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "base.jpg")
@@ -25,6 +37,25 @@ log = logging.getLogger("vesyl-print.printers")
 # (as opposed to usb://, parallel://, serial://, file://, ...).
 _NETWORK_URI_SCHEMES = (
     "ipp", "ipps", "http", "https", "socket", "lpd", "dnssd", "smb",
+)
+
+# JetDirect / AppSocket raw printing (Zebra ZPL, etc.)
+_SOCKET_PORT = 9100
+
+# Interfaces we never scan for printers (virtual / overlay / mesh).
+_SKIP_IFACE_PREFIXES = (
+    "lo",
+    "docker",
+    "br-",
+    "veth",
+    "virbr",
+    "tailscale",
+    "wg",
+    "tun",
+    "tap",
+    "cni",
+    "flannel",
+    "lxc",
 )
 
 
@@ -154,6 +185,266 @@ def _queue_name(model: str) -> str:
     return name or "printer"
 
 
+def _host_from_uri(uri: str) -> str | None:
+    """Hostname or IP from a CUPS device URI, or None if unparseable."""
+    if not uri or "://" not in uri:
+        return None
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        return None
+    host = parsed.hostname
+    return host if host else None
+
+
+def _ipv4_from_host(host: str | None) -> str | None:
+    """Resolve host to a single IPv4 address string, or None."""
+    if not host:
+        return None
+    try:
+        return str(ipaddress.IPv4Address(host))
+    except ipaddress.AddressValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    if not infos:
+        return None
+    return infos[0][4][0]
+
+
+def ips_from_device_uris(uris: list[str] | set[str]) -> set[str]:
+    """IPv4 addresses already known from configured / discovered device URIs."""
+    ips: set[str] = set()
+    for uri in uris:
+        ip = _ipv4_from_host(_host_from_uri(uri))
+        if ip:
+            ips.add(ip)
+    return ips
+
+
+def _iface_should_skip(iface: str) -> bool:
+    name = iface.strip().lower()
+    return any(name == p or name.startswith(p) for p in _SKIP_IFACE_PREFIXES)
+
+
+def local_scan_networks() -> list[ipaddress.IPv4Network]:
+    """IPv4 LAN prefixes to scan (global scope, non-virtual interfaces).
+
+    Caps each scan range at /24 so a misconfigured /16 does not hammer hosts.
+    """
+    out = _run(["ip", "-4", "-o", "addr", "show", "scope", "global"], 3)
+    nets: list[ipaddress.IPv4Network] = []
+    seen: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        iface = parts[1]
+        if _iface_should_skip(iface):
+            continue
+        try:
+            inet_idx = parts.index("inet")
+            cidr = parts[inet_idx + 1]
+        except (ValueError, IndexError):
+            continue
+        try:
+            iface_ip = ipaddress.ip_interface(cidr)
+        except ValueError:
+            continue
+        if not isinstance(iface_ip.ip, ipaddress.IPv4Address):
+            continue
+        net = iface_ip.network
+        # Never scan more than a /24 around us.
+        if net.num_addresses > 256:
+            net = ipaddress.IPv4Network(f"{iface_ip.ip}/24", strict=False)
+        key = str(net)
+        if key in seen:
+            continue
+        seen.add(key)
+        nets.append(net)
+    return nets
+
+
+def _local_ipv4_addrs() -> set[str]:
+    """This host's global IPv4 addresses (never scan ourselves as a printer)."""
+    out = _run(["ip", "-4", "-o", "addr", "show", "scope", "global"], 3)
+    addrs: set[str] = set()
+    for line in out.splitlines():
+        parts = line.split()
+        try:
+            inet_idx = parts.index("inet")
+            cidr = parts[inet_idx + 1]
+            addrs.add(str(ipaddress.ip_interface(cidr).ip))
+        except (ValueError, IndexError):
+            continue
+    return addrs
+
+
+def port_open(ip: str, port: int = _SOCKET_PORT, *, timeout: float = 0.2) -> bool:
+    """True if TCP connect to ``ip:port`` succeeds quickly."""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def scan_port_open_hosts(
+    networks: list[ipaddress.IPv4Network],
+    *,
+    port: int = _SOCKET_PORT,
+    ignore_ips: set[str] | None = None,
+    timeout: float = 0.2,
+    max_workers: int = 64,
+) -> list[str]:
+    """IPs on ``networks`` with ``port`` open, excluding ``ignore_ips`` and self."""
+    ignore = set(ignore_ips or ())
+    ignore |= _local_ipv4_addrs()
+
+    candidates: list[str] = []
+    for net in networks:
+        for host in net.hosts():
+            ip = str(host)
+            if ip in ignore:
+                continue
+            candidates.append(ip)
+
+    if not candidates:
+        return []
+
+    open_ips: list[str] = []
+    workers = min(max_workers, max(1, len(candidates)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(port_open, ip, port, timeout=timeout): ip for ip in candidates
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            ip = futures[fut]
+            try:
+                if fut.result():
+                    open_ips.append(ip)
+            except Exception:
+                continue
+    open_ips.sort(key=lambda s: tuple(int(p) for p in s.split(".")))
+    return open_ips
+
+
+_ZEBRA_MODEL_RE = re.compile(
+    r"ZTC\s+([A-Za-z0-9][A-Za-z0-9\-_. /]*[A-Za-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def parse_zebra_http_identity(body: str) -> str | None:
+    """Extract a display model from a Zebra printer home page body.
+
+    Returns None when the page does not look like a Zebra print server.
+    Example page title/body: ``Zebra Technologies`` / ``ZTC ZD421-203dpi ZPL``.
+    """
+    if not body:
+        return None
+    low = body.lower()
+    if "zebra" not in low and "zdesigner" not in low:
+        return None
+
+    m = _ZEBRA_MODEL_RE.search(body)
+    if m:
+        model = m.group(1).strip()
+        # Prefer "Zebra ZD421-203dpi ZPL" over bare ZTC string.
+        if not model.lower().startswith("zebra"):
+            return f"Zebra {model}"
+        return model
+
+    # Older pages may only say "Zebra Technologies" without ZTC.
+    if "zebra technologies" in low or "zebra.com" in low:
+        return "Zebra Printer"
+    return "Zebra Printer"
+
+
+def identify_zebra_http(
+    ip: str,
+    *,
+    timeout: float = 2.0,
+    fetch: Callable[[str], bytes] | None = None,
+) -> str | None:
+    """GET ``http://ip/`` and return a model name if the host is a Zebra.
+
+    ``fetch`` is injectable for tests: ``(url) -> bytes``.
+    """
+    url = f"http://{ip}/"
+    try:
+        if fetch is not None:
+            raw = fetch(url)
+        else:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "vesyl-print-agent",
+                    "Accept": "text/html, */*",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(16384)
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        log.debug("zebra HTTP probe failed for %s: %s", ip, e)
+        return None
+
+    if isinstance(raw, bytes):
+        body = raw.decode("utf-8", errors="replace")
+    else:
+        body = str(raw)
+    return parse_zebra_http_identity(body)
+
+
+def discover_zebra_socket_printers(
+    *,
+    ignore_ips: set[str] | None = None,
+    networks: list[ipaddress.IPv4Network] | None = None,
+    port: int = _SOCKET_PORT,
+    scan_timeout: float = 0.2,
+    http_timeout: float = 2.0,
+    fetch: Callable[[str], bytes] | None = None,
+    open_hosts: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Find Zebra printers reachable via AppSocket (TCP 9100).
+
+    Flow:
+      1. Scan local LAN for open port 9100 (unless ``open_hosts`` injected)
+      2. Skip ``ignore_ips`` (known IPP / already configured hosts)
+      3. Confirm Zebra via HTTP homepage
+      4. Return ``(ip, model)`` pairs for ``socket://ip:9100`` provisioning
+    """
+    ignore = set(ignore_ips or ())
+    if open_hosts is None:
+        nets = networks if networks is not None else local_scan_networks()
+        if not nets:
+            log.debug("no local networks to scan for port %s", port)
+            return []
+        log.info(
+            "scanning %s for TCP %s (skipping %d known IP(s))",
+            ", ".join(str(n) for n in nets),
+            port,
+            len(ignore),
+        )
+        hosts = scan_port_open_hosts(
+            nets, port=port, ignore_ips=ignore, timeout=scan_timeout
+        )
+    else:
+        hosts = [h for h in open_hosts if h not in ignore]
+
+    found: list[tuple[str, str]] = []
+    for ip in hosts:
+        model = identify_zebra_http(ip, timeout=http_timeout, fetch=fetch)
+        if not model:
+            log.debug("port %s open on %s but not identified as Zebra", port, ip)
+            continue
+        log.info("found Zebra at %s (%s) via socket/%s", ip, model, port)
+        found.append((ip, model))
+    return found
+
+
 def add_printer(uri: str, model: str) -> str | None:
     """Add a driverless (IPP Everywhere) queue named after the model.
 
@@ -172,7 +463,62 @@ def add_printer(uri: str, model: str) -> str | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return queue if result.returncode == 0 else None
+    if result.returncode != 0:
+        log.warning(
+            "lpadmin everywhere failed for %s: %s",
+            uri,
+            (result.stderr or result.stdout or "").strip(),
+        )
+        return None
+    return queue
+
+
+def add_raw_socket_printer(
+    ip: str,
+    model: str,
+    *,
+    port: int = _SOCKET_PORT,
+    queue: str | None = None,
+) -> str | None:
+    """Add a raw AppSocket/HP JetDirect queue: ``socket://ip:port`` + ``-m raw``.
+
+    Zebra thermal printers take ZPL on port 9100; raw avoids CUPS filters that
+    would mangle the payload. Returns the queue name on success.
+    """
+    uri = f"socket://{ip}:{port}"
+    queue_name = queue or _queue_name(model)
+    try:
+        result = subprocess.run(
+            [
+                "lpadmin",
+                "-p",
+                queue_name,
+                "-v",
+                uri,
+                "-m",
+                "raw",
+                "-D",
+                model,
+                "-L",
+                f"AppSocket {ip}:{port}",
+                "-E",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("lpadmin raw socket failed for %s: %s", uri, e)
+        return None
+    if result.returncode != 0:
+        log.warning(
+            "lpadmin raw socket failed for %s: %s",
+            uri,
+            (result.stderr or result.stdout or "").strip(),
+        )
+        return None
+    log.info("added raw socket queue %s → %s", queue_name, uri)
+    return queue_name
 
 
 def print_test_page(queue: str) -> bool:
@@ -194,6 +540,9 @@ def print_test_page(queue: str) -> bool:
 def ensure_printers() -> list[str]:
     """Ensure every discoverable network printer has a CUPS queue.
 
+    1. IPP / driverless devices from ``lpinfo``
+    2. Port-9100 Zebra scan (skips IPs already known from step 1 / CUPS)
+
     Returns display names of all configured network printers (including any
     that were already present). Discovery browses the network and can take
     several seconds, so call this off the render loop.
@@ -201,8 +550,13 @@ def ensure_printers() -> list[str]:
     existing = configured_network_queues()
     existing_uris = {uri for _, uri in existing}
     existing_names = {name for name, _ in existing}
+    known_ips = ips_from_device_uris(existing_uris)
 
+    # --- 1. IPP Everywhere ---
     for uri, model in discover_network_printers():
+        ip = _ipv4_from_host(_host_from_uri(uri))
+        if ip:
+            known_ips.add(ip)
         if uri in existing_uris:
             continue
         queue = _queue_name(model)
@@ -212,6 +566,34 @@ def ensure_printers() -> list[str]:
         if added:
             existing_uris.add(uri)
             existing_names.add(added)
+            if ip:
+                known_ips.add(ip)
+
+    # --- 2. AppSocket 9100 + Zebra HTTP identity ---
+    try:
+        zebras = discover_zebra_socket_printers(ignore_ips=known_ips)
+    except Exception:
+        log.exception("zebra socket discovery failed")
+        zebras = []
+
+    for ip, model in zebras:
+        uri = f"socket://{ip}:{_SOCKET_PORT}"
+        if uri in existing_uris:
+            continue
+        # Also skip if some other queue already points at this host:9100.
+        if any(_host_from_uri(u) == ip and ":9100" in u for u in existing_uris):
+            continue
+        queue = _queue_name(model)
+        # Disambiguate if an IPP queue already took the same model name.
+        if queue in existing_names:
+            queue = _queue_name(f"{model}_{ip.split('.')[-1]}")
+        if queue in existing_names:
+            continue
+        added = add_raw_socket_printer(ip, model, queue=queue)
+        if added:
+            existing_uris.add(uri)
+            existing_names.add(added)
+            known_ips.add(ip)
 
     return configured_printers()
 

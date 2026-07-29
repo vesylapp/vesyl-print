@@ -19,7 +19,8 @@ Raspberry Pi **print node** for VESYL: LCD status display, CUPS printer discover
 ## Hardware
 
 - Raspberry Pi with **MHS-3.5" (ILI9486)** SPI LCD (`/dev/fb1`)
-- Network printers discovered via CUPS (IPP Everywhere)
+- Network printers discovered via CUPS (IPP Everywhere), plus a LAN scan for
+  Zebra thermal printers on port **9100** (AppSocket) identified over HTTP
 
 ## Install
 
@@ -189,6 +190,15 @@ Raw payloads are written as `.zpl`/`.raw` **without** PDF/PNG magic sniffing and
 submitted with `lp -o raw`. Thermal printers usually need a **raw** CUPS queue
 (`lpadmin -m raw` or `socket://host:9100`); driverless IPP Everywhere often will
 not honor raw. Inventory reports `supports_raw` per queue for WMS.
+
+**Zebra discovery:** after IPP/`lpinfo`, the agent scans local `/24` LAN
+segments for TCP **9100**, skips IPs already known from IPP/CUPS, GETs
+`http://IP/` to confirm a Zebra print server (e.g. “ZTC ZD421-203dpi ZPL”), and
+adds an AppSocket queue:
+
+```bash
+lpadmin -p Zebra_ZD421-203dpi_ZPL -v socket://10.0.0.172:9100 -m raw -E
+```
 
 Local ZPL smoke test:
 
