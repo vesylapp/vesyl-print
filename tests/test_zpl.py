@@ -41,10 +41,45 @@ class TestGfaEncode(unittest.TestCase):
         self.assertEqual(hex_data, "80")  # MSB set
 
     def test_build_label_contains_gfa(self):
-        zpl = zpl_mod.build_zpl_label("80", total_bytes=1, bytes_per_row=1)
+        zpl = zpl_mod.build_zpl_label(
+            "80", total_bytes=1, bytes_per_row=1, height_dots=20
+        )
         self.assertTrue(zpl.startswith("^XA"))
         self.assertIn("^GFA,1,1,1,80", zpl)
+        self.assertIn("^PW8", zpl)
+        self.assertIn("^LL20", zpl)
+        self.assertNotIn("^PQ", zpl)
+        self.assertNotIn("^XB", zpl)
+        full = zpl_mod.build_zpl_label(
+            "80", total_bytes=1, bytes_per_row=1, height_dots=1218
+        )
+        self.assertIn("^LL1218", full)
         self.assertTrue(zpl.strip().endswith("^XZ"))
+
+    def test_fit_width_scales_up(self):
+        from PIL import Image
+
+        td = Path(tempfile.mkdtemp(prefix="vesyl-zpl-s-"))
+        p = td / "tiny.png"
+        Image.new("L", (16, 8), 200).save(p)
+        try:
+            img = zpl_mod.load_image_as_mono(p, max_width_dots=64, fit="width")
+            self.assertEqual(img.size[0], 64)
+        finally:
+            p.unlink(missing_ok=True)
+            td.rmdir()
+
+    def test_infer_4x6_zd220_and_zd421(self):
+        self.assertEqual(
+            zpl_mod.infer_media_width_dots("Zebra_ZD220-203dpi_ZPL"), 812
+        )
+        self.assertEqual(
+            zpl_mod.infer_media_height_dots("Zebra_ZD220-203dpi_ZPL"), 1218
+        )
+        self.assertEqual(zpl_mod.infer_media_width_dots(None), 812)
+        self.assertEqual(
+            zpl_mod.infer_media_width_dots("Zebra_ZD421-203dpi_ZPL"), 812
+        )
 
     def test_png_to_zpl_file(self):
         png = _tiny_png()

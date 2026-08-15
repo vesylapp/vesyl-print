@@ -605,11 +605,13 @@ def process_job(
                 conv_dir = path.parent if is_temp else Path(
                     tempfile.mkdtemp(prefix="vesyl-print-zpl-")
                 )
+                zpl_opts = dict(job.options)
+                zpl_opts.setdefault("cups_name", job.cups_name)
                 zpl_temp = zpl_mod.write_zpl_file(
                     path,
                     conv_dir,
                     job.id,
-                    options=job.options,
+                    options=zpl_opts,
                 )
                 log.info(
                     "job %s converted %s → ZPL for raw queue %s",

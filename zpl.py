@@ -20,10 +20,14 @@ from typing import Any
 
 log = logging.getLogger("vesyl-print.zpl")
 
-# Common Zebra desktop defaults (ZD220 / ZD421 203dpi, 2" media).
+# 203 dpi desktop Zebra. Default media is 4"×6" shipping labels.
 DEFAULT_DPI = 203
-DEFAULT_MAX_WIDTH_DOTS = 448  # ~2.2" at 203 dpi
+DEFAULT_MAX_WIDTH_DOTS = 812   # 4.00" × 203
+DEFAULT_MAX_HEIGHT_DOTS = 1218  # 6.00" × 203
 DEFAULT_THRESHOLD = 128
+# Shift graphic down so it isn't clipped by the top of the label / printhead.
+# 32 dots ≈ 4 mm at 203 dpi.
+DEFAULT_TOP_MARGIN_DOTS = 32
 
 
 class ZplError(Exception):
@@ -111,6 +115,45 @@ def pdf_to_png(
     return png
 
 
+def infer_media_width_dots(cups_name: str | None, *, dpi: int = DEFAULT_DPI) -> int:
+    """Guess printable width from the CUPS queue name (model / dpi token).
+
+    Default is **4×6** (812 dots @ 203 dpi). Only well-known 2" models
+    (ZD220 / ZD230) are capped at 448 dots.
+    """
+    name = (cups_name or "").lower()
+    if "300dpi" in name:
+        dpi = 300
+    elif "203dpi" in name or "200dpi" in name:
+        dpi = 203
+    # ZD220 / ZD230 / ZD421 / ZD621 are 4" desktop printers (not 2").
+    if any(
+        t in name
+        for t in (
+            "zd220",
+            "zd230",
+            "zd421",
+            "zd621",
+            "zt410",
+            "zt411",
+            "gk420",
+            "gx430",
+        )
+    ):
+        return 812 if dpi <= 203 else int(round(4.09 * dpi))
+    return DEFAULT_MAX_WIDTH_DOTS
+
+
+def infer_media_height_dots(cups_name: str | None, *, dpi: int = DEFAULT_DPI) -> int:
+    """Guess label length. Default 6" (1218 @ 203) for 4×6 stock."""
+    name = (cups_name or "").lower()
+    if "300dpi" in name:
+        dpi = 300
+    elif "203dpi" in name or "200dpi" in name:
+        dpi = 203
+    return DEFAULT_MAX_HEIGHT_DOTS if dpi <= 203 else int(round(6.0 * dpi))
+
+
 def load_image_as_mono(
     path: Path,
     *,
@@ -118,8 +161,12 @@ def load_image_as_mono(
     max_height_dots: int | None = None,
     threshold: int = DEFAULT_THRESHOLD,
     invert: bool = False,
+    fit: str = "width",
 ):
-    """Load image/PDF path → Pillow 1-bit image (black=0) scaled to fit width."""
+    """Load image/PDF path → Pillow 1-bit image (black=0).
+
+    ``fit=width`` scales up or down so the image fills ``max_width_dots``.
+    """
     try:
         from PIL import Image, ImageOps
     except ImportError as e:
@@ -155,21 +202,46 @@ def load_image_as_mono(
     if invert:
         img = ImageOps.invert(img)
 
+    # Crop empty page margins so a 4×6 design on a larger PDF page still fills.
+    try:
+        # Darker than ~250 counts as content
+        mask = img.point(lambda x: 255 if x < 250 else 0)
+        bbox = mask.getbbox()
+        if bbox:
+            img = img.crop(bbox)
+    except Exception:
+        pass
+
     w, h = img.size
     if w < 1 or h < 1:
         raise ZplError("empty image", code="image_bad")
 
     max_w = max(8, int(max_width_dots))
     max_h = int(max_height_dots) if max_height_dots else None
+    fit_mode = (fit or "width").lower()
+
     scale = 1.0
-    if w > max_w:
-        scale = min(scale, max_w / w)
-    if max_h and h > max_h:
-        scale = min(scale, max_h / h)
-    if scale < 1.0:
+    if fit_mode == "width":
+        scale = max_w / w
+        if max_h and h * scale > max_h:
+            scale = max_h / h
+    elif fit_mode == "contain":
+        if w > max_w:
+            scale = min(scale, max_w / w)
+        if max_h and h > max_h:
+            scale = min(scale, max_h / h)
+
+    if abs(scale - 1.0) > 0.001:
         nw = max(1, int(round(w * scale)))
         nh = max(1, int(round(h * scale)))
         img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+        w, h = img.size
+
+    pad_w = (8 - (w % 8)) % 8
+    if pad_w:
+        canvas = Image.new("L", (w + pad_w, h), 255)
+        canvas.paste(img, (0, 0))
+        img = canvas
 
     # 1-bit: black (print) = 0 in PIL mode "1"
     thr = max(0, min(255, int(threshold)))
@@ -210,20 +282,31 @@ def build_zpl_label(
     *,
     total_bytes: int,
     bytes_per_row: int,
+    height_dots: int | None = None,
     x: int = 0,
     y: int = 0,
     copies: int = 1,
 ) -> str:
-    """Build a complete ZPL label with one ^GFA graphic."""
+    """Build a complete ZPL label with one ^GFA graphic.
+
+    ``^PW`` / ``^LL`` match the bitmap (plus ``y`` offset). Print quantity is
+    left to CUPS ``lp -n`` unless copies > 1.
+    """
     copies = max(1, int(copies))
-    # ^PQ = print quantity inside format
-    body = (
-        f"^XA\n"
-        f"^FO{x},{y}^GFA,{total_bytes},{total_bytes},{bytes_per_row},{hex_data}^FS\n"
-        f"^PQ{copies}\n"
-        f"^XZ\n"
-    )
-    return body
+    width_dots = max(8, int(bytes_per_row) * 8)
+    parts = [
+        "^XA",
+        "^LH0,0",
+        "^FWN",
+        f"^PW{width_dots}",
+    ]
+    if height_dots and height_dots > 0:
+        parts.append(f"^LL{int(height_dots) + max(0, int(y))}")
+    parts.append(f"^FO{x},{y}^GFA,{total_bytes},{total_bytes},{bytes_per_row},{hex_data}^FS")
+    if copies > 1:
+        parts.append(f"^PQ{copies}")
+    parts.append("^XZ")
+    return "\n".join(parts) + "\n"
 
 
 def image_path_to_zpl(
@@ -234,23 +317,29 @@ def image_path_to_zpl(
 ) -> str:
     """Convert a PDF/PNG/JPEG path to a ZPL string (embedded ^GFA)."""
     opts = options or {}
-    max_w = _opt_int(opts, "zpl_max_width_dots", DEFAULT_MAX_WIDTH_DOTS)
+    dpi = _opt_int(opts, "zpl_dpi", DEFAULT_DPI)
+    cups = str(opts.get("cups_name") or "")
+    default_w = infer_media_width_dots(cups, dpi=dpi)
+    default_h = infer_media_height_dots(cups, dpi=dpi)
+    max_w = _opt_int(opts, "zpl_max_width_dots", default_w)
     # Aliases
-    if "label_width_dots" in (opts or {}):
+    if "label_width_dots" in opts:
         max_w = _opt_int(opts, "label_width_dots", max_w)
-    max_h = None
-    if opts.get("zpl_max_height_dots") is not None or opts.get("label_height_dots") is not None:
-        max_h = _opt_int(
-            opts,
-            "zpl_max_height_dots",
-            _opt_int(opts, "label_height_dots", 0) or 0,
-        )
-        if max_h <= 0:
-            max_h = None
+    fit = str(opts.get("zpl_fit") or "contain").lower()
+    max_h = _opt_int(opts, "zpl_max_height_dots", default_h)
+    if opts.get("label_height_dots") is not None:
+        max_h = _opt_int(opts, "label_height_dots", max_h)
+    if max_h <= 0:
+        max_h = default_h
     thr = _opt_int(opts, "zpl_threshold", DEFAULT_THRESHOLD)
     invert = bool(opts.get("zpl_invert") or opts.get("invert"))
     x = _opt_int(opts, "zpl_x", 0)
-    y = _opt_int(opts, "zpl_y", 0)
+    y = _opt_int(opts, "zpl_y", DEFAULT_TOP_MARGIN_DOTS)
+
+    # Leave room at the bottom so ^FO y-shift does not run off the label
+    # (overflow onto the next gap looks like an extra blank label).
+    if y > 0 and max_h:
+        max_h = max(8, max_h - y)
 
     # DPI only affects PDF rasterization.
     dpi = _opt_int(opts, "zpl_dpi", DEFAULT_DPI)
@@ -266,6 +355,7 @@ def image_path_to_zpl(
                 max_height_dots=max_h,
                 threshold=thr,
                 invert=invert,
+                fit=fit,
             )
         finally:
             try:
@@ -281,6 +371,7 @@ def image_path_to_zpl(
             max_height_dots=max_h,
             threshold=thr,
             invert=invert,
+            fit=fit,
         )
 
     hex_data, total, row_bytes, height = mono_image_to_gfa_hex(img)
@@ -297,6 +388,7 @@ def image_path_to_zpl(
         hex_data,
         total_bytes=total,
         bytes_per_row=row_bytes,
+        height_dots=height,
         x=x,
         y=y,
         copies=1,  # quantity handled by lp -n when possible
