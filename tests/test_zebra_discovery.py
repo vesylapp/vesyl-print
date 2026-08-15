@@ -47,6 +47,83 @@ class TestParseZebraHttp(unittest.TestCase):
         self.assertEqual(printers.parse_zebra_http_identity(body), "Zebra Printer")
 
 
+LPINFO_USB_SNIPPET = """\
+Device: uri = usb://Zebra%20Technologies/ZTC%20ZD220-203dpi%20ZPL?serial=D4N261201258
+        class = direct
+        info = Zebra Technologies ZTC ZD220-203dpi ZPL
+        make-and-model = Zebra Technologies ZTC ZD220-203dpi ZPL
+        device-id = MANUFACTURER:Zebra Technologies ;COMMAND SET:ZPL;MODEL:ZTC ZD220-203dpi ZPL;
+        location =
+Device: uri = ipp
+        class = network
+        info = Internet Printing Protocol (ipp)
+        make-and-model = Unknown
+        device-id =
+        location =
+Device: uri = dnssd://Brother%20HL-L3280CDW%20series._ipp._tcp.local/
+        class = network
+        info = Brother HL-L3280CDW series
+        make-and-model = Brother HL-L3280CDW series
+        device-id =
+        location =
+"""
+
+
+class TestUsbDiscovery(unittest.TestCase):
+    def test_normalize_usb_model(self):
+        self.assertEqual(
+            printers._normalize_usb_model(
+                "Zebra Technologies ZTC ZD220-203dpi ZPL"
+            ),
+            "Zebra ZD220-203dpi ZPL",
+        )
+
+    def test_discover_usb_from_lpinfo(self):
+        with mock.patch("printers._run", return_value=LPINFO_USB_SNIPPET):
+            found = printers.discover_usb_printers()
+        self.assertEqual(len(found), 1)
+        uri, model = found[0]
+        self.assertTrue(uri.startswith("usb://"))
+        self.assertIn("ZD220", model)
+        self.assertTrue(printers._model_looks_thermal_raw(model))
+
+    def test_ensure_printers_adds_usb_raw(self):
+        added: list[tuple] = []
+
+        def fake_add_raw(uri, model, *, queue=None, location=None):
+            added.append((uri, model, queue))
+            return queue or "Zebra_ZD220"
+
+        with mock.patch(
+            "printers.configured_network_queues",
+            side_effect=[
+                [],  # start empty
+                [("Zebra_ZD220_203dpi_ZPL", "usb://Zebra/ZD220?serial=1")],
+            ],
+        ), mock.patch(
+            "printers.discover_usb_printers",
+            return_value=[
+                (
+                    "usb://Zebra%20Technologies/ZTC%20ZD220-203dpi%20ZPL?serial=1",
+                    "Zebra ZD220-203dpi ZPL",
+                )
+            ],
+        ), mock.patch(
+            "printers.discover_network_printers", return_value=[]
+        ), mock.patch(
+            "printers.discover_zebra_socket_printers", return_value=[]
+        ), mock.patch(
+            "printers.add_raw_printer", side_effect=fake_add_raw
+        ), mock.patch(
+            "printers.configured_printers",
+            return_value=["Zebra ZD220-203dpi ZPL"],
+        ):
+            names = printers.ensure_printers()
+        self.assertEqual(names, ["Zebra ZD220-203dpi ZPL"])
+        self.assertEqual(len(added), 1)
+        self.assertTrue(added[0][0].startswith("usb://"))
+
+
 class TestHostAndIpHelpers(unittest.TestCase):
     def test_host_from_uri(self):
         self.assertEqual(
@@ -115,7 +192,7 @@ class TestAddRawSocketPrinter(unittest.TestCase):
             )
         self.assertEqual(name, "Zebra_ZD421-203dpi_ZPL")
         cmd = run.call_args[0][0]
-        self.assertEqual(cmd[0], "lpadmin")
+        self.assertTrue(cmd[0] == "lpadmin" or cmd[0].endswith("/lpadmin"))
         self.assertIn("-p", cmd)
         self.assertEqual(cmd[cmd.index("-p") + 1], "Zebra_ZD421-203dpi_ZPL")
         self.assertEqual(cmd[cmd.index("-v") + 1], "socket://10.0.0.172:9100")

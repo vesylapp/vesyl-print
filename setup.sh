@@ -80,7 +80,8 @@ fi
 # The service user must be in 'video' to write /dev/fb1, 'lpadmin' to
 # discover and add network printers to CUPS without sudo, and 'input' to
 # read the MHS-3.5" resistive touchscreen (/dev/input/event*) for page cycle.
-usermod -aG video,lpadmin,input "$RUN_USER"
+# lp: /dev/usb/lp* for USB printers on some images; lpadmin: manage CUPS queues
+usermod -aG video,lpadmin,lp,input "$RUN_USER"
 
 # --- 2. locate the boot config + overlays dir ------------------------------
 if [[ -f /boot/firmware/config.txt ]]; then

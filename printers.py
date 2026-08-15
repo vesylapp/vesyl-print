@@ -1,15 +1,17 @@
-"""Discover and provision network printers via CUPS.
+"""Discover and provision printers via CUPS.
 
-On startup the app polls CUPS for discoverable network printers and adds
-any that are not already configured:
+On startup the app polls CUPS for discoverable printers and adds any that
+are not already configured:
 
-1. IPP / driverless (``lpinfo`` + ``lpadmin -m everywhere``)
-2. Port-9100 AppSocket scan for Zebra thermal printers not advertised via IPP —
+1. USB / direct devices (``lpinfo`` ``usb://…``) — raw for Zebra/ZPL,
+   otherwise driverless everywhere with raw fallback
+2. IPP / driverless network (``lpinfo`` + ``lpadmin -m everywhere``)
+3. Port-9100 AppSocket scan for Zebra thermal printers not advertised via IPP —
    identify via the printer's HTTP homepage, then add as
    ``socket://IP:9100`` with the raw driver (HP JetDirect / AppSocket)
 
-The live display lists every configured network printer. Requires membership
-in the ``lpadmin`` group to add printers (no sudo needed).
+The live display lists every configured network **and USB** printer. Requires
+membership in the ``lpadmin`` group to add printers (no sudo needed).
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import ipaddress
 import logging
 import os
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -26,7 +29,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 # Test page sent to a printer right after the app auto-provisions it.
 TEST_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "base.jpg")
@@ -38,6 +41,12 @@ log = logging.getLogger("vesyl-print.printers")
 _NETWORK_URI_SCHEMES = (
     "ipp", "ipps", "http", "https", "socket", "lpd", "dnssd", "smb",
 )
+
+# Local USB printers (usblp / libusb backends).
+_USB_URI_SCHEMES = ("usb",)
+
+# CUPS admin tools often live in /usr/sbin (not on a minimal user PATH).
+_CUPS_BIN_DIRS = ("/usr/sbin", "/usr/bin", "/bin")
 
 # JetDirect / AppSocket raw printing (Zebra ZPL, etc.)
 _SOCKET_PORT = 9100
@@ -59,7 +68,21 @@ _SKIP_IFACE_PREFIXES = (
 )
 
 
+def _cups_cmd(name: str) -> str:
+    """Resolve a CUPS tool (lpinfo lives in /usr/sbin on Debian/Pi OS)."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in _CUPS_BIN_DIRS:
+        p = Path(d) / name
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return name
+
+
 def _run(cmd: list[str], timeout: float) -> str:
+    if cmd:
+        cmd = [_cups_cmd(cmd[0]), *cmd[1:]]
     try:
         return subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout
@@ -68,15 +91,31 @@ def _run(cmd: list[str], timeout: float) -> str:
         return ""
 
 
+def _uri_scheme(uri: str) -> str:
+    if not uri or "://" not in uri:
+        return ""
+    return uri.split(":", 1)[0].lower()
+
+
 def _is_network_uri(uri: str) -> bool:
-    return "://" in uri and uri.split(":", 1)[0].lower() in _NETWORK_URI_SCHEMES
+    return _uri_scheme(uri) in _NETWORK_URI_SCHEMES
+
+
+def _is_usb_uri(uri: str) -> bool:
+    return _uri_scheme(uri) in _USB_URI_SCHEMES
+
+
+def _is_managed_uri(uri: str) -> bool:
+    """Network or USB queues we auto-provision and show on the LCD."""
+    return _is_network_uri(uri) or _is_usb_uri(uri)
 
 
 # --- currently configured printers -----------------------------------------
 
 def configured_network_queues() -> list[tuple[str, str]]:
-    """(queue_name, uri) for every CUPS queue with a network device URI.
+    """(queue_name, uri) for every CUPS queue with a network **or USB** device URI.
 
+    Name kept for compatibility; includes ``usb://`` queues as well as IPP/socket.
     Parses `lpstat -v` lines of the form "device for <name>: <uri>".
     """
     out = _run(["lpstat", "-v"], 3)
@@ -87,18 +126,18 @@ def configured_network_queues() -> list[tuple[str, str]]:
             continue
         name, _, uri = line[len(prefix):].partition(":")
         uri = uri.strip()
-        if _is_network_uri(uri):
+        if _is_managed_uri(uri):
             queues.append((name.strip(), uri))
     return queues
 
 
 def configured_printers() -> list[str]:
-    """Display names of all configured network queues (stable order)."""
+    """Display names of all configured network/USB queues (stable order)."""
     return [_display_name(queue) for queue, _ in configured_network_queues()]
 
 
 def configured_printer() -> str | None:
-    """Display name of the first configured network queue, or None."""
+    """Display name of the first configured network/USB queue, or None."""
     names = configured_printers()
     return names[0] if names else None
 
@@ -131,15 +170,8 @@ def _display_name(queue: str) -> str:
 
 # --- discovery + provisioning ----------------------------------------------
 
-def discover_network_printers() -> list[tuple[str, str]]:
-    """All discoverable network printers as (device_uri, make_and_model).
-
-    Uses `lpinfo -l -v`, which browses the network (mDNS) and can take a few
-    seconds. Skips backend placeholders (uri = "ipp", "socket", …) and
-    devices with an unknown model. Dedupes by URI.
-    """
-    out = _run(["lpinfo", "-l", "-v"], 25)
-
+def _parse_lpinfo_devices(out: str) -> list[dict[str, str]]:
+    """Parse ``lpinfo -l -v`` into a list of device attribute dicts."""
     devices: list[dict[str, str]] = []
     current: dict[str, str] | None = None
     for line in out.splitlines():
@@ -155,12 +187,22 @@ def discover_network_printers() -> list[tuple[str, str]]:
             current[key.strip()] = value.strip()
     if current is not None:
         devices.append(current)
+    return devices
 
+
+def discover_network_printers() -> list[tuple[str, str]]:
+    """All discoverable network printers as (device_uri, make_and_model).
+
+    Uses `lpinfo -l -v`, which browses the network (mDNS) and can take a few
+    seconds. Skips backend placeholders (uri = "ipp", "socket", …) and
+    devices with an unknown model. Dedupes by URI.
+    """
+    out = _run(["lpinfo", "-l", "-v"], 25)
     found: list[tuple[str, str]] = []
     seen_uris: set[str] = set()
-    for d in devices:
+    for d in _parse_lpinfo_devices(out):
         uri = d.get("uri", "")
-        model = d.get("make-and-model", "")
+        model = d.get("make-and-model", "") or d.get("info", "")
         if (
             d.get("class") == "network"
             and _is_network_uri(uri)
@@ -177,6 +219,73 @@ def discover_network_printer() -> tuple[str, str] | None:
     """(device_uri, make_and_model) of the first discoverable network printer."""
     found = discover_network_printers()
     return found[0] if found else None
+
+
+def _normalize_usb_model(model: str) -> str:
+    """Clean CUPS USB make-and-model for display / queue naming.
+
+    e.g. ``Zebra Technologies ZTC ZD220-203dpi ZPL`` → ``Zebra ZD220-203dpi ZPL``
+    """
+    m = (model or "").strip()
+    if not m:
+        return "USB Printer"
+    m = re.sub(r"\s+", " ", m)
+    # Drop redundant manufacturer tokens common in USB ID strings.
+    m = re.sub(r"(?i)^Zebra Technologies\s+", "Zebra ", m)
+    m = re.sub(r"(?i)\bZTC\s+", "", m)
+    return m.strip() or "USB Printer"
+
+
+def _model_looks_thermal_raw(model: str) -> bool:
+    """True when the device should use CUPS ``raw`` (ZPL / label printers)."""
+    low = (model or "").lower()
+    return any(
+        tok in low
+        for tok in (
+            "zebra",
+            "zpl",
+            "zdesigner",
+            "eltron",
+            "datamax",
+            "sato",
+            "tsc ",
+            "godex",
+        )
+    )
+
+
+def discover_usb_printers() -> list[tuple[str, str]]:
+    """Discover local USB printers as (device_uri, make_and_model).
+
+    Uses ``lpinfo -l -v`` devices with ``class=direct`` and ``usb://`` URIs
+    (e.g. Zebra ZD220 on usblp). Skips unknown models and placeholder backends.
+    """
+    out = _run(["lpinfo", "-l", "-v"], 15)
+    found: list[tuple[str, str]] = []
+    seen_uris: set[str] = set()
+    for d in _parse_lpinfo_devices(out):
+        uri = d.get("uri", "")
+        if not _is_usb_uri(uri):
+            continue
+        # CUPS reports attached USB printers as class=direct.
+        cls = (d.get("class") or "").lower()
+        if cls and cls not in ("direct", "usb"):
+            continue
+        model = (
+            d.get("make-and-model")
+            or d.get("info")
+            or unquote(uri.split("usb://", 1)[-1].split("?", 1)[0])
+        )
+        model = _normalize_usb_model(model)
+        if not model or model.lower() == "unknown":
+            continue
+        # Normalize serial query for stable dedupe (order of query params).
+        if uri in seen_uris:
+            continue
+        seen_uris.add(uri)
+        found.append((uri, model))
+        log.info("found USB printer %s → %s", model, uri)
+    return found
 
 
 def _queue_name(model: str) -> str:
@@ -445,18 +554,28 @@ def discover_zebra_socket_printers(
     return found
 
 
-def add_printer(uri: str, model: str) -> str | None:
+def add_printer(uri: str, model: str, *, queue: str | None = None) -> str | None:
     """Add a driverless (IPP Everywhere) queue named after the model.
 
     Returns the queue name on success, or None on failure.
     """
-    queue = _queue_name(model)
+    queue_name = queue or _queue_name(model)
     try:
         result = subprocess.run(
             # -D stashes the real model as the description; a driverless queue
             # otherwise reports its model as the generic "IPP Everywhere".
-            ["lpadmin", "-p", queue, "-v", uri, "-m", "everywhere",
-             "-D", model, "-E"],
+            [
+                _cups_cmd("lpadmin"),
+                "-p",
+                queue_name,
+                "-v",
+                uri,
+                "-m",
+                "everywhere",
+                "-D",
+                model,
+                "-E",
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -470,7 +589,7 @@ def add_printer(uri: str, model: str) -> str | None:
             (result.stderr or result.stdout or "").strip(),
         )
         return None
-    return queue
+    return queue_name
 
 
 def add_raw_socket_printer(
@@ -486,39 +605,75 @@ def add_raw_socket_printer(
     would mangle the payload. Returns the queue name on success.
     """
     uri = f"socket://{ip}:{port}"
+    return add_raw_printer(
+        uri,
+        model,
+        queue=queue,
+        location=f"AppSocket {ip}:{port}",
+    )
+
+
+def add_raw_printer(
+    uri: str,
+    model: str,
+    *,
+    queue: str | None = None,
+    location: str | None = None,
+) -> str | None:
+    """Add a CUPS queue with ``-m raw`` (USB Zebra, socket:// thermal, etc.)."""
     queue_name = queue or _queue_name(model)
+    cmd = [
+        _cups_cmd("lpadmin"),
+        "-p",
+        queue_name,
+        "-v",
+        uri,
+        "-m",
+        "raw",
+        "-D",
+        model,
+        "-E",
+    ]
+    if location:
+        cmd.extend(["-L", location])
     try:
         result = subprocess.run(
-            [
-                "lpadmin",
-                "-p",
-                queue_name,
-                "-v",
-                uri,
-                "-m",
-                "raw",
-                "-D",
-                model,
-                "-L",
-                f"AppSocket {ip}:{port}",
-                "-E",
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as e:
-        log.warning("lpadmin raw socket failed for %s: %s", uri, e)
+        log.warning("lpadmin raw failed for %s: %s", uri, e)
         return None
     if result.returncode != 0:
         log.warning(
-            "lpadmin raw socket failed for %s: %s",
+            "lpadmin raw failed for %s: %s",
             uri,
             (result.stderr or result.stdout or "").strip(),
         )
         return None
-    log.info("added raw socket queue %s → %s", queue_name, uri)
+    log.info("added raw queue %s → %s", queue_name, uri)
     return queue_name
+
+
+def add_usb_printer(uri: str, model: str, *, queue: str | None = None) -> str | None:
+    """Provision a USB printer into CUPS.
+
+    Zebra / ZPL and other thermal devices use the raw driver so label payloads
+    are not filtered. Other USB devices try IPP Everywhere first, then raw.
+    """
+    queue_name = queue or _queue_name(model)
+    if _model_looks_thermal_raw(model) or "zpl" in uri.lower():
+        return add_raw_printer(
+            uri, model, queue=queue_name, location="USB"
+        )
+
+    added = add_printer(uri, model)
+    if added:
+        return added
+    log.info("USB everywhere failed for %s — trying raw", uri)
+    return add_raw_printer(uri, model, queue=queue_name, location="USB")
 
 
 def print_test_page(queue: str) -> bool:
@@ -538,19 +693,54 @@ def print_test_page(queue: str) -> bool:
 
 
 def ensure_printers() -> list[str]:
-    """Ensure every discoverable network printer has a CUPS queue.
+    """Ensure every discoverable printer has a CUPS queue.
 
-    1. IPP / driverless devices from ``lpinfo``
-    2. Port-9100 Zebra scan (skips IPs already known from step 1 / CUPS)
+    1. USB / direct (``usb://…``) from ``lpinfo``
+    2. IPP / driverless network devices from ``lpinfo``
+    3. Port-9100 Zebra scan (skips IPs already known from step 2 / CUPS)
 
-    Returns display names of all configured network printers (including any
-    that were already present). Discovery browses the network and can take
-    several seconds, so call this off the render loop.
+    Returns display names of all configured printers (including any that were
+    already present). Discovery browses USB + the network and can take several
+    seconds, so call this off the render loop.
     """
     existing = configured_network_queues()
     existing_uris = {uri for _, uri in existing}
     existing_names = {name for name, _ in existing}
     known_ips = ips_from_device_uris(existing_uris)
+
+    # --- 0. USB (Zebra ZD220 etc.) ---
+    try:
+        usb_devs = discover_usb_printers()
+    except Exception:
+        log.exception("USB printer discovery failed")
+        usb_devs = []
+
+    for uri, model in usb_devs:
+        if uri in existing_uris:
+            continue
+        # Same serial already configured under a slightly different URI form.
+        if any(_is_usb_uri(u) and u.split("?", 1)[0] == uri.split("?", 1)[0]
+               for u in existing_uris):
+            # Prefer exact serial match when both have query strings.
+            serial = ""
+            if "serial=" in uri:
+                serial = uri.split("serial=", 1)[1].split("&", 1)[0]
+            if serial and any(serial in u for u in existing_uris if _is_usb_uri(u)):
+                continue
+        queue = _queue_name(model)
+        if queue in existing_names:
+            # Disambiguate second USB of same model via serial suffix.
+            serial = ""
+            if "serial=" in uri:
+                serial = uri.split("serial=", 1)[1].split("&", 1)[0][-6:]
+            queue = _queue_name(f"{model}_{serial}") if serial else _queue_name(f"{model}_USB")
+        if queue in existing_names:
+            continue
+        added = add_usb_printer(uri, model, queue=queue)
+        if added:
+            existing_uris.add(uri)
+            existing_names.add(added)
+            log.info("provisioned USB printer queue %s", added)
 
     # --- 1. IPP Everywhere ---
     for uri, model in discover_network_printers():
@@ -599,7 +789,7 @@ def ensure_printers() -> list[str]:
 
 
 def ensure_printer() -> str | None:
-    """Back-compat: first network printer display name after ensure_printers()."""
+    """Back-compat: first configured printer display name after ensure_printers()."""
     names = ensure_printers()
     return names[0] if names else None
 
@@ -1095,6 +1285,14 @@ def queue_supports_raw(queue: str, *, device_uri: str | None = None) -> bool:
         # Port-9100 style raw TCP is the usual Zebra / thermal path.
         if scheme == "socket":
             return True
+        # USB Zebra / usblp queues we provision as raw.
+        if scheme == "usb" and (
+            "zpl" in uri.lower()
+            or "zebra" in uri.lower()
+            or "raw" in model
+            or "raw" in info
+        ):
+            return True
         if "raw" in uri.lower():
             return True
 
@@ -1102,7 +1300,7 @@ def queue_supports_raw(queue: str, *, device_uri: str | None = None) -> bool:
 
 
 def inventory_payload() -> list[dict[str, object]]:
-    """CUPS network printer inventory for heartbeat / report_printers.
+    """CUPS printer inventory (network + USB) for heartbeat / report_printers.
 
     Each item includes:
       cups_name, uri, display_name, status,
