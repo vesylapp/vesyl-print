@@ -68,6 +68,7 @@ echo "==> Run as user:  $RUN_USER"
 echo "==> Installing dependencies (python3, Pillow, numpy, fonts, CUPS, websocket, cryptography)..."
 apt-get update || echo "   (apt-get update failed — continuing with cached lists)"
 apt-get install -y python3 python3-pil python3-numpy fonts-dejavu-core cups \
+    poppler-utils \
     python3-websocket python3-cryptography rsync || true
 # Fallback if distro package missing — ActionCable push needs websocket-client.
 if ! python3 -c "import websocket" 2>/dev/null; then

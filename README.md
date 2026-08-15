@@ -191,6 +191,12 @@ submitted with `lp -o raw`. Thermal printers usually need a **raw** CUPS queue
 (`lpadmin -m raw` or `socket://host:9100`); driverless IPP Everywhere often will
 not honor raw. Inventory reports `supports_raw` per queue for WMS.
 
+**PDF / PNG / JPEG → Zebra:** if the queue is raw (USB ZD220, `socket://…:9100`),
+the agent rasterizes the file (`pdftoppm` / Pillow) to 1-bit and wraps it in a
+ZPL `^GFA` graphic (ASCII hex), then `lp -o raw`. Options: `zpl_max_width_dots`
+(default 448), `zpl_dpi` (203), `zpl_threshold`, `zpl_invert`, `no_zpl_convert`.
+Native ZPL (`raw_*` / files starting with `^XA`) is sent unchanged.
+
 **Zebra discovery:** after IPP/`lpinfo`, the agent scans local `/24` LAN
 segments for TCP **9100**, skips IPs already known from IPP/CUPS, GETs
 `http://IP/` to confirm a Zebra print server (e.g. “ZTC ZD421-203dpi ZPL”), and

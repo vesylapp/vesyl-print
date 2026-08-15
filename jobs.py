@@ -15,6 +15,9 @@ On agent start: drain_queue() recovers queue/*.json left from crashes.
 ``raw_uri`` / ``raw_base64`` write a temp ``.zpl``/``.raw`` file (no PDF/PNG
 magic sniff) and submit with ``lp -o raw``. Thermal queues usually need a raw
 CUPS queue; driverless IPP Everywhere often will not honor raw.
+
+PDF/PNG/JPEG sent to a raw Zebra queue are converted to ZPL ``^GFA`` graphics
+(see ``zpl.py``) before ``lp -o raw``.
 """
 
 from __future__ import annotations
@@ -33,6 +36,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
+
+import zpl as zpl_mod
 
 log = logging.getLogger("vesyl-print.jobs")
 
@@ -586,12 +591,52 @@ def process_job(
         copies = int(job.options.get("copies") or 1)
         if copies < 1:
             copies = 1
+
+        use_raw = is_raw_job(job)
+        # PDF/PNG/JPEG → ZPL graphic when targeting a raw thermal (Zebra) queue.
+        zpl_temp: Path | None = None
+        if zpl_mod.should_convert_to_zpl(
+            path,
+            cups_name=job.cups_name,
+            job_options=job.options,
+            force_raw=use_raw,
+        ):
+            try:
+                conv_dir = path.parent if is_temp else Path(
+                    tempfile.mkdtemp(prefix="vesyl-print-zpl-")
+                )
+                zpl_temp = zpl_mod.write_zpl_file(
+                    path,
+                    conv_dir,
+                    job.id,
+                    options=job.options,
+                )
+                log.info(
+                    "job %s converted %s → ZPL for raw queue %s",
+                    job_id,
+                    path.name,
+                    job.cups_name,
+                )
+                # Drop original temp graphic; keep ZPL temp.
+                if is_temp and path is not None and path != zpl_temp:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                path = zpl_temp
+                is_temp = True
+                use_raw = True
+            except zpl_mod.ZplError as e:
+                raise JobError(e.message, code=e.code) from e
+            except Exception as e:
+                raise JobError(f"ZPL conversion failed: {e}", code="zpl_error") from e
+
         cups_id = lp(
             job.cups_name,
             path,
             title=job.title,
             copies=copies,
-            raw=is_raw_job(job),
+            raw=use_raw,
         )
         cups_job = cups_id if isinstance(cups_id, str) and cups_id.strip() else None
         try:
