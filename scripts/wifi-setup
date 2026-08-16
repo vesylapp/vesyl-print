@@ -1,0 +1,29 @@
+#!/usr/bin/python3
+"""Root helper: NetworkManager hotspot / scan / connect for vesyl-print.
+
+Installed as /usr/local/lib/vesyl-print/wifi-setup
+Sudoers: vesyl ALL=(root) NOPASSWD: /usr/local/lib/vesyl-print/wifi-setup
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+if sys.version_info < (3, 9):
+    sys.stderr.write("wifi-setup requires Python 3.9+\n")
+    raise SystemExit(2)
+
+CANDIDATES = (
+    Path("/opt/vesyl-print/current"),
+    Path(__file__).resolve().parents[1],
+)
+for root in CANDIDATES:
+    if (root / "wifi_setup.py").is_file():
+        sys.path.insert(0, str(root))
+        break
+
+import wifi_setup  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(wifi_setup.main())

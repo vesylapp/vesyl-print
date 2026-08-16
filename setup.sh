@@ -49,6 +49,7 @@ DISPLAY_UNIT="/etc/systemd/system/${DISPLAY_SERVICE}.service"
 AGENT_UNIT="/etc/systemd/system/${AGENT_SERVICE}.service"
 CLI_PATH="/usr/local/bin/vesyl-print"
 APPLY_UPDATE="/usr/local/lib/vesyl-print/apply-update"
+WIFI_SETUP="/usr/local/lib/vesyl-print/wifi-setup"
 SUDOERS_DROPIN="/etc/sudoers.d/vesyl-print"
 
 if [[ -f "$REPO_DIR/VERSION" ]]; then
@@ -69,7 +70,8 @@ echo "==> Installing dependencies (python3, Pillow, numpy, fonts, CUPS, websocke
 apt-get update || echo "   (apt-get update failed — continuing with cached lists)"
 apt-get install -y python3 python3-pil python3-numpy fonts-dejavu-core cups \
     poppler-utils \
-    python3-websocket python3-cryptography rsync || true
+    python3-websocket python3-cryptography rsync \
+    network-manager python3-segno || true
 # Fallback if distro package missing — ActionCable push needs websocket-client.
 if ! python3 -c "import websocket" 2>/dev/null; then
     echo "==> Installing websocket-client via pip"
@@ -82,7 +84,16 @@ fi
 # discover and add network printers to CUPS without sudo, and 'input' to
 # read the MHS-3.5" resistive touchscreen (/dev/input/event*) for page cycle.
 # lp: /dev/usb/lp* for USB printers on some images; lpadmin: manage CUPS queues
-usermod -aG video,lpadmin,lp,input "$RUN_USER"
+usermod -aG video,lpadmin,lp,input,netdev "$RUN_USER"
+
+# Captive-portal DNS for the setup hotspot (phones auto-open the login page).
+install -d -m 0755 /etc/NetworkManager/dnsmasq-shared.d
+cat > /etc/NetworkManager/dnsmasq-shared.d/vesyl-captive.conf <<'DNS'
+# vesyl-print setup hotspot — managed by setup.sh
+address=/#/10.42.0.1
+dhcp-option=114,http://10.42.0.1/
+DNS
+chmod 0644 /etc/NetworkManager/dnsmasq-shared.d/vesyl-captive.conf
 
 # --- 2. locate the boot config + overlays dir ------------------------------
 if [[ -f /boot/firmware/config.txt ]]; then
@@ -269,17 +280,34 @@ else
     echo "   WARNING: scripts/apply-update missing — skip helper" >&2
 fi
 
-if [[ -x "$APPLY_UPDATE" ]]; then
+WIFI_SRC=""
+if [[ -f "$APP_ROOT/scripts/wifi-setup" ]]; then
+    WIFI_SRC="$APP_ROOT/scripts/wifi-setup"
+elif [[ -f "$REPO_DIR/scripts/wifi-setup" ]]; then
+    WIFI_SRC="$REPO_DIR/scripts/wifi-setup"
+fi
+if [[ -n "$WIFI_SRC" ]]; then
+    echo "==> Installing Wi-Fi helper: $WIFI_SETUP"
+    install -m 0755 "$WIFI_SRC" "$WIFI_SETUP"
+else
+    echo "   WARNING: scripts/wifi-setup missing — skip helper" >&2
+fi
+
+if [[ -x "$APPLY_UPDATE" || -x "$WIFI_SETUP" ]]; then
     echo "==> Installing sudoers drop-in: $SUDOERS_DROPIN"
     tmp_sudoers="$(mktemp)"
-    cat > "$tmp_sudoers" <<SUDO
-# vesyl-print OTA — managed by setup.sh (do not edit by hand)
-# Allows the service user to activate releases and restart units only.
-$RUN_USER ALL=(root) NOPASSWD: $APPLY_UPDATE
-SUDO
+    {
+        echo "# vesyl-print helpers — managed by setup.sh (do not edit by hand)"
+        if [[ -x "$APPLY_UPDATE" ]]; then
+            echo "$RUN_USER ALL=(root) NOPASSWD: $APPLY_UPDATE"
+        fi
+        if [[ -x "$WIFI_SETUP" ]]; then
+            echo "$RUN_USER ALL=(root) NOPASSWD: $WIFI_SETUP"
+        fi
+    } > "$tmp_sudoers"
     if visudo -cf "$tmp_sudoers" >/dev/null 2>&1; then
         install -m 0440 "$tmp_sudoers" "$SUDOERS_DROPIN"
-        echo "   $RUN_USER may run: sudo -n $APPLY_UPDATE …"
+        echo "   $RUN_USER may run: sudo -n $APPLY_UPDATE / $WIFI_SETUP"
     else
         echo "   WARNING: sudoers snippet failed visudo -cf — not installed" >&2
         cat "$tmp_sudoers" >&2

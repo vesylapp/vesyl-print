@@ -27,8 +27,13 @@ IDLE_HOME_SECONDS = 10.0
 
 # Long-press overlay (not part of the page cycle).
 PAGE_TEST = "test"
+PAGE_WIFI = "wifi"
 LONG_PRESS_SECONDS = 3.0
 TEST_IDLE_SECONDS = 30.0
+
+
+def network_status_color(up: bool) -> tuple[int, int, int]:
+    return OK if up else DOWN
 
 
 def format_agent_version(version: str | None) -> str:
@@ -205,9 +210,9 @@ def layout_test_print(
     nav_size: int = 52,
     show_nav: bool = True,
 ) -> list[HitRect]:
-    """Hit targets: ‹ › beside the printer name, Back | Test on the bottom row."""
+    """Hit targets: ‹ › beside the name; Back | Wi-Fi | Test on the bottom row."""
     inner_w = max(40, w - 2 * pad)
-    col_w = max(36, (inner_w - gap) // 2)
+    col_w = max(32, (inner_w - 2 * gap) // 3)
     btn_y = h - footer_reserve - btn_h
     if btn_y < body_top:
         btn_y = max(body_top, 0)
@@ -247,8 +252,16 @@ def layout_test_print(
             payload={"kind": "back", "label": "Back"},
         ),
         HitRect(
-            id="test",
+            id="wifi",
             x=pad + col_w + gap,
+            y=btn_y,
+            w=col_w,
+            h=btn_h,
+            payload={"kind": "wifi", "label": "Wi-Fi"},
+        ),
+        HitRect(
+            id="test",
+            x=pad + 2 * (col_w + gap),
             y=btn_y,
             w=col_w,
             h=btn_h,
@@ -355,6 +368,8 @@ def apply_test_hit(
         return "prev"
     if kind == "next":
         return "next"
+    if kind == "wifi":
+        return "wifi"
     return None
 
 

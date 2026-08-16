@@ -72,6 +72,10 @@ class IdentityAndLabelsTests(unittest.TestCase):
         self.assertEqual(disp.printer_status_color("printing"), disp.WARN)
         self.assertEqual(disp.printer_status_color("stopped"), disp.DOWN)
 
+    def test_network_status_color(self):
+        self.assertEqual(disp.network_status_color(True), disp.OK)
+        self.assertEqual(disp.network_status_color(False), disp.DOWN)
+
     def test_printer_status_label_prefers_message(self):
         self.assertEqual(
             disp.printer_status_label("stopped", "Out of paper"),
@@ -249,7 +253,9 @@ class TestPrintUiTests(unittest.TestCase):
         raw_rects = disp.layout_test_print(
             w=480, h=320, body_top=80, printer=raw_p, nav_y=80
         )
-        self.assertEqual([r.id for r in raw_rects], ["prev", "next", "back", "test"])
+        self.assertEqual(
+            [r.id for r in raw_rects], ["prev", "next", "back", "wifi", "test"]
+        )
         prev = next(r for r in raw_rects if r.id == "prev")
         nxt = next(r for r in raw_rects if r.id == "next")
         back = next(r for r in raw_rects if r.id == "back")

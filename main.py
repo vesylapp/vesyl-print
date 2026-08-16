@@ -27,6 +27,7 @@ import statusio
 import sysinfo
 import touch as touch_mod
 import update as update_mod
+import wifi_setup
 from config import AGENT_VERSION, load_config
 from display_status import (
     DOWN,
@@ -53,6 +54,7 @@ from display_status import (
     jobs_strip_label,
     layout_test_print,
     ota_display_message,
+    network_status_color,
     printer_status_color,
     printer_status_label,
     test_print_default_format,
@@ -124,9 +126,12 @@ class InfoScreen:
         )
         self._page_lock = threading.Lock()
         self.test_ui = TestPrintState(idle_seconds=TEST_IDLE_SECONDS)
+        self.wifi = wifi_setup.WifiSetupController()
         self._hit_rects: list[HitRect] = []
         self._print_lock = threading.Lock()
         self._last_ptr: tuple[int, int, float] | None = None
+        self._wifi_qr: Image.Image | None = None
+        self._wifi_qr_key: str = ""
         if update_status_path:
             self.update_status_path = update_status_path
         elif status_path:
@@ -231,6 +236,12 @@ class InfoScreen:
             elif action == "prev":
                 self.test_ui.cycle(-1, n)
                 self.test_ui.sync_printers(printers)
+            elif action == "wifi":
+                if sysinfo.ethernet_up():
+                    self.test_ui.message = "Unplug Ethernet first"
+                else:
+                    self.test_ui.close()
+                    self.wifi.request_setup()
             elif action and action.startswith("print:"):
                 self._start_test_print(action.split(":", 1)[1])
             return
@@ -293,6 +304,10 @@ class InfoScreen:
 
         if self.test_ui.sync_idle(time.monotonic()):
             return self._render_test(img, d, body_top, st, cloud)
+
+        wifi = self.wifi.snapshot()
+        if wifi.show_setup:
+            return self._render_wifi(wifi, st)
 
         if pairing == "revoked":
             return self._render_revoked(img, d, body_top, st)
@@ -533,6 +548,38 @@ class InfoScreen:
         self._draw_footer(d, st, default_label="test print", default_color=WARN)
         return img
 
+    def _render_wifi(self, wifi: wifi_setup.WifiSnapshot, st) -> Image.Image:
+        """Full-screen setup: QR joins the temporary AP."""
+        img, d = self._new()
+        self._centered(d, "SET UP WI-FI", self.f_label, y=10, fill=ACCENT)
+        payload = wifi.qr_payload or wifi_setup.wifi_qr_payload(wifi.ssid, wifi.pin)
+        if payload and payload != self._wifi_qr_key:
+            box = 168 if self.h >= 300 else 140
+            self._wifi_qr = wifi_setup.qr_image(payload, box)
+            self._wifi_qr_key = payload
+        qr = self._wifi_qr
+        y = 36
+        if qr is not None:
+            qx = max(0, (self.w - qr.width) // 2)
+            img.paste(qr, (qx, y))
+            y += qr.height + 8
+        else:
+            self._centered(
+                d, "Scan not available — join AP below", self.f_hint, y=y, fill=MUTED
+            )
+            y += 28
+        if wifi.ssid:
+            self._centered(d, wifi.ssid, self.f_footer, y=y, fill=FG)
+            y += 18
+        if wifi.pin:
+            self._centered(d, f"PIN {wifi.pin}", self.f_footer, y=y, fill=WARN)
+            y += 18
+        msg = wifi.message or "Join, then tap Sign in if asked"
+        msg = self._fit(d, msg, self.f_hint, self.w - 24)
+        self._centered(d, msg, self.f_hint, y=min(y, self.h - 52), fill=MUTED)
+        self._draw_footer(d, st, default_label="no ethernet", default_color=WARN)
+        return img
+
     def _draw_hit_button(self, d, r: HitRect) -> None:
         kind = str((r.payload or {}).get("kind") or "")
         label = str((r.payload or {}).get("label") or r.id)
@@ -546,6 +593,10 @@ class InfoScreen:
         elif kind == "back":
             fill = (28, 30, 38)
             border = MUTED
+        elif kind == "wifi":
+            fill = (36, 40, 52)
+            border = ACCENT
+            text_fill = ACCENT
         elif kind in ("prev", "next"):
             fill = (28, 30, 38)
             border = (70, 76, 92)
@@ -716,7 +767,7 @@ class InfoScreen:
         default_label: str,
         default_color: tuple[int, int, int],
     ) -> None:
-        """Footer right cluster: ``vX.Y.Z  ● status`` (version left of status dot)."""
+        """Footer: left network (green/red) + right ``vX.Y.Z  ● status``."""
         ota = ota_display_message(self._update_status())
         if ota:
             label, color = ota
@@ -725,13 +776,11 @@ class InfoScreen:
 
         version = self._display_version(st)
         ver_w = d.textlength(version, font=self.f_footer) if version else 0
-        # Room for optional version + gap + dot (12px) + gap before label.
         reserved = (ver_w + 8 + 12 + 8) if version else (12 + 8)
         max_status_w = self.w - 16 - 16 - reserved
         label = self._fit(d, label, self.f_footer, max(40, max_status_w))
         tw = d.textlength(label, font=self.f_footer)
 
-        # Right edge: status text; immediately left: colored dot; left of that: version.
         tx = self.w - 16 - tw
         dot_l, dot_r = tx - 20, tx - 8
         d.text((tx, self.h - 28), label, font=self.f_footer, fill=MUTED)
@@ -743,6 +792,37 @@ class InfoScreen:
                 font=self.f_footer,
                 fill=MUTED,
             )
+
+        kind, net_label, net_up = sysinfo.network_link()
+        net_color = network_status_color(net_up)
+        icon_w = 16
+        max_net_w = max(40, (dot_l - 8 - ver_w if version else dot_l) - 16 - icon_w - 6)
+        net_label = self._fit(d, net_label, self.f_footer, max_net_w)
+        self._draw_net_icon(d, kind, 16, self.h - 26, net_color)
+        d.text((16 + icon_w + 4, self.h - 28), net_label, font=self.f_footer, fill=net_color)
+
+    def _draw_net_icon(
+        self,
+        d,
+        kind: str,
+        x: int,
+        y: int,
+        color: tuple[int, int, int],
+    ) -> None:
+        """Tiny ethernet jack / wifi arcs in the footer."""
+        if kind == "eth":
+            d.rectangle([x + 1, y + 1, x + 13, y + 8], outline=color, width=1)
+            d.rectangle([x + 4, y + 8, x + 10, y + 11], fill=color)
+            return
+        if kind == "wifi":
+            cx, cy = x + 7, y + 11
+            d.arc([cx - 4, cy - 4, cx + 4, cy + 4], 200, 340, fill=color, width=1)
+            d.arc([cx - 7, cy - 7, cx + 7, cy + 7], 200, 340, fill=color, width=1)
+            d.ellipse([cx - 1, cy - 1, cx + 1, cy + 1], fill=color)
+            return
+        # down
+        d.line([x + 3, y + 2, x + 11, y + 10], fill=color, width=2)
+        d.line([x + 11, y + 2, x + 3, y + 10], fill=color, width=2)
 
     def _status(self, d, text, color):
         """Right-aligned footer without version (splash/offline helpers)."""
@@ -926,6 +1006,18 @@ def main() -> None:
         args=(screen, stop_bg),
         daemon=True,
         name="vesyl-printers",
+    ).start()
+
+    def _wifi_loop() -> None:
+        while not stop_bg.is_set():
+            try:
+                screen.wifi.tick()
+            except Exception:
+                log.debug("wifi setup tick failed", exc_info=True)
+            stop_bg.wait(2.0)
+
+    threading.Thread(
+        target=_wifi_loop, daemon=True, name="vesyl-wifi-setup"
     ).start()
 
     listener: touch_mod.TouchListener | None = None
