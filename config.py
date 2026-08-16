@@ -18,7 +18,7 @@ def _read_version_file() -> str:
                 return v
     except OSError:
         pass
-    return "0.3.15"
+    return "0.3.16"
 
 
 AGENT_VERSION = _read_version_file()
@@ -99,6 +99,10 @@ class Config:
     pull_jobs_enabled: bool = True
     # Phase D: ActionCable PrintNodeChannel push (pull remains safety net).
     cable_enabled: bool = True
+    # After lp accepts a job: "async" (default) watches CUPS in the background
+    # so the next job can spool immediately — page order is CUPS FIFO.
+    # "sync" waits for the printer to finish (old behavior). "off" skips watch.
+    wait_cups: str = "async"
     # OTA (app): cloud sets desired_agent_version on heartbeat response.
     auto_update_enabled: bool = True
     update_channel: str = "stable"
@@ -163,6 +167,14 @@ def _apply_file(data: dict[str, Any], cfg: Config) -> None:
         cfg.pull_jobs_enabled = bool(data["pull_jobs_enabled"])
     if "cable_enabled" in data:
         cfg.cable_enabled = bool(data["cable_enabled"])
+    if "wait_cups" in data:
+        raw = data["wait_cups"]
+        if raw is True or str(raw).lower() in ("sync", "true", "1"):
+            cfg.wait_cups = "sync"
+        elif raw is False or str(raw).lower() in ("off", "false", "0"):
+            cfg.wait_cups = "off"
+        else:
+            cfg.wait_cups = "async"
     if "auto_update_enabled" in data:
         cfg.auto_update_enabled = bool(data["auto_update_enabled"])
     if ch := data.get("update_channel"):
@@ -227,6 +239,7 @@ def write_default_config(path: Path | None = None) -> Path:
         "pull_interval_seconds": cfg.pull_interval_seconds,
         "pull_jobs_enabled": True,
         "cable_enabled": True,
+        "wait_cups": "async",
         "auto_update_enabled": True,
         "update_channel": "stable",
         "releases_base_url": DEFAULT_RELEASES_BASE_URL,

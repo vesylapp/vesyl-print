@@ -79,6 +79,7 @@ state in `/var/lib/vesyl-print`.
 | `pull_jobs_enabled` | REST pull safety net |
 | `cable_enabled` | ActionCable push via `cable_url` |
 | `cable_url` | e.g. `wss://wms-api.vesyl.dev/print/cable` |
+| `wait_cups` | After `lp`: `async` (default — next job spools immediately; CUPS FIFO keeps order), `sync` (wait for printer), `off` |
 
 ### Job delivery
 
@@ -184,6 +185,8 @@ Jobs go through the durable pipeline:
 1. Write `queue/<job_id>.json` (fsync)
 2. Materialize content → `lp -d <cups_name>` (add `-o raw` for `raw_*` / ZPL)
 3. Marker `processed/<job_id>`, delete queue file
+4. Watch CUPS in the background (`wait_cups: async`) so the next job can
+   `lp` immediately. Page order is the CUPS queue, not “wait for printed.”
 
 Content types: `pdf_*`, `png_*`, `jpeg_*`/`jpg_*`, `raw_*` (ZPL/EPL), `local_path`.
 Raw payloads are written as `.zpl`/`.raw` **without** PDF/PNG magic sniffing and

@@ -6,6 +6,8 @@ import base64
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -322,6 +324,43 @@ class TestRawLpPath(unittest.TestCase):
                 result = process_job(job, store, lp=lp, wait_cups=False)
             self.assertEqual(result, "delivered")
             wait.assert_not_called()
+
+    def test_wait_cups_async_returns_before_cups_finishes(self):
+        """Next job can spool as soon as lp accepts — CUPS watch is background."""
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "x.zpl"
+            f.write_bytes(b"^XA^XZ")
+            job = jobs.job_from_local_file(f, "Q", raw=True)
+            store = _store(td)
+            states: list[str] = []
+            started = threading.Event()
+            release = threading.Event()
+
+            def lp(cups, path, *, title=None, copies=1, raw=False):
+                return "Q-99"
+
+            def wait(request_id, *, timeout_s=0, poll_s=0, on_tick=None):
+                started.set()
+                release.wait(timeout=2)
+                return "printed"
+
+            def state(j, st, detail=None):
+                states.append(st)
+
+            with mock.patch("jobs.wait_cups_job", side_effect=wait):
+                result = process_job(
+                    job, store, lp=lp, report_state=state, wait_cups="async"
+                )
+            self.assertEqual(result, "delivered")
+            self.assertIn("delivered", states)
+            self.assertNotIn("printed", states)
+            self.assertTrue(store.is_processed(job.id))
+            self.assertTrue(started.wait(timeout=2))
+            release.set()
+            deadline = time.monotonic() + 2
+            while "printed" not in states and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIn("printed", states)
 
 
 class TestReceiveIdempotent(unittest.TestCase):

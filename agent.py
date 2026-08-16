@@ -376,6 +376,7 @@ def drain_local_queue(
             device_token=device_token,
             heartbeat_seconds=cfg.heartbeat_seconds,
         ),
+        wait_cups=cfg.wait_cups,
     )
     for job_id, result in results:
         log.info("drain %s → %s", job_id, result)
@@ -436,6 +437,7 @@ def pull_and_process(
                 ack=ack,
                 report_state=report_state,
                 on_wait_tick=on_wait_tick,
+                wait_cups=cfg.wait_cups,
             )
         except JobError as e:
             log.error("job %s failed: %s", job.id, e.message)
@@ -476,6 +478,7 @@ def process_job_payload(
                 device_token=device_token,
                 heartbeat_seconds=cfg.heartbeat_seconds,
             ),
+            wait_cups=cfg.wait_cups,
         )
     except JobError as e:
         log.error("job %s failed: %s", job.id, e.message)

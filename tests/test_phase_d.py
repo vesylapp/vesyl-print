@@ -223,6 +223,10 @@ class TestConfigCable(unittest.TestCase):
         self.assertTrue(cfg.cable_enabled)
         self.assertTrue(cfg.cable_url.endswith("/print/cable"))
 
+    def test_wait_cups_default_async(self):
+        cfg = Config(api_base_url="https://example.test", cable_url="")
+        self.assertEqual(cfg.wait_cups, "async")
+
 
 class TestSessionStartNoDeadlock(unittest.TestCase):
     def test_start_does_not_deadlock_without_ws(self):

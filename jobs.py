@@ -7,7 +7,9 @@ Ordering (at-least-once, crash-safe):
 3. Only then call ack callback (when cloud supports it)
 4. Materialize content → lp -d <cups_name> (``-o raw`` for raw_*/ZPL)
 5. Report **delivered** when lp accepts the job
-6. Poll CUPS when possible → report **printed** or **error**
+6. Optionally poll CUPS → report **printed** or **error**
+   (``wait_cups="async"`` does this in the background so the next job can
+   be ``lp``'d immediately; CUPS FIFO keeps page order on one queue)
 7. On success path: write processed/<job_id>, delete queue file
 
 On agent start: drain_queue() recovers queue/*.json left from crashes.
@@ -29,13 +31,14 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 import zpl as zpl_mod
 
@@ -203,6 +206,54 @@ def default_lp(
 # job remains in not-completed so we still report ``printed`` after refill.
 _DEFAULT_CUPS_WAIT_S = 24 * 60 * 60.0  # 24h hard ceiling
 _CUPS_WAIT_LOG_EVERY_S = 60.0
+
+# True/"sync" = block until CUPS finishes (old behavior).
+# "async" = watch CUPS in a thread; return after lp so the next job can spool.
+# False/"off" = do not watch CUPS.
+WaitCups = bool | Literal["sync", "async", "off"]
+
+
+def normalize_wait_cups(wait_cups: WaitCups) -> Literal["sync", "async", "off"]:
+    if wait_cups is True or wait_cups == "sync":
+        return "sync"
+    if wait_cups is False or wait_cups in ("off", "false", "0", 0):
+        return "off"
+    return "async"
+
+
+def _watch_cups_async(
+    job: PrintJob,
+    cups_id: str,
+    report_state: StateFn,
+    on_tick: Callable[[], None] | None,
+) -> None:
+    """Report printed/error after CUPS completes, without blocking the next lp."""
+
+    def run() -> None:
+        try:
+            outcome = wait_cups_job(cups_id, on_tick=on_tick)
+            if outcome == "printed":
+                try:
+                    report_state(job, "printed", cups_id)
+                except Exception:
+                    log.debug("async report_state printed failed", exc_info=True)
+            elif outcome == "error":
+                try:
+                    report_state(job, "error", f"CUPS job {cups_id} failed")
+                except Exception:
+                    log.debug("async report_state error failed", exc_info=True)
+            else:
+                log.info(
+                    "job %s CUPS tracking timed out for %s — left delivered",
+                    job.id,
+                    cups_id,
+                )
+        except Exception:
+            log.exception("async CUPS wait failed for job %s", job.id)
+
+    threading.Thread(
+        target=run, name=f"cups-wait-{job.id[:8]}", daemon=True
+    ).start()
 
 
 def wait_cups_job(
@@ -546,12 +597,18 @@ def process_job(
     fetch_url: Callable[[str], bytes] | None = None,
     work_dir: Path | None = None,
     on_wait_tick: Callable[[], None] | None = None,
-    wait_cups: bool = True,
+    wait_cups: WaitCups = True,
 ) -> str:
     """Run the full durable pipeline for one job.
 
     Returns final local result: ``printed``, ``delivered`` (no CUPS tracking),
     or raises JobError after reporting error.
+
+    ``wait_cups``:
+      True / ``"sync"`` — block until CUPS leaves the active queue (default).
+      ``"async"`` — return after ``lp``; watch CUPS in a thread (page order is
+      CUPS FIFO on the same queue).
+      False / ``"off"`` — do not watch CUPS.
 
     ``on_wait_tick`` is invoked periodically while waiting on CUPS completion
     (e.g. paper-out recovery) so the agent can keep reporting printer inventory.
@@ -648,7 +705,8 @@ def process_job(
             log.debug("report_state delivered failed", exc_info=True)
 
         final = "delivered"
-        if cups_job and wait_cups:
+        mode = normalize_wait_cups(wait_cups)
+        if cups_job and mode == "sync":
             outcome = wait_cups_job(cups_job, on_tick=on_wait_tick)
             if outcome == "printed":
                 try:
@@ -666,6 +724,8 @@ def process_job(
                     job_id,
                     cups_id,
                 )
+        elif cups_job and mode == "async":
+            _watch_cups_async(job, cups_job, report_state, on_wait_tick)
         elif not cups_job:
             log.info("job %s no CUPS request id — left delivered", job_id)
 
@@ -712,6 +772,7 @@ def drain_queue(
     report_state: StateFn = noop_state,
     fetch_url: Callable[[str], bytes] | None = None,
     on_wait_tick: Callable[[], None] | None = None,
+    wait_cups: WaitCups = True,
 ) -> list[tuple[str, str]]:
     """Process every queue/*.json (crash recovery). Returns [(job_id, result)]."""
     store.ensure()
@@ -732,6 +793,7 @@ def drain_queue(
                 report_state=report_state,
                 fetch_url=fetch_url,
                 on_wait_tick=on_wait_tick,
+                wait_cups=wait_cups,
             )
             results.append((job_id, state))
         except JobError as e:
@@ -750,7 +812,7 @@ def receive_job(
     report_state: StateFn = noop_state,
     fetch_url: Callable[[str], bytes] | None = None,
     on_wait_tick: Callable[[], None] | None = None,
-    wait_cups: bool = True,
+    wait_cups: WaitCups = True,
 ) -> str:
     """Entry point for a newly delivered job (pull/push later)."""
     return process_job(
