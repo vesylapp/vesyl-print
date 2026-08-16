@@ -2,6 +2,8 @@
 
 Paired: Ops (default) → Network → System; tap cycles; 10s idle returns to Ops.
 Unpaired / revoked: engineer network view for connect + claim.
+Hold the screen 3s (paired or not) to open the test-print overlay. While
+that overlay is open, taps do not cycle pages: ‹ › change printer, Test, Back.
 
 Renders to the 3.5" LCD (/dev/fb1) at ~1 Hz.
 Run with:  python3 main.py
@@ -29,21 +31,31 @@ from config import AGENT_VERSION, load_config
 from display_status import (
     DOWN,
     IDLE_HOME_SECONDS,
+    LONG_PRESS_SECONDS,
     OK,
     PAGE_NETWORK,
     PAGE_OPS,
     PAGE_SYSTEM,
+    PAGE_TEST,
     PAIRED_PAGES,
+    TEST_IDLE_SECONDS,
     WARN,
+    HitRect,
     PageState,
+    TestPrintState,
+    apply_test_hit,
+    coarse_test_action,
     count_queue_jobs,
     format_agent_version,
     heartbeat_age_label,
+    hit_test,
     identity_line,
     jobs_strip_label,
+    layout_test_print,
     ota_display_message,
     printer_status_color,
     printer_status_label,
+    test_print_default_format,
 )
 from framebuffer import Framebuffer
 from stream_lcd import (
@@ -111,6 +123,10 @@ class InfoScreen:
             initial_page, idle_seconds=idle_home_seconds
         )
         self._page_lock = threading.Lock()
+        self.test_ui = TestPrintState(idle_seconds=TEST_IDLE_SECONDS)
+        self._hit_rects: list[HitRect] = []
+        self._print_lock = threading.Lock()
+        self._last_ptr: tuple[int, int, float] | None = None
         if update_status_path:
             self.update_status_path = update_status_path
         elif status_path:
@@ -160,6 +176,101 @@ class InfoScreen:
         with self._page_lock:
             self._pages.note_tap(paired=paired, now_mono=time.monotonic())
 
+    def handle_pointer(self, ev: touch_mod.TouchEvent) -> None:
+        """Route a classified touch event.
+
+        While the test overlay is open, page-cycle taps are ignored. Side
+        ‹ › buttons change printer; only Back leaves the overlay.
+        """
+        now = time.monotonic()
+        if ev.kind == "long_press":
+            if not self.test_ui.open:
+                self.test_ui.open_panel(now)
+                log.info("test print panel opened (long-press)")
+            else:
+                self.test_ui.note_input(now)
+            return
+        if self.test_ui.open:
+            printers = self._ops_printer_rows()
+            self.test_ui.sync_printers(printers)
+            n = len(printers)
+            # Finger drag on a resistive panel often classifies as a swipe;
+            # still treat the release point as a button press.
+            if ev.kind not in (
+                "tap",
+                "swipe_left",
+                "swipe_right",
+            ):
+                self.test_ui.note_input(now)
+                return
+            if ev.x is not None and ev.y is not None:
+                self._last_ptr = (int(ev.x), int(ev.y), now)
+            hit = hit_test(self._hit_rects, ev.x, ev.y, pad=18)
+            action = apply_test_hit(self.test_ui, hit, now)
+            if not action:
+                coarse = coarse_test_action(ev.x, ev.y, self.w, self.h)
+                if coarse == "test":
+                    raw = bool(
+                        (self.test_ui.selected or {}).get("supports_raw")
+                    )
+                    action = f"print:{test_print_default_format(raw)}"
+                else:
+                    action = coarse
+            log.info(
+                "test-ui %s at (%s,%s) → %s",
+                ev.kind,
+                ev.x,
+                ev.y,
+                action,
+            )
+            if action == "close":
+                self.test_ui.close()
+            elif action == "next":
+                self.test_ui.cycle(1, n)
+                self.test_ui.sync_printers(printers)
+            elif action == "prev":
+                self.test_ui.cycle(-1, n)
+                self.test_ui.sync_printers(printers)
+            elif action and action.startswith("print:"):
+                self._start_test_print(action.split(":", 1)[1])
+            return
+        if ev.kind == "tap":
+            self.note_tap()
+
+    def _start_test_print(self, fmt: str) -> None:
+        sel = self.test_ui.selected or {}
+        cups = str(sel.get("cups_name") or "").strip()
+        if not cups:
+            self.test_ui.message = "No CUPS queue"
+            return
+        if not self._print_lock.acquire(blocking=False):
+            return
+        self.test_ui.busy = True
+        self.test_ui.message = f"Sending {fmt.upper()}…"
+
+        def _run() -> None:
+            try:
+                from test_label import submit_test_label
+
+                state = submit_test_label(cups, fmt, wait_cups=False)
+                self.test_ui.message = f"{fmt.upper()} {state}"
+                log.info("test print %s → %s (%s)", fmt, cups, state)
+            except Exception as e:
+                msg = getattr(e, "message", None) or str(e)
+                self.test_ui.message = f"Failed: {msg}"[:48]
+                log.warning("test print %s → %s failed: %s", fmt, cups, e)
+            finally:
+                self.test_ui.busy = False
+                self.test_ui.note_input(time.monotonic())
+                try:
+                    self._print_lock.release()
+                except RuntimeError:
+                    pass
+
+        threading.Thread(
+            target=_run, name="vesyl-test-print", daemon=True
+        ).start()
+
     def set_page(self, page: str) -> None:
         with self._page_lock:
             self._pages.set_page(page, now_mono=time.monotonic())
@@ -179,6 +290,9 @@ class InfoScreen:
         st = self._agent_status()
         pairing = st.pairing if st else "unpaired"
         cloud = st.cloud if st else "unknown"
+
+        if self.test_ui.sync_idle(time.monotonic()):
+            return self._render_test(img, d, body_top, st, cloud)
 
         if pairing == "revoked":
             return self._render_revoked(img, d, body_top, st)
@@ -208,6 +322,8 @@ class InfoScreen:
         self._centered(
             d, "claim: vesyl-print claim <CODE>", self.f_hint, y=y, fill=MUTED
         )
+        y += 18
+        self._centered(d, "hold 3s · test print", self.f_hint, y=y, fill=MUTED)
         y += 32
         self._row(d, "HOSTNAME", sysinfo.hostname(), y=y)
         y += 52
@@ -345,9 +461,104 @@ class InfoScreen:
         if self.printer_rows:
             return self.printer_rows
         return [
-            {"name": n, "status": None, "message": None}
+            {
+                "name": n,
+                "cups_name": n,
+                "status": None,
+                "message": None,
+                "supports_raw": False,
+            }
             for n in self.printer_names
         ]
+
+    def _render_test(
+        self,
+        img,
+        d,
+        body_top: int,
+        st: statusio.AgentStatus | None,
+        cloud: str,
+    ) -> Image.Image:
+        y = self._ota_banner(d, body_top)
+        self._centered(d, "TEST PRINT", self.f_label, y=y, fill=ACCENT)
+        y += 24
+
+        printers = self._ops_printer_rows()
+        selected = self.test_ui.sync_printers(printers)
+        nav_y = y
+        if not printers:
+            self._centered(d, "No printers", self.f_value, y=y + 8, fill=MUTED)
+            y += 40
+        else:
+            name = str(
+                (selected or {}).get("name")
+                or (selected or {}).get("cups_name")
+                or "Printer"
+            )
+            name = self._fit(d, name, self.f_value, self.w - 112)
+            self._centered(d, name, self.f_value, y=y + 6, fill=FG)
+            y += 44
+            raw = bool((selected or {}).get("supports_raw"))
+            kind = "RAW · ZPL" if raw else "PDF"
+            n = len(printers)
+            idx = self.test_ui.index + 1
+            meta = f"{kind}   {idx}/{n}"
+            self._centered(d, meta, self.f_hint, y=y, fill=MUTED)
+            y += 22
+
+        if self.test_ui.message:
+            msg = self._fit(d, self.test_ui.message, self.f_hint, self.w - 32)
+            self._centered(d, msg, self.f_hint, y=y, fill=WARN)
+            y += 18
+
+        rects = layout_test_print(
+            w=self.w,
+            h=self.h,
+            body_top=y,
+            printer=selected,
+            nav_y=nav_y,
+            show_nav=bool(printers),
+        )
+        self._hit_rects = rects
+        for r in rects:
+            self._draw_hit_button(d, r)
+
+        ptr = self._last_ptr
+        if ptr is not None and (time.monotonic() - ptr[2]) < 2.5:
+            cx, cy = ptr[0], ptr[1]
+            d.ellipse([cx - 7, cy - 7, cx + 7, cy + 7], outline=ACCENT, width=2)
+            d.line([cx - 10, cy, cx + 10, cy], fill=ACCENT, width=1)
+            d.line([cx, cy - 10, cx, cy + 10], fill=ACCENT, width=1)
+
+        self._draw_footer(d, st, default_label="test print", default_color=WARN)
+        return img
+
+    def _draw_hit_button(self, d, r: HitRect) -> None:
+        kind = str((r.payload or {}).get("kind") or "")
+        label = str((r.payload or {}).get("label") or r.id)
+        fill = (36, 40, 52)
+        border = (70, 76, 92)
+        text_fill = FG
+        if kind == "test":
+            fill = (48, 52, 20)
+            border = ACCENT
+            text_fill = ACCENT
+        elif kind == "back":
+            fill = (28, 30, 38)
+            border = MUTED
+        elif kind in ("prev", "next"):
+            fill = (28, 30, 38)
+            border = (70, 76, 92)
+            text_fill = ACCENT
+        d.rectangle([r.x, r.y, r.x + r.w - 1, r.y + r.h - 1], fill=fill, outline=border)
+        text = self._fit(d, label, self.f_footer, r.w - 20)
+        tw = d.textlength(text, font=self.f_footer)
+        d.text(
+            (r.x + (r.w - tw) / 2, r.y + max(8, (r.h - 16) // 2)),
+            text,
+            font=self.f_footer,
+            fill=text_fill,
+        )
 
     def _render_network(
         self,
@@ -379,7 +590,7 @@ class InfoScreen:
 
         self._centered(
             d,
-            "tap · next  ·  home in 10s",
+            "tap · next  ·  hold 3s test",
             self.f_hint,
             y=self.h - 52,
             fill=MUTED,
@@ -421,7 +632,7 @@ class InfoScreen:
 
         self._centered(
             d,
-            "tap · next  ·  home in 10s",
+            "tap · next  ·  hold 3s test",
             self.f_hint,
             y=self.h - 52,
             fill=MUTED,
@@ -586,8 +797,10 @@ def _refresh_printers(screen: InfoScreen, stop: threading.Event) -> None:
             rows = [
                 {
                     "name": str(item.get("display_name") or item.get("cups_name") or "—"),
+                    "cups_name": str(item.get("cups_name") or ""),
                     "status": item.get("status"),
                     "message": item.get("status_message"),
+                    "supports_raw": bool(item.get("supports_raw")),
                 }
                 for item in inv
             ]
@@ -600,6 +813,10 @@ def _refresh_printers(screen: InfoScreen, stop: threading.Event) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="/dev/fb1")
     ap.add_argument(
@@ -618,9 +835,9 @@ def main() -> None:
     )
     ap.add_argument(
         "--page",
-        choices=list(PAIRED_PAGES),
+        choices=list(PAIRED_PAGES) + [PAGE_TEST],
         default=PAGE_OPS,
-        help="initial paired page (default: ops); also used with --once",
+        help="initial paired page (default: ops); 'test' opens the test-print overlay",
     )
     ap.add_argument(
         "--touch-device",
@@ -682,9 +899,11 @@ def main() -> None:
         status_path=status_path,
         update_status_path=update_status_path,
         queue_dir=queue_dir,
-        initial_page=args.page,
+        initial_page=PAGE_OPS if args.page == PAGE_TEST else args.page,
         idle_home_seconds=args.idle_home,
     )
+    if args.page == PAGE_TEST:
+        screen.test_ui.open_panel(time.monotonic())
 
     if args.offline:
         fb.show(screen.render_offline())
@@ -711,7 +930,11 @@ def main() -> None:
 
     listener: touch_mod.TouchListener | None = None
     if not args.no_touch:
-        listener = touch_mod.open_touch(device=args.touch_device)
+        listener = touch_mod.open_touch(
+            device=args.touch_device,
+            long_press_s=LONG_PRESS_SECONDS,
+            screen_size=fb.size,
+        )
         listener.start()
 
     streamer: LcdStreamServer | None = None
@@ -744,8 +967,10 @@ def main() -> None:
     try:
         while running["go"]:
             start = time.monotonic()
-            if listener is not None and listener.poll_tap():
-                screen.note_tap()
+            if listener is not None:
+                ev = listener.poll_event()
+                if ev is not None:
+                    screen.handle_pointer(ev)
             frame = screen.render()
             fb.show(frame)
             if streamer is not None:
@@ -754,11 +979,12 @@ def main() -> None:
             # Wake sooner when a tap may be pending so page changes feel snappy.
             sleep_for = max(0.0, args.interval - elapsed)
             if listener is not None and sleep_for > 0.05:
-                # Slice sleep so we can pick up taps mid-interval.
+                # Slice sleep so we can pick up taps / long-press mid-interval.
                 end = time.monotonic() + sleep_for
                 while running["go"] and time.monotonic() < end:
-                    if listener.poll_tap():
-                        screen.note_tap()
+                    ev = listener.poll_event()
+                    if ev is not None:
+                        screen.handle_pointer(ev)
                         break
                     time.sleep(min(0.05, end - time.monotonic()))
             elif sleep_for > 0:

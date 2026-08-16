@@ -14,7 +14,8 @@ Needs group ``video`` for ``/dev/fb1``. Binds 0.0.0.0 by default (trusted LAN on
 
 The HTML page shows the LCD at the top and live Pi stats tables below
 (pairing, system, printers, jobs, OTA). Stats also available as JSON at
-``/api/stats``.
+``/api/stats``. Each printer row links to ``/api/test-print`` (PDF, plus ZPL
+on raw/Zebra queues).
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from PIL import Image
 
@@ -304,6 +305,18 @@ HTML_PAGE = """\
     .dot.warn {{ background: var(--warn); }}
     .dot.down {{ background: var(--down); }}
     .dot.muted {{ background: var(--muted); }}
+    .prn-status {{ display: block; }}
+    .test-links {{
+      display: flex; flex-wrap: wrap; gap: 10px;
+      margin-top: 4px;
+    }}
+    .test-links a {{
+      font-size: 12px; font-weight: 600; letter-spacing: 0.04em;
+    }}
+    .test-links a.busy {{ opacity: 0.45; pointer-events: none; }}
+    .print-notice {{ font-size: 12px; color: var(--muted); }}
+    .print-notice.ok {{ color: var(--ok); }}
+    .print-notice.err {{ color: var(--down); }}
     .empty {{ color: var(--muted); font-size: 13px; margin: 0; }}
     .err {{ color: var(--down); }}
     footer.foot {{
@@ -390,6 +403,7 @@ HTML_PAGE = """\
     const claimSub = document.getElementById('claim-sub');
     const boxes = Array.from(document.querySelectorAll('.code-box'));
     let claiming = false;
+    let printNotice = {{ text: '', kind: '' }};
 
     function esc(s) {{
       if (s == null || s === '') return '—';
@@ -433,6 +447,37 @@ HTML_PAGE = """\
       if (s === 'printing' || s === 'processing') return 'warn';
       if (s === 'stopped' || s === 'offline' || s === 'error') return 'down';
       return 'muted';
+    }}
+
+    function printerFormats(prn) {{
+      if (prn && Array.isArray(prn.test_formats) && prn.test_formats.length) {{
+        return prn.test_formats;
+      }}
+      return (prn && prn.supports_raw) ? ['pdf', 'zpl'] : ['pdf'];
+    }}
+
+    function testPrintHref(cups, fmt) {{
+      return '/api/test-print?cups_name=' + encodeURIComponent(cups || '')
+        + '&format=' + encodeURIComponent(fmt || 'pdf');
+    }}
+
+    function printerRow(prn) {{
+      const name = (prn && (prn.display_name || prn.cups_name)) || 'Printer';
+      const cups = (prn && prn.cups_name) || '';
+      const label = (prn && (prn.status_message || prn.status)) || 'unknown';
+      const formats = printerFormats(prn);
+      let links = '';
+      for (const fmt of formats) {{
+        links += '<a class="test-print" href="' + testPrintHref(cups, fmt)
+          + '" data-cups="' + esc(cups) + '" data-fmt="' + esc(fmt) + '">'
+          + esc(String(fmt).toUpperCase()) + '</a>';
+      }}
+      return '<tr><th>' + esc(name) + '</th><td>'
+        + '<span class="prn-status"><span class="dot '
+        + levelClass(printerLevel(prn && prn.status)) + '"></span>'
+        + esc(label) + '</span>'
+        + (cups ? '<span class="test-links">' + links + '</span>' : '')
+        + '</td></tr>';
     }}
 
     function needsClaim(data) {{
@@ -630,8 +675,12 @@ HTML_PAGE = """\
       }} else {{
         let pr = '';
         for (const prn of printers) {{
-          const label = prn.status_message || prn.status || 'unknown';
-          pr += row(prn.display_name || prn.cups_name, label, printerLevel(prn.status));
+          pr += printerRow(prn);
+        }}
+        if (printNotice.text) {{
+          pr += '<tr><th></th><td class="print-notice '
+            + (printNotice.kind || '') + '">' + esc(printNotice.text)
+            + '</td></tr>';
         }}
         html += card('Printers', pr);
       }}
@@ -669,6 +718,49 @@ HTML_PAGE = """\
           + '<p class="err">Failed to load stats: ' + esc(e.message) + '</p></section>';
       }}
     }}
+    document.addEventListener('click', async (e) => {{
+      const a = e.target && e.target.closest ? e.target.closest('a.test-print') : null;
+      if (!a) return;
+      e.preventDefault();
+      if (a.dataset.busy === '1') return;
+      const fmt = a.dataset.fmt || 'pdf';
+      const cups = a.dataset.cups || '';
+      const label = fmt.toUpperCase();
+      a.dataset.busy = '1';
+      a.classList.add('busy');
+      printNotice = {{ text: 'Sending ' + label + '…', kind: '' }};
+      const noticeEl = document.querySelector('.print-notice');
+      if (noticeEl) {{
+        noticeEl.textContent = printNotice.text;
+        noticeEl.className = 'print-notice';
+      }}
+      try {{
+        const r = await fetch('/api/test-print', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json', 'Accept': 'application/json' }},
+          body: JSON.stringify({{ cups_name: cups, format: fmt }}),
+        }});
+        const body = await r.json().catch(() => ({{}}));
+        if (!r.ok || body.ok === false) {{
+          throw new Error(body.error || body.message || ('HTTP ' + r.status));
+        }}
+        const dest = body.display_name || body.cups_name || cups;
+        printNotice = {{
+          text: label + ' sent to ' + dest + (body.result ? ' (' + body.result + ')' : ''),
+          kind: 'ok',
+        }};
+      }} catch (err) {{
+        printNotice = {{ text: 'Test print failed: ' + (err.message || err), kind: 'err' }};
+      }}
+      a.dataset.busy = '0';
+      a.classList.remove('busy');
+      const after = document.querySelector('.print-notice');
+      if (after) {{
+        after.textContent = printNotice.text;
+        after.className = 'print-notice ' + (printNotice.kind || '');
+      }}
+    }});
+
     poll();
     setInterval(poll, 2000);
   </script>
@@ -795,6 +887,95 @@ class ClaimError(Exception):
         super().__init__(message)
         self.message = message
         self.status = status
+
+
+class TestPrintError(Exception):
+    """User-facing test-print failure (safe to return in HTTP JSON)."""
+
+    def __init__(self, message: str, *, status: int = 400):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def _printer_test_formats(item: dict[str, Any]) -> list[str]:
+    from display_status import test_print_formats
+
+    return list(test_print_formats(bool(item.get("supports_raw"))))
+
+
+def test_print_href(cups_name: str, fmt: str) -> str:
+    return (
+        f"/api/test-print?cups_name={quote(str(cups_name or ''), safe='')}"
+        f"&format={quote(str(fmt or 'pdf'), safe='')}"
+    )
+
+
+def run_test_print(
+    cups_name: str,
+    fmt: str,
+    *,
+    inventory: list[dict[str, Any]] | None = None,
+    submit: Callable[..., str] | None = None,
+) -> dict[str, Any]:
+    """Send the Road Runner sample label to a configured CUPS queue."""
+    from display_status import test_print_formats
+
+    cups = (cups_name or "").strip()
+    kind = (fmt or "pdf").strip().lower()
+    if not cups:
+        raise TestPrintError("missing cups_name", status=400)
+    if kind not in ("pdf", "zpl"):
+        raise TestPrintError(f"unsupported format: {fmt}", status=400)
+
+    items = inventory
+    if items is None:
+        try:
+            import printers
+
+            items = list(printers.inventory_payload())
+        except Exception as e:
+            raise TestPrintError(
+                f"printer inventory unavailable: {e}", status=503
+            ) from e
+
+    match: dict[str, Any] | None = None
+    for item in items:
+        name = str(item.get("cups_name") or "")
+        display = str(item.get("display_name") or "")
+        if name == cups or display == cups:
+            match = item
+            break
+    if match is None:
+        raise TestPrintError(f"unknown printer: {cups}", status=404)
+
+    queue = str(match.get("cups_name") or cups)
+    allowed = test_print_formats(bool(match.get("supports_raw")))
+    if kind not in allowed:
+        raise TestPrintError(
+            f"{kind.upper()} is only available on raw/Zebra queues",
+            status=400,
+        )
+
+    if submit is None:
+        from test_label import submit_test_label
+
+        submit = submit_test_label
+    try:
+        result = submit(queue, kind, wait_cups=False)
+    except TestPrintError:
+        raise
+    except Exception as e:
+        msg = getattr(e, "message", None) or str(e)
+        raise TestPrintError(msg, status=500) from e
+
+    return {
+        "ok": True,
+        "cups_name": queue,
+        "display_name": match.get("display_name") or queue,
+        "format": kind,
+        "result": result,
+    }
 
 
 def claim_device(
@@ -943,13 +1124,21 @@ def collect_stats(
             import printers
 
             for item in printers.inventory_payload():
+                cups = item.get("cups_name")
+                formats = _printer_test_formats(item)
                 printers_list.append(
                     {
-                        "cups_name": item.get("cups_name"),
+                        "cups_name": cups,
                         "display_name": item.get("display_name"),
                         "status": item.get("status"),
                         "status_message": item.get("status_message"),
                         "uri": item.get("uri"),
+                        "supports_raw": bool(item.get("supports_raw")),
+                        "test_formats": formats,
+                        "test_print": {
+                            fmt: test_print_href(str(cups or ""), fmt)
+                            for fmt in formats
+                        },
                     }
                 )
         except Exception as e:
@@ -1083,6 +1272,8 @@ def make_handler(
                 self._serve_snapshot()
             elif path in ("/api/stats", "/stats.json"):
                 self._serve_stats()
+            elif path in ("/api/test-print", "/test-print"):
+                self._serve_test_print()
             elif path in ("/assets/logo.svg", "/logo.svg"):
                 self._serve_asset("logo.svg", "image/svg+xml")
             elif path in ("/assets/logo.png", "/logo.png"):
@@ -1096,6 +1287,8 @@ def make_handler(
             path = urlparse(self.path).path
             if path in ("/api/claim", "/claim"):
                 self._serve_claim()
+            elif path in ("/api/test-print", "/test-print"):
+                self._serve_test_print()
             else:
                 self.send_error(404, "not found")
 
@@ -1125,6 +1318,30 @@ def make_handler(
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def _serve_test_print(self) -> None:
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            cups = (qs.get("cups_name") or qs.get("printer") or [None])[0]
+            fmt = (qs.get("format") or qs.get("fmt") or [None])[0]
+            if self.command == "POST":
+                try:
+                    data = self._read_json_body()
+                except ClaimError as e:
+                    self._json_response(e.status, {"ok": False, "error": e.message})
+                    return
+                cups = data.get("cups_name") or data.get("printer") or cups
+                fmt = data.get("format") or data.get("fmt") or fmt
+            try:
+                result = run_test_print(str(cups or ""), str(fmt or "pdf"))
+                self._json_response(200, result)
+            except TestPrintError as e:
+                self._json_response(e.status, {"ok": False, "error": e.message})
+            except Exception:
+                log.exception("test-print endpoint failed")
+                self._json_response(
+                    500, {"ok": False, "error": "Internal test-print error"}
+                )
 
         def _serve_claim(self) -> None:
             try:

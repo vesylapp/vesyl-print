@@ -308,6 +308,21 @@ class TestRawLpPath(unittest.TestCase):
             process_job(job, store, lp=lp)
             self.assertEqual(flags, [True])
 
+    def test_wait_cups_false_skips_poll(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "x.zpl"
+            f.write_bytes(b"^XA^XZ")
+            job = jobs.job_from_local_file(f, "Q", raw=True)
+            store = _store(td)
+
+            def lp(cups, path, *, title=None, copies=1, raw=False):
+                return "Q-99"
+
+            with mock.patch("jobs.wait_cups_job") as wait:
+                result = process_job(job, store, lp=lp, wait_cups=False)
+            self.assertEqual(result, "delivered")
+            wait.assert_not_called()
+
 
 class TestReceiveIdempotent(unittest.TestCase):
     def test_double_receive_prints_once(self):

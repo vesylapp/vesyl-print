@@ -6,6 +6,7 @@ Also owns paired-page ordering and idle-home logic for touch navigation.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -23,6 +24,11 @@ PAGE_NETWORK = "network"
 PAGE_SYSTEM = "system"
 PAIRED_PAGES: tuple[str, ...] = (PAGE_OPS, PAGE_NETWORK, PAGE_SYSTEM)
 IDLE_HOME_SECONDS = 10.0
+
+# Long-press overlay (not part of the page cycle).
+PAGE_TEST = "test"
+LONG_PRESS_SECONDS = 3.0
+TEST_IDLE_SECONDS = 30.0
 
 
 def format_agent_version(version: str | None) -> str:
@@ -114,6 +120,260 @@ class PageState:
             idle_seconds=self.idle_seconds,
         )
         return self.page
+
+
+def test_print_formats(supports_raw: bool) -> tuple[str, ...]:
+    """Formats offered for a queue: PDF+ZPL on raw/Zebra, PDF only otherwise."""
+    if supports_raw:
+        return ("pdf", "zpl")
+    return ("pdf",)
+
+
+def test_print_default_format(supports_raw: bool) -> str:
+    """LCD Test button: native ZPL on raw/Zebra, PDF everywhere else."""
+    return "zpl" if supports_raw else "pdf"
+
+
+@dataclass
+class HitRect:
+    """Screen-space tap target produced while rendering the test overlay."""
+
+    id: str
+    x: int
+    y: int
+    w: int
+    h: int
+    payload: dict[str, Any] = field(default_factory=dict)
+
+    def contains(self, px: int, py: int, pad: int = 0) -> bool:
+        p = max(0, int(pad))
+        return (
+            self.x - p <= px < self.x + self.w + p
+            and self.y - p <= py < self.y + self.h + p
+        )
+
+
+def hit_test(
+    rects: list[HitRect],
+    x: int | None,
+    y: int | None,
+    *,
+    pad: int = 0,
+) -> HitRect | None:
+    if x is None or y is None:
+        return None
+    px, py = int(x), int(y)
+    for r in rects:
+        if r.contains(px, py, pad=pad):
+            return r
+    return None
+
+
+def coarse_test_action(
+    x: int | None,
+    y: int | None,
+    w: int,
+    h: int,
+) -> str | None:
+    """Fallback zones when a tap misses the painted buttons.
+
+    Bottom band: left = Back, right = Test. Side strips: prev / next.
+    """
+    if x is None or y is None or w < 1 or h < 1:
+        return None
+    px, py = int(x), int(y)
+    if py >= h - 88:
+        return "close" if px < w // 2 else "test"
+    if px <= 64:
+        return "prev"
+    if px >= w - 64:
+        return "next"
+    return None
+
+
+def layout_test_print(
+    *,
+    w: int,
+    h: int,
+    body_top: int,
+    printer: dict[str, Any] | None,
+    footer_reserve: int = 56,
+    btn_h: int = 48,
+    pad: int = 16,
+    gap: int = 10,
+    nav_y: int | None = None,
+    nav_size: int = 52,
+    show_nav: bool = True,
+) -> list[HitRect]:
+    """Hit targets: ‹ › beside the printer name, Back | Test on the bottom row."""
+    inner_w = max(40, w - 2 * pad)
+    col_w = max(36, (inner_w - gap) // 2)
+    btn_y = h - footer_reserve - btn_h
+    if btn_y < body_top:
+        btn_y = max(body_top, 0)
+    raw = bool(printer and printer.get("supports_raw"))
+    fmt = test_print_default_format(raw)
+    ny = body_top if nav_y is None else nav_y
+    ns = max(40, int(nav_size))
+    rects: list[HitRect] = []
+    if show_nav:
+        rects.append(
+            HitRect(
+                id="prev",
+                x=pad,
+                y=ny,
+                w=ns,
+                h=ns,
+                payload={"kind": "prev", "label": "‹"},
+            )
+        )
+        rects.append(
+            HitRect(
+                id="next",
+                x=max(pad + ns, w - pad - ns),
+                y=ny,
+                w=ns,
+                h=ns,
+                payload={"kind": "next", "label": "›"},
+            )
+        )
+    rects += [
+        HitRect(
+            id="back",
+            x=pad,
+            y=btn_y,
+            w=col_w,
+            h=btn_h,
+            payload={"kind": "back", "label": "Back"},
+        ),
+        HitRect(
+            id="test",
+            x=pad + col_w + gap,
+            y=btn_y,
+            w=col_w,
+            h=btn_h,
+            payload={
+                "kind": "test",
+                "format": fmt,
+                "label": f"Test {fmt.upper()}",
+            },
+        ),
+    ]
+    return rects
+
+
+class TestPrintState:
+    """Modal test-print overlay opened by a 3s screen hold.
+
+    One printer at a time. Side ‹ › buttons cycle the queue; Test sends the
+    default format for that queue; Back returns home. Missed taps stay here
+    (page cycling is disabled while open).
+    """
+
+    def __init__(self, *, idle_seconds: float = TEST_IDLE_SECONDS):
+        self.open = False
+        self.index = 0
+        self.selected: dict[str, Any] | None = None
+        self.message: str | None = None
+        self.busy = False
+        self.last_input_mono: float | None = None
+        self.idle_seconds = idle_seconds
+
+    def open_panel(self, now_mono: float) -> None:
+        self.open = True
+        self.index = 0
+        self.selected = None
+        self.message = None
+        self.busy = False
+        self.last_input_mono = now_mono
+
+    def close(self) -> None:
+        self.open = False
+        self.index = 0
+        self.selected = None
+        self.message = None
+        self.busy = False
+        self.last_input_mono = None
+
+    def note_input(self, now_mono: float) -> None:
+        self.last_input_mono = now_mono
+
+    def sync_printers(self, printers: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Clamp index and refresh ``selected`` from the live inventory."""
+        if not printers:
+            self.index = 0
+            self.selected = None
+            return None
+        if self.index < 0 or self.index >= len(printers):
+            self.index = 0
+        self.selected = printers[self.index]
+        return self.selected
+
+    def cycle(self, delta: int, count: int) -> None:
+        if count <= 0:
+            self.index = 0
+            return
+        self.index = (self.index + int(delta)) % count
+        self.message = None
+
+    def sync_idle(self, now_mono: float) -> bool:
+        """Close after idle (unless a print is in flight). Returns ``open``."""
+        if not self.open:
+            return False
+        if self.busy:
+            return True
+        if self.last_input_mono is None:
+            self.close()
+            return False
+        if now_mono - self.last_input_mono >= self.idle_seconds:
+            self.close()
+            return False
+        return True
+
+
+def apply_test_hit(
+    state: TestPrintState,
+    hit: HitRect | None,
+    now_mono: float,
+) -> str | None:
+    """Handle a tap on the overlay. Misses stay put (do not close or page-cycle)."""
+    if not state.open:
+        return None
+    state.note_input(now_mono)
+    if state.busy:
+        return None
+    kind = hit.payload.get("kind") if hit is not None else None
+    if kind == "back":
+        return "close"
+    if kind == "test":
+        raw = bool(state.selected and state.selected.get("supports_raw"))
+        fmt = str(hit.payload.get("format") or test_print_default_format(raw))
+        if fmt not in ("pdf", "zpl"):
+            fmt = test_print_default_format(raw)
+        return f"print:{fmt}"
+    if kind == "prev":
+        return "prev"
+    if kind == "next":
+        return "next"
+    return None
+
+
+def apply_test_swipe(
+    state: TestPrintState,
+    direction: str,
+    count: int,
+    now_mono: float,
+) -> None:
+    """Swipe left → next printer, swipe right → previous."""
+    if not state.open:
+        return
+    state.note_input(now_mono)
+    if state.busy or count <= 0:
+        return
+    if direction == "left":
+        state.cycle(1, count)
+    elif direction == "right":
+        state.cycle(-1, count)
 
 
 def identity_line(

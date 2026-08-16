@@ -546,6 +546,7 @@ def process_job(
     fetch_url: Callable[[str], bytes] | None = None,
     work_dir: Path | None = None,
     on_wait_tick: Callable[[], None] | None = None,
+    wait_cups: bool = True,
 ) -> str:
     """Run the full durable pipeline for one job.
 
@@ -647,7 +648,7 @@ def process_job(
             log.debug("report_state delivered failed", exc_info=True)
 
         final = "delivered"
-        if cups_job:
+        if cups_job and wait_cups:
             outcome = wait_cups_job(cups_job, on_tick=on_wait_tick)
             if outcome == "printed":
                 try:
@@ -665,7 +666,7 @@ def process_job(
                     job_id,
                     cups_id,
                 )
-        else:
+        elif not cups_job:
             log.info("job %s no CUPS request id — left delivered", job_id)
 
         store.mark_processed(job_id)
@@ -749,6 +750,7 @@ def receive_job(
     report_state: StateFn = noop_state,
     fetch_url: Callable[[str], bytes] | None = None,
     on_wait_tick: Callable[[], None] | None = None,
+    wait_cups: bool = True,
 ) -> str:
     """Entry point for a newly delivered job (pull/push later)."""
     return process_job(
@@ -759,6 +761,7 @@ def receive_job(
         report_state=report_state,
         fetch_url=fetch_url,
         on_wait_tick=on_wait_tick,
+        wait_cups=wait_cups,
     )
 
 

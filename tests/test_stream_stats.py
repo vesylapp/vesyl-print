@@ -48,7 +48,8 @@ class CollectStatsTests(unittest.TestCase):
                         "display_name": "Zebra ZD421",
                         "status": "idle",
                         "status_message": None,
-                        "uri": "ipp://1.2.3.4/ipp/print",
+                        "uri": "socket://1.2.3.4:9100",
+                        "supports_raw": True,
                     }
                 ],
             ):
@@ -74,6 +75,10 @@ class CollectStatsTests(unittest.TestCase):
             self.assertEqual(data["paths"]["api_base_url"], "https://example.test")
             self.assertEqual(len(data["printers"]), 1)
             self.assertEqual(data["printers"][0]["display_name"], "Zebra ZD421")
+            self.assertTrue(data["printers"][0]["supports_raw"])
+            self.assertEqual(data["printers"][0]["test_formats"], ["pdf", "zpl"])
+            self.assertIn("format=pdf", data["printers"][0]["test_print"]["pdf"])
+            self.assertIn("format=zpl", data["printers"][0]["test_print"]["zpl"])
             self.assertIn("hostname", data["system"])
             self.assertIn("collected_at", data)
 
@@ -119,6 +124,9 @@ class CollectStatsTests(unittest.TestCase):
         self.assertIn(".page {{", stream_lcd.HTML_PAGE)
         self.assertIn("/api/stats", stream_lcd.HTML_PAGE)
         self.assertIn("/api/claim", stream_lcd.HTML_PAGE)
+        self.assertIn("/api/test-print", stream_lcd.HTML_PAGE)
+        self.assertIn("test-print", stream_lcd.HTML_PAGE)
+        self.assertIn("printerRow", stream_lcd.HTML_PAGE)
         self.assertIn("id=\"claim-panel\"", stream_lcd.HTML_PAGE)
         self.assertIn("code-box", stream_lcd.HTML_PAGE)
         self.assertIn("code-dash", stream_lcd.HTML_PAGE)
@@ -194,6 +202,74 @@ class ClaimCodeTests(unittest.TestCase):
             self.assertEqual(call_kw[0][0], "AB7K2Q9M")
             save.assert_called_once()
             write_st.assert_called_once()
+
+
+class TestPrintApiTests(unittest.TestCase):
+    _INV = [
+        {
+            "cups_name": "Zebra_ZD220-203dpi_ZPL",
+            "display_name": "Zebra ZD220-203dpi ZPL",
+            "supports_raw": True,
+        },
+        {
+            "cups_name": "HP_OfficeJet_Pro_9010",
+            "display_name": "HP OfficeJet Pro 9010 series",
+            "supports_raw": False,
+        },
+    ]
+
+    def test_href_encodes_queue(self):
+        href = stream_lcd.test_print_href("Zebra ZD/raw", "pdf")
+        self.assertTrue(href.startswith("/api/test-print?"))
+        self.assertIn("format=pdf", href)
+        self.assertIn("Zebra", href)
+
+    def test_run_pdf_and_zpl_on_raw(self):
+        seen: list[tuple[str, str]] = []
+
+        def submit(cups, fmt, *, wait_cups=False):
+            seen.append((cups, fmt))
+            return "delivered"
+
+        out = stream_lcd.run_test_print(
+            "Zebra_ZD220-203dpi_ZPL",
+            "zpl",
+            inventory=self._INV,
+            submit=submit,
+        )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["format"], "zpl")
+        self.assertEqual(seen, [("Zebra_ZD220-203dpi_ZPL", "zpl")])
+
+        stream_lcd.run_test_print(
+            "Zebra ZD220-203dpi ZPL",
+            "pdf",
+            inventory=self._INV,
+            submit=submit,
+        )
+        self.assertEqual(seen[-1], ("Zebra_ZD220-203dpi_ZPL", "pdf"))
+
+    def test_zpl_rejected_on_non_raw(self):
+        with self.assertRaises(stream_lcd.TestPrintError) as cm:
+            stream_lcd.run_test_print(
+                "HP_OfficeJet_Pro_9010",
+                "zpl",
+                inventory=self._INV,
+                submit=lambda *a, **k: "nope",
+            )
+        self.assertEqual(cm.exception.status, 400)
+
+    def test_unknown_printer(self):
+        with self.assertRaises(stream_lcd.TestPrintError) as cm:
+            stream_lcd.run_test_print(
+                "NoSuch", "pdf", inventory=self._INV, submit=lambda *a, **k: "x"
+            )
+        self.assertEqual(cm.exception.status, 404)
+
+    def test_html_page_formats(self):
+        html = stream_lcd.HTML_PAGE.format(w=480, h=320, fps=2, css_max=960)
+        self.assertIn("/api/test-print", html)
+        self.assertIn("function printerRow", html)
 
 
 if __name__ == "__main__":
