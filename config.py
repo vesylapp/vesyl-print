@@ -9,19 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-def _read_version_file() -> str:
-    try:
-        p = Path(__file__).resolve().parent / "VERSION"
-        if p.is_file():
-            v = p.read_text(encoding="utf-8").strip()
-            if v:
-                return v
-    except OSError:
-        pass
-    return "0.3.16"
-
-
-AGENT_VERSION = _read_version_file()
+AGENT_VERSION = (
+    Path(__file__).resolve().parent / "VERSION"
+).read_text(encoding="utf-8").strip()
 
 # Preferred for Pis: direct API host (paths are /print/v1/...).
 DEFAULT_API_BASE_URL = "https://wms-api.vesyl.dev"
