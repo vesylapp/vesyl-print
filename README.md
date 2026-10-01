@@ -8,7 +8,7 @@ Raspberry Pi **print node** for VESYL: LCD status display, CUPS printer discover
 |-----------|------|
 | **LCD** (`main.py` / `vesyl-print-display.service`) | Multi-page status (ops / network / system); touch cycle; unpaired network view; OTA |
 | **Agent** (`agent.py` / `vesyl-print-agent.service`) | Heartbeats + `whoami`; writes status for the LCD |
-| **CLI** (`vesyl-print`) | `claim`, `enroll`, `status`, `unpair` |
+| **CLI** (`vesyl-print`) | `claim`, `enroll`, `status`, `queues`, `unpair` |
 
 **Local print (Phase B)** + **cloud job pull (Phase C)** + **ActionCable push (Phase D)** are implemented.
 
@@ -167,6 +167,7 @@ If the device token is revoked, the agent clears local credentials and the LCD s
 vesyl-print claim <CODE> [--name NAME]
 vesyl-print enroll <TOKEN> [--name NAME]
 vesyl-print status [--check]
+vesyl-print queues [--json]
 vesyl-print unpair
 vesyl-print agent          # same as agent.py service
 vesyl-print print-test --file ./label.pdf --queue Brother_HL-L3280CDW_series

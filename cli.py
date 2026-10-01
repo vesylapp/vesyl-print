@@ -1,4 +1,4 @@
-"""vesyl-print CLI: claim, enroll, status, unpair, agent, print-test, update."""
+"""vesyl-print CLI: claim, enroll, status, queues, unpair, agent, print-test, update."""
 
 from __future__ import annotations
 
@@ -181,6 +181,75 @@ def cmd_status(args: argparse.Namespace) -> int:
             print()
             print(f"whoami: FAILED — {e.message}" + (f" ({e.code})" if e.code else ""))
             return 1
+    return 0
+
+
+def _queue_status_label(item: dict) -> str:
+    """Prefer a human reason next to the CUPS state when one exists."""
+    status = str(item.get("status") or "unknown")
+    message = str(item.get("status_message") or "").strip()
+    if message and message != status:
+        return f"{status} ({message})"
+    return status
+
+
+def queue_rows(items: list[dict] | None) -> list[dict]:
+    """Public fields for ``vesyl-print queues``, including test-print formats."""
+    from display_status import test_print_formats
+
+    rows: list[dict] = []
+    for item in items or []:
+        raw = bool(item.get("supports_raw"))
+        rows.append(
+            {
+                "cups_name": item.get("cups_name") or "",
+                "display_name": item.get("display_name") or "",
+                "status": item.get("status") or "unknown",
+                "status_message": item.get("status_message"),
+                "uri": item.get("uri") or "",
+                "supports_raw": raw,
+                "test_formats": list(test_print_formats(raw)),
+            }
+        )
+    return rows
+
+
+def format_queues(items: list[dict] | None) -> str:
+    """Human listing of configured CUPS queues. Empty inventory is one line."""
+    rows = queue_rows(items)
+    if not rows:
+        return "No CUPS queues configured."
+    blocks: list[str] = []
+    for row in rows:
+        name = row["cups_name"] or "—"
+        display = row["display_name"] or name
+        formats = ", ".join(row["test_formats"]) or "—"
+        raw = "yes" if row["supports_raw"] else "no"
+        blocks.append(
+            "\n".join(
+                [
+                    name,
+                    f"  display:  {display}",
+                    f"  status:   {_queue_status_label(row)}",
+                    f"  raw:      {raw}",
+                    f"  formats:  {formats}",
+                    f"  uri:      {row['uri'] or '—'}",
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
+
+
+def cmd_queues(args: argparse.Namespace) -> int:
+    """List configured CUPS queues (the names ``print-test --queue`` accepts)."""
+    try:
+        items = printers.inventory_payload()
+    except Exception as e:
+        _die(f"could not list CUPS queues: {e}")
+    if args.json:
+        print(json.dumps(queue_rows(items), indent=2))
+    else:
+        print(format_queues(items))
     return 0
 
 
@@ -434,7 +503,7 @@ def cmd_print_test(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="vesyl-print",
-        description="VESYL print node — claim, enroll, status, agent, print-test, update",
+        description="VESYL print node — claim, enroll, status, queues, agent, print-test, update",
     )
     p.add_argument(
         "--version",
@@ -460,6 +529,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Call whoami against the API",
     )
     s.set_defaults(func=cmd_status)
+
+    q = sub.add_parser(
+        "queues",
+        help="List configured CUPS printer queues",
+    )
+    q.add_argument(
+        "--json",
+        action="store_true",
+        help="Print queue inventory as JSON",
+    )
+    q.set_defaults(func=cmd_queues)
 
     u = sub.add_parser("unpair", help="Delete local credentials only")
     u.set_defaults(func=cmd_unpair)
