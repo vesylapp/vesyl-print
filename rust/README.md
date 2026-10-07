@@ -22,9 +22,9 @@ cargo clippy --all-targets
 | `zpl.py` | `zpl.rs` | ported (`image` crate) |
 | `printers.py` | `printers.rs` | ported |
 | `update.py` | `update.rs` | ported (`ed25519-dalek`, `tar`) |
-| `agent.py` | `agent.rs` + `vesyl-print agent` | ported |
+| `agent.py` | `agent.rs` | ported |
 | `sysinfo.py` | `sysinfo.rs` | `hostname` only |
-| `cli.py` | — | next |
+| `cli.py` | `cli.rs` → `vesyl-print` binary | ported (all subcommands) |
 | display: `main.py`, `touch.py`, `framebuffer.py`, `stream_lcd.py`, … | — | later |
 
 Run the agent locally (unpaired, temp dirs):
@@ -33,6 +33,11 @@ Run the agent locally (unpaired, temp dirs):
 VESYL_PRINT_CONFIG_DIR=/tmp/vp/cfg VESYL_PRINT_STATE_DIR=/tmp/vp/state \
 VESYL_PRINT_INSTALL_ROOT=/tmp/vp/install cargo run -- agent
 ```
+
+Every `cli.py` subcommand exists with the same flags and output
+(`claim`, `enroll`, `status`, `queues`, `unpair`, `agent`, `version`,
+`update check|apply|rollback`, `print-test`). `vesyl-print queues` output is
+byte-identical to the Python CLI against the same CUPS server.
 
 `VESYL_PRINT_LOG=debug` raises log verbosity.
 
@@ -60,3 +65,8 @@ HTTP/WebSocket servers.
 - Agent sleeps wake within 100 ms of SIGTERM (Python finished its sleep).
 - `printers::test_image()` looks for `base.jpg` next to the executable, then
   `/opt/vesyl-print/current/base.jpg`, so release tarballs must keep shipping it.
+- `status --check` and `queues --json` print JSON keys sorted (Python kept
+  insertion order). Values are identical.
+- `update apply --manifest-url` and `update rollback` use the installed
+  `apply-update` sudo helper when present; Python's CLI flipped `current`
+  in-process and restarted via `systemctl`.

@@ -9,6 +9,7 @@ description = "VESYL print node agent (Rust port)"
 [dependencies]
 base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6.7", features = ["derive"] }
 ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "pem"] }
 flate2 = "1.1.10"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
