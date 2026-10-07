@@ -20,9 +20,21 @@ cargo clippy --all-targets
 | `cable.py` | `cable.rs` | ported (`tungstenite`, sync thread) |
 | `jobs.py` | `jobs.rs` | ported |
 | `zpl.py` | `zpl.rs` | ported (`image` crate) |
-| `printers.py` | `printers.rs` | `queue_supports_raw` only |
-| `agent.py`, `cli.py`, `update.py`, rest of `printers.py` | — | next |
+| `printers.py` | `printers.rs` | ported |
+| `update.py` | `update.rs` | ported (`ed25519-dalek`, `tar`) |
+| `agent.py` | `agent.rs` + `vesyl-print agent` | ported |
+| `sysinfo.py` | `sysinfo.rs` | `hostname` only |
+| `cli.py` | — | next |
 | display: `main.py`, `touch.py`, `framebuffer.py`, `stream_lcd.py`, … | — | later |
+
+Run the agent locally (unpaired, temp dirs):
+
+```bash
+VESYL_PRINT_CONFIG_DIR=/tmp/vp/cfg VESYL_PRINT_STATE_DIR=/tmp/vp/state \
+VESYL_PRINT_INSTALL_ROOT=/tmp/vp/install cargo run -- agent
+```
+
+`VESYL_PRINT_LOG=debug` raises log verbosity.
 
 Python tests that used `mock.patch` map to injectable hooks: `jobs::Pipeline`
 takes `lp`, `ack`, `report_state`, `fetch_url`, `wait_cups_job` and
@@ -39,3 +51,12 @@ HTTP/WebSocket servers.
 - ZPL resize uses Lanczos3 from the `image` crate. Its output can differ from
   Pillow's LANCZOS by a few edge pixels. Grayscale conversion matches Pillow's
   coefficients exactly.
+- OTA slots count as healthy with either the Python entrypoints
+  (`agent.py`/`main.py`) or the Rust binary (`vesyl-print` / `bin/vesyl-print`),
+  so rollback works across the migration in both directions.
+- The OTA public key is compiled in from `keys/update_public.pem`; a key file
+  set in config still overrides it.
+- `update_status.json` is written atomically (Python wrote it in place).
+- Agent sleeps wake within 100 ms of SIGTERM (Python finished its sleep).
+- `printers::test_image()` looks for `base.jpg` next to the executable, then
+  `/opt/vesyl-print/current/base.jpg`, so release tarballs must keep shipping it.

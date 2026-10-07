@@ -11,8 +11,12 @@
 //! | `cable.py`    | [`cable`]       |
 //! | `jobs.py`     | [`jobs`]        |
 //! | `zpl.py`      | [`zpl`]         |
-//! | `printers.py` | [`printers`] (raw-queue probe only so far) |
+//! | `printers.py` | [`printers`]    |
+//! | `agent.py`    | [`agent`]       |
+//! | `update.py`   | [`update`]      |
+//! | `sysinfo.py`  | [`sysinfo`] (hostname only so far) |
 
+pub mod agent;
 pub mod auth;
 pub mod cable;
 pub mod cloud;
@@ -20,6 +24,8 @@ pub mod config;
 pub mod jobs;
 pub mod printers;
 pub mod statusio;
+pub mod sysinfo;
+pub mod update;
 pub mod util;
 pub mod zpl;
 
