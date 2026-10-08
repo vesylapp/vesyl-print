@@ -1235,6 +1235,41 @@ fn binary_must_not_need_a_glibc_newer_than_the_floor() {
     }
 }
 
+/// The floor check needs readelf (binutils): a machine without it is told
+/// before the build, which takes minutes, not after it.
+#[test]
+fn without_readelf_the_build_never_starts() {
+    let f = fixture!();
+    // The fake toolchain and the host tools the script runs, but no readelf.
+    let bin = f.tmp.join("no-binutils");
+    fs::create_dir(&bin).unwrap();
+    for tool in BUILD_TOOLS.iter().chain(SIGN_TOOLS).chain(&["chmod"]) {
+        symlink(which(tool).unwrap(), bin.join(tool)).unwrap();
+    }
+    for entry in fs::read_dir(&f.fakebin).unwrap() {
+        let name = entry.unwrap().file_name();
+        if name != "readelf" {
+            symlink(f.fakebin.join(&name), bin.join(&name)).unwrap();
+        }
+    }
+    let script = f.repo.join("scripts/build-release.sh");
+    let r = run(
+        &which("bash").unwrap(),
+        &f.script_args(path_str(&script), &[VERSION]),
+        &f.env(path_str(&bin).to_string(), &[("BUILD_ONLY", "1")]),
+    );
+    f.assert_no_tripwire();
+    assert_eq!(r.code, Some(1), "{}", r.log());
+    assert!(
+        r.stderr
+            .contains("readelf not found (binutils): it checks the binary's glibc floor"),
+        "{}",
+        r.log()
+    );
+    assert!(!f.cargo_env.exists(), "cargo zigbuild ran: {}", r.log());
+    assert!(!f.tarball().exists());
+}
+
 // --- split CI modes ---------------------------------------------------------------
 
 #[test]

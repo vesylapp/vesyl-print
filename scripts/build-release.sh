@@ -329,8 +329,6 @@ glibc_le() {
 # sysroot is usually newer than the oldest supported device.
 check_glibc_floor() {
   local bin="$1" needs v newest=""
-  command -v readelf >/dev/null 2>&1 ||
-    die "readelf not found (binutils): it checks the binary's glibc floor"
   needs="$(readelf -V "$bin")" || die "readelf -V $bin failed"
   while read -r v; do
     v="${v#GLIBC_}"
@@ -351,6 +349,10 @@ build_rust_binary() {
     die "cargo-zigbuild not found: install it with zig (the versions CI pins:" \
       "pip install --require-hashes -r .github/zigbuild-requirements.txt; or" \
       "cargo install --locked cargo-zigbuild plus zig on PATH)"
+  # Needed only once the binary is built, but checked before the build,
+  # which takes minutes.
+  command -v readelf >/dev/null 2>&1 ||
+    die "readelf not found (binutils): it checks the binary's glibc floor"
   # Package exactly what this build produces: ask cargo where its target dir
   # is, pin that for the build, and delete the previous artifact there.
   local target_dir built

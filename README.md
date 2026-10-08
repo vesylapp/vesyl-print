@@ -83,7 +83,8 @@ components are letters, digits and `._-` (no `.` or `..`); trailing slashes
 are dropped.
 
 A git checkout has no binary, so `setup.sh` stops before changing anything.
-Build a release from a checkout (needs cargo-zigbuild) with
+Build a release from a checkout (needs cargo-zigbuild, binutils, jq and
+rsync; see [Publish a release](#publish-a-release)) with
 `BUILD_ONLY=1 ./scripts/build-release.sh [VERSION]` and run the `setup.sh`
 inside the extracted tarball; how to number a build that is not a release is
 covered below.
@@ -420,7 +421,9 @@ compares versions by number and ignores a `-` suffix (0.5.0-rc.1 counts as
 and re-provision the lab Pi from the published v0.5.0 tarball.
 
 Local build: `UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 0.5.0` builds
-and signs in one go (needs cargo-zigbuild, jq, rsync, openssl). `BUILD_ONLY=1`,
+and signs in one go. It needs cargo-zigbuild and zig (the versions CI pins
+are in `.github/zigbuild-requirements.txt`), binutils (`readelf`, for the
+glibc 2.31 floor check), jq, rsync and openssl. `BUILD_ONLY=1`,
 `SIGN_ONLY=1` and `VERIFY_ONLY=1` run one step each; see
 [OTA_UPDATES.md §4.2](./OTA_UPDATES.md#42-artifact-format).
 
