@@ -978,14 +978,23 @@ pub(crate) mod tests {
     /// Minimal PDF: one `page_w`×`page_h` pt page per box, each page filled
     /// with its black `(x, y, w, h)` box (points, origin bottom-left).
     fn pdf_with_boxes(page_w: u32, page_h: u32, boxes: &[(u32, u32, u32, u32)]) -> Vec<u8> {
-        let n = boxes.len();
+        let contents: Vec<String> = boxes
+            .iter()
+            .map(|(x, y, w, h)| format!("0 g {x} {y} {w} {h} re f"))
+            .collect();
+        let contents: Vec<&str> = contents.iter().map(String::as_str).collect();
+        pdf_with_content(page_w, page_h, &contents)
+    }
+
+    /// Minimal PDF: one `page_w`×`page_h` pt page per content stream.
+    fn pdf_with_content(page_w: u32, page_h: u32, contents: &[&str]) -> Vec<u8> {
+        let n = contents.len();
         let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 3 + 2 * i)).collect();
         let mut objs = vec![
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
             format!("<< /Type /Pages /Kids [{}] /Count {n} >>", kids.join(" ")),
         ];
-        for (i, (x, y, w, h)) in boxes.iter().enumerate() {
-            let content = format!("0 g {x} {y} {w} {h} re f");
+        for (i, content) in contents.iter().enumerate() {
             objs.push(format!(
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_w} {page_h}] /Contents {} 0 R >>",
                 4 + 2 * i
@@ -1373,5 +1382,495 @@ pub(crate) mod tests {
         // Missing rows still fail cleanly.
         let err = mono(&png[..at + 10], "cut.png").unwrap_err();
         assert_eq!(err.code, "image_bad");
+    }
+
+    // --- Golden output: labels stay byte-identical ---------------------------
+
+    /// The repository's real 4×6 test label (`assets/test-labels/`).
+    fn test_label(ext: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../assets/test-labels")
+            .join(format!("vesyl-roadrunner-4x6.{ext}"))
+    }
+
+    /// Deterministic pseudo-random bytes (an LCG): photo-like noise.
+    fn noise(n: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (x >> 16) as u8
+            })
+            .collect()
+    }
+
+    /// 120×80 RGBA canvas on fully transparent black: an opaque black box,
+    /// a box fading out in alpha, and gray ink at half alpha.
+    fn alpha_canvas() -> image::RgbaImage {
+        image::RgbaImage::from_fn(120, 80, |x, y| match (x, y) {
+            (10..40, 10..30) => image::Rgba([0, 0, 0, 255]),
+            (50..110, 10..30) => image::Rgba([0, 0, 0, (255 - (x - 50) * 4) as u8]),
+            (10..110, 40..70) => image::Rgba([90, 60, 30, 128]),
+            _ => image::Rgba([0, 0, 0, 0]),
+        })
+    }
+
+    /// Every raster fixture: the real label in each pixel format and codec
+    /// the conversion decodes differently, plus small synthetic images.
+    fn raster_fixtures(dir: &Path) -> Vec<(&'static str, PathBuf)> {
+        use base64::Engine as _;
+        use image::codecs::jpeg::JpegEncoder;
+        let label = image::open(test_label("png")).unwrap();
+        let jpeg = |img: &image::DynamicImage| {
+            let mut buf = Vec::new();
+            img.write_with_encoder(JpegEncoder::new_with_quality(&mut buf, 85))
+                .unwrap();
+            buf
+        };
+        let canvas = image::DynamicImage::ImageRgba8(alpha_canvas());
+        let gray16 = image::ImageBuffer::<Luma<u16>, Vec<u16>>::from_fn(64, 48, |x, y| {
+            Luma([((x * 1024 + y * 700) % 65536) as u16])
+        });
+        let idx: Vec<u8> = (0..30 * 40)
+            .map(|i| match (i % 40, i / 40) {
+                (5..15, 5..10) => 1,
+                (20..35, 5..25) => 2,
+                _ => 0,
+            })
+            .collect();
+        let rgb_noise =
+            image::RgbImage::from_raw(300, 200, noise(300 * 200 * 3, 7)).expect("noise buffer");
+        let files: Vec<(&'static str, Vec<u8>)> = vec![
+            ("label.png", fs::read(test_label("png")).unwrap()),
+            (
+                "label-rgb.png",
+                encoded(
+                    &image::DynamicImage::ImageRgb8(label.to_rgb8()),
+                    ImageFormat::Png,
+                ),
+            ),
+            (
+                "label.jpg",
+                jpeg(&image::DynamicImage::ImageRgb8(label.to_rgb8())),
+            ),
+            ("label-gray.jpg", jpeg(&label)),
+            ("canvas.png", encoded(&canvas, ImageFormat::Png)),
+            ("canvas.gif", encoded(&canvas, ImageFormat::Gif)),
+            (
+                "canvas-la.png",
+                encoded(
+                    &image::DynamicImage::ImageLumaA8(canvas.to_luma_alpha8()),
+                    ImageFormat::Png,
+                ),
+            ),
+            (
+                "palette.png",
+                palette_png(40, 30, &[[0, 0, 0], [0, 0, 0], [120, 120, 120]], &[0], &idx),
+            ),
+            (
+                "gray16.png",
+                encoded(&image::DynamicImage::ImageLuma16(gray16), ImageFormat::Png),
+            ),
+            (
+                "usps.tif",
+                base64::engine::general_purpose::STANDARD
+                    .decode(GROUP4_TIFF_B64)
+                    .unwrap(),
+            ),
+            ("boxed.webp", encoded(&boxed_label(), ImageFormat::WebP)),
+            ("boxed.bmp", encoded(&boxed_label(), ImageFormat::Bmp)),
+            (
+                "noise.png",
+                encoded(&image::DynamicImage::ImageRgb8(rgb_noise), ImageFormat::Png),
+            ),
+        ];
+        files
+            .into_iter()
+            .map(|(name, bytes)| {
+                let p = dir.join(name);
+                fs::write(&p, bytes).unwrap();
+                (name, p)
+            })
+            .collect()
+    }
+
+    /// Options every fixture is converted with: queue names without and with
+    /// a dpi token, each fit, label boxes (both spellings), offsets, and
+    /// threshold/invert.
+    const GOLDEN_OPTIONS: &[&str] = &[
+        r#"{}"#,
+        r#"{"cups_name":"Zebra_Raw"}"#,
+        r#"{"cups_name":"Zebra_ZD421-300dpi_ZPL"}"#,
+        r#"{"zpl_fit":"width"}"#,
+        r#"{"zpl_fit":"none"}"#,
+        r#"{"zpl_fit":"height"}"#,
+        r#"{"zpl_max_width_dots":400,"zpl_max_height_dots":600}"#,
+        r#"{"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"}"#,
+        r#"{"zpl_x":0,"zpl_y":0}"#,
+        r#"{"zpl_x":-5,"zpl_y":-10}"#,
+        r#"{"zpl_y":10}"#,
+        r#"{"zpl_threshold":200,"zpl_invert":true}"#,
+    ];
+
+    /// Extra options for PDFs: rendering resolution and page selection.
+    const GOLDEN_PDF_OPTIONS: &[&str] = &[
+        r#"{"cups_name":"Zebra_ZD421-203dpi_ZPL"}"#,
+        r#"{"zpl_dpi":300}"#,
+        r#"{"zpl_page":1}"#,
+        r#"{"zpl_page":"2"}"#,
+    ];
+
+    /// Every fixture with every option set.
+    fn golden_cases<'a>(
+        fixtures: &'a [(&'a str, PathBuf)],
+        options: &'a [&'a str],
+    ) -> impl Iterator<Item = (&'a str, &'a Path, &'a str)> {
+        fixtures
+            .iter()
+            .flat_map(move |(name, path)| options.iter().map(move |o| (*name, path.as_path(), *o)))
+    }
+
+    /// `fixture options digest` for each conversion: the first 16 hex digits
+    /// of the SHA-256 of the ZPL, or `err:<code>`.
+    fn golden_rows(cases: &[(&str, &Path, &str)]) -> Vec<String> {
+        use sha2::{Digest as _, Sha256};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let row = |(name, path, o): (&str, &Path, &str)| {
+            let v: Value = serde_json::from_str(o).unwrap();
+            let got = match image_path_to_zpl(path, v.as_object().unwrap()) {
+                Ok(zpl) => Sha256::digest(zpl.as_bytes())[..8]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+                Err(e) => format!("err:{}", e.code),
+            };
+            format!("{name} {o} {got}")
+        };
+        // A few workers share the cases: the debug build resamples slowly.
+        let next = AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(6));
+        let mut rows: Vec<(usize, String)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut done = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(case) = cases.get(i) else {
+                                return done;
+                            };
+                            done.push((i, row(*case)));
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        rows.sort();
+        rows.into_iter().map(|(_, row)| row).collect()
+    }
+
+    fn assert_golden(expected: &str, actual: &[String]) {
+        let want: Vec<&str> = expected
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let changed: Vec<String> = actual
+            .iter()
+            .zip(want.iter().copied().chain(std::iter::repeat("<missing>")))
+            .filter(|(got, want)| got.as_str() != *want)
+            .map(|(got, want)| format!("  want {want}\n   got {got}"))
+            .collect();
+        assert!(
+            changed.is_empty() && want.len() == actual.len(),
+            "ZPL output changed:\n{}\nfull table:\n{}",
+            changed.join("\n"),
+            actual.join("\n")
+        );
+    }
+
+    /// Recorded from the conversion as it was before its size limits: a
+    /// normal label must never change. After a deliberate output change, the
+    /// failure message prints the new table.
+    const RASTER_GOLDEN: &str = r#"
+label.png {} 6144278d5f7eaae6
+label.png {"cups_name":"Zebra_Raw"} 6144278d5f7eaae6
+label.png {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 6144278d5f7eaae6
+label.png {"zpl_fit":"width"} 77a7db60c7a396b8
+label.png {"zpl_fit":"none"} 6144278d5f7eaae6
+label.png {"zpl_fit":"height"} 6144278d5f7eaae6
+label.png {"zpl_max_width_dots":400,"zpl_max_height_dots":600} abd6b15f82656e2f
+label.png {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} ea2ee3aec94647db
+label.png {"zpl_x":0,"zpl_y":0} bf6d1dbf18e61349
+label.png {"zpl_x":-5,"zpl_y":-10} dc6a38955c86d326
+label.png {"zpl_y":10} f42edcaffacb7666
+label.png {"zpl_threshold":200,"zpl_invert":true} fe5b7f273a8d8daf
+label-rgb.png {} 6144278d5f7eaae6
+label-rgb.png {"cups_name":"Zebra_Raw"} 6144278d5f7eaae6
+label-rgb.png {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 6144278d5f7eaae6
+label-rgb.png {"zpl_fit":"width"} 77a7db60c7a396b8
+label-rgb.png {"zpl_fit":"none"} 6144278d5f7eaae6
+label-rgb.png {"zpl_fit":"height"} 6144278d5f7eaae6
+label-rgb.png {"zpl_max_width_dots":400,"zpl_max_height_dots":600} abd6b15f82656e2f
+label-rgb.png {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} ea2ee3aec94647db
+label-rgb.png {"zpl_x":0,"zpl_y":0} bf6d1dbf18e61349
+label-rgb.png {"zpl_x":-5,"zpl_y":-10} dc6a38955c86d326
+label-rgb.png {"zpl_y":10} f42edcaffacb7666
+label-rgb.png {"zpl_threshold":200,"zpl_invert":true} fe5b7f273a8d8daf
+label.jpg {} ae3c5faabac29458
+label.jpg {"cups_name":"Zebra_Raw"} ae3c5faabac29458
+label.jpg {"cups_name":"Zebra_ZD421-300dpi_ZPL"} ae3c5faabac29458
+label.jpg {"zpl_fit":"width"} 70a776165ade4dfe
+label.jpg {"zpl_fit":"none"} ae3c5faabac29458
+label.jpg {"zpl_fit":"height"} ae3c5faabac29458
+label.jpg {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 217918e8320d7294
+label.jpg {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} c965339eff924c26
+label.jpg {"zpl_x":0,"zpl_y":0} a90379b7b95b6493
+label.jpg {"zpl_x":-5,"zpl_y":-10} bce3e984bdcdac57
+label.jpg {"zpl_y":10} b6d8565773141fe1
+label.jpg {"zpl_threshold":200,"zpl_invert":true} 4a4a999664d69c3d
+label-gray.jpg {} ae3c5faabac29458
+label-gray.jpg {"cups_name":"Zebra_Raw"} ae3c5faabac29458
+label-gray.jpg {"cups_name":"Zebra_ZD421-300dpi_ZPL"} ae3c5faabac29458
+label-gray.jpg {"zpl_fit":"width"} 70a776165ade4dfe
+label-gray.jpg {"zpl_fit":"none"} ae3c5faabac29458
+label-gray.jpg {"zpl_fit":"height"} ae3c5faabac29458
+label-gray.jpg {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 217918e8320d7294
+label-gray.jpg {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} c965339eff924c26
+label-gray.jpg {"zpl_x":0,"zpl_y":0} a90379b7b95b6493
+label-gray.jpg {"zpl_x":-5,"zpl_y":-10} bce3e984bdcdac57
+label-gray.jpg {"zpl_y":10} b6d8565773141fe1
+label-gray.jpg {"zpl_threshold":200,"zpl_invert":true} 4a4a999664d69c3d
+canvas.png {} 2c2961c5636ae306
+canvas.png {"cups_name":"Zebra_Raw"} 2c2961c5636ae306
+canvas.png {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 2c2961c5636ae306
+canvas.png {"zpl_fit":"width"} a90387a70c8788c5
+canvas.png {"zpl_fit":"none"} 2c2961c5636ae306
+canvas.png {"zpl_fit":"height"} 2c2961c5636ae306
+canvas.png {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 2c2961c5636ae306
+canvas.png {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} da0cd4429d78c684
+canvas.png {"zpl_x":0,"zpl_y":0} 6a8866443aaab52f
+canvas.png {"zpl_x":-5,"zpl_y":-10} 411e085856fd1d5d
+canvas.png {"zpl_y":10} 03b2fe7ed8b70bfb
+canvas.png {"zpl_threshold":200,"zpl_invert":true} 2968c1e8dc83e67c
+canvas.gif {} 34da79daaf1623ca
+canvas.gif {"cups_name":"Zebra_Raw"} 34da79daaf1623ca
+canvas.gif {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 34da79daaf1623ca
+canvas.gif {"zpl_fit":"width"} 76cce02b7b5afd97
+canvas.gif {"zpl_fit":"none"} 34da79daaf1623ca
+canvas.gif {"zpl_fit":"height"} 34da79daaf1623ca
+canvas.gif {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 34da79daaf1623ca
+canvas.gif {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} 4704fcc437a6b713
+canvas.gif {"zpl_x":0,"zpl_y":0} a9cbeca7a746517c
+canvas.gif {"zpl_x":-5,"zpl_y":-10} 74c22a91d087a907
+canvas.gif {"zpl_y":10} e4871908e0f5a6a4
+canvas.gif {"zpl_threshold":200,"zpl_invert":true} 255f47f89b53684f
+canvas-la.png {} 2c2961c5636ae306
+canvas-la.png {"cups_name":"Zebra_Raw"} 2c2961c5636ae306
+canvas-la.png {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 2c2961c5636ae306
+canvas-la.png {"zpl_fit":"width"} a90387a70c8788c5
+canvas-la.png {"zpl_fit":"none"} 2c2961c5636ae306
+canvas-la.png {"zpl_fit":"height"} 2c2961c5636ae306
+canvas-la.png {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 2c2961c5636ae306
+canvas-la.png {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} da0cd4429d78c684
+canvas-la.png {"zpl_x":0,"zpl_y":0} 6a8866443aaab52f
+canvas-la.png {"zpl_x":-5,"zpl_y":-10} 411e085856fd1d5d
+canvas-la.png {"zpl_y":10} 03b2fe7ed8b70bfb
+canvas-la.png {"zpl_threshold":200,"zpl_invert":true} 2968c1e8dc83e67c
+palette.png {} 1b3a720a224aee5b
+palette.png {"cups_name":"Zebra_Raw"} 1b3a720a224aee5b
+palette.png {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 1b3a720a224aee5b
+palette.png {"zpl_fit":"width"} 95f18f507a506815
+palette.png {"zpl_fit":"none"} 1b3a720a224aee5b
+palette.png {"zpl_fit":"height"} 1b3a720a224aee5b
+palette.png {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 1b3a720a224aee5b
+palette.png {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} 39f9d07fa124c22a
+palette.png {"zpl_x":0,"zpl_y":0} 0b6f4bd679644587
+palette.png {"zpl_x":-5,"zpl_y":-10} 1fd022051d1d3cd0
+palette.png {"zpl_y":10} 82c69bae3a2c20ff
+palette.png {"zpl_threshold":200,"zpl_invert":true} 1a7a9aa8f8872580
+gray16.png {} d25696e31d8c9669
+gray16.png {"cups_name":"Zebra_Raw"} d25696e31d8c9669
+gray16.png {"cups_name":"Zebra_ZD421-300dpi_ZPL"} d25696e31d8c9669
+gray16.png {"zpl_fit":"width"} d0b1743a0d693193
+gray16.png {"zpl_fit":"none"} d25696e31d8c9669
+gray16.png {"zpl_fit":"height"} d25696e31d8c9669
+gray16.png {"zpl_max_width_dots":400,"zpl_max_height_dots":600} d25696e31d8c9669
+gray16.png {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} c2ccee69d0a3648e
+gray16.png {"zpl_x":0,"zpl_y":0} fa6aa602df0e3f0c
+gray16.png {"zpl_x":-5,"zpl_y":-10} bcfc66edd9a32e63
+gray16.png {"zpl_y":10} 0b01c2b37b01e4fa
+gray16.png {"zpl_threshold":200,"zpl_invert":true} aa1f59b6d89a36e6
+usps.tif {} 350fcf193ab7c414
+usps.tif {"cups_name":"Zebra_Raw"} 350fcf193ab7c414
+usps.tif {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 350fcf193ab7c414
+usps.tif {"zpl_fit":"width"} c01850051ffab54c
+usps.tif {"zpl_fit":"none"} 350fcf193ab7c414
+usps.tif {"zpl_fit":"height"} 350fcf193ab7c414
+usps.tif {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 350fcf193ab7c414
+usps.tif {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} 2a643502ed476343
+usps.tif {"zpl_x":0,"zpl_y":0} 2e11961cb1699f2a
+usps.tif {"zpl_x":-5,"zpl_y":-10} fc05fed08e8c22b1
+usps.tif {"zpl_y":10} f4e549fb551ff453
+usps.tif {"zpl_threshold":200,"zpl_invert":true} 8065aa50d0384d60
+boxed.webp {} 9f024988f5a4fafd
+boxed.webp {"cups_name":"Zebra_Raw"} 9f024988f5a4fafd
+boxed.webp {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 9f024988f5a4fafd
+boxed.webp {"zpl_fit":"width"} 6eabe9b93cafaf02
+boxed.webp {"zpl_fit":"none"} 9f024988f5a4fafd
+boxed.webp {"zpl_fit":"height"} 9f024988f5a4fafd
+boxed.webp {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 9f024988f5a4fafd
+boxed.webp {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} d2a3e150a012611e
+boxed.webp {"zpl_x":0,"zpl_y":0} 6b53dcaf9ff5106a
+boxed.webp {"zpl_x":-5,"zpl_y":-10} 2fc90aff4ce40963
+boxed.webp {"zpl_y":10} fe8e46842b985173
+boxed.webp {"zpl_threshold":200,"zpl_invert":true} aceff9d7a8692263
+boxed.bmp {} 9f024988f5a4fafd
+boxed.bmp {"cups_name":"Zebra_Raw"} 9f024988f5a4fafd
+boxed.bmp {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 9f024988f5a4fafd
+boxed.bmp {"zpl_fit":"width"} 6eabe9b93cafaf02
+boxed.bmp {"zpl_fit":"none"} 9f024988f5a4fafd
+boxed.bmp {"zpl_fit":"height"} 9f024988f5a4fafd
+boxed.bmp {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 9f024988f5a4fafd
+boxed.bmp {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} d2a3e150a012611e
+boxed.bmp {"zpl_x":0,"zpl_y":0} 6b53dcaf9ff5106a
+boxed.bmp {"zpl_x":-5,"zpl_y":-10} 2fc90aff4ce40963
+boxed.bmp {"zpl_y":10} fe8e46842b985173
+boxed.bmp {"zpl_threshold":200,"zpl_invert":true} aceff9d7a8692263
+noise.png {} ad644ac40398808c
+noise.png {"cups_name":"Zebra_Raw"} ad644ac40398808c
+noise.png {"cups_name":"Zebra_ZD421-300dpi_ZPL"} ad644ac40398808c
+noise.png {"zpl_fit":"width"} fd94e2c664b9f0ae
+noise.png {"zpl_fit":"none"} ad644ac40398808c
+noise.png {"zpl_fit":"height"} ad644ac40398808c
+noise.png {"zpl_max_width_dots":400,"zpl_max_height_dots":600} ad644ac40398808c
+noise.png {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} 38db9d65314616ba
+noise.png {"zpl_x":0,"zpl_y":0} fcb8f039fbcf78c2
+noise.png {"zpl_x":-5,"zpl_y":-10} 619b230715d56d76
+noise.png {"zpl_y":10} f095df32903d6911
+noise.png {"zpl_threshold":200,"zpl_invert":true} afb8acc9cf545f0c
+"#;
+
+    #[test]
+    fn raster_labels_are_byte_identical() {
+        let td = tempfile::tempdir().unwrap();
+        let fixtures = raster_fixtures(td.path());
+        let cases: Vec<_> = golden_cases(&fixtures, GOLDEN_OPTIONS).collect();
+        assert_golden(RASTER_GOLDEN, &golden_rows(&cases));
+    }
+
+    /// The renderer the PDF goldens were recorded with: another poppler
+    /// release may anti-alias differently, so those rows are skipped there.
+    const GOLDEN_PDFTOPPM: &str = "pdftoppm version 26.08.0";
+
+    const PDF_GOLDEN: &str = r#"
+roadrunner.pdf {"cups_name":"Zebra_ZT411-600dpi_ZPL"} ed873ed64b203c67
+roadrunner.pdf {} 35479131dc264911
+roadrunner.pdf {"cups_name":"Zebra_Raw"} 35479131dc264911
+roadrunner.pdf {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 0315a81aa73f8b42
+roadrunner.pdf {"zpl_fit":"width"} b585e4e654cf3fce
+roadrunner.pdf {"zpl_fit":"none"} 35479131dc264911
+roadrunner.pdf {"zpl_fit":"height"} 35479131dc264911
+roadrunner.pdf {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 521519a84f7768e4
+roadrunner.pdf {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} d8524b753c622350
+roadrunner.pdf {"zpl_x":0,"zpl_y":0} cf81fd5d5e7ae990
+roadrunner.pdf {"zpl_x":-5,"zpl_y":-10} 71bbd7a8a67bbe08
+roadrunner.pdf {"zpl_y":10} 709b199368749d67
+roadrunner.pdf {"zpl_threshold":200,"zpl_invert":true} e0ea7beb2efde3be
+roadrunner.pdf {"cups_name":"Zebra_ZD421-203dpi_ZPL"} 35479131dc264911
+roadrunner.pdf {"zpl_dpi":300} 0315a81aa73f8b42
+roadrunner.pdf {"zpl_page":1} 35479131dc264911
+roadrunner.pdf {"zpl_page":"2"} err:pdf_render
+two.pdf {} e225d4a5b85205b1
+two.pdf {"cups_name":"Zebra_Raw"} e225d4a5b85205b1
+two.pdf {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 6c65afad4188d15c
+two.pdf {"zpl_fit":"width"} 239a3681e90605cc
+two.pdf {"zpl_fit":"none"} e225d4a5b85205b1
+two.pdf {"zpl_fit":"height"} e225d4a5b85205b1
+two.pdf {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 906257693c4749e3
+two.pdf {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} 434cf312c551e065
+two.pdf {"zpl_x":0,"zpl_y":0} ba600e44fac98a47
+two.pdf {"zpl_x":-5,"zpl_y":-10} 37da5191ff31d081
+two.pdf {"zpl_y":10} cabc6a64be37be31
+two.pdf {"zpl_threshold":200,"zpl_invert":true} ce3f277c7f228b51
+two.pdf {"cups_name":"Zebra_ZD421-203dpi_ZPL"} e225d4a5b85205b1
+two.pdf {"zpl_dpi":300} 6c65afad4188d15c
+two.pdf {"zpl_page":1} 8c2a186829b91735
+two.pdf {"zpl_page":"2"} 84dadba5fc6786a1
+letter.pdf {} 76d0e0277f4eedde
+letter.pdf {"cups_name":"Zebra_Raw"} 76d0e0277f4eedde
+letter.pdf {"cups_name":"Zebra_ZD421-300dpi_ZPL"} 3a836c0973436a1f
+letter.pdf {"zpl_fit":"width"} 76d0e0277f4eedde
+letter.pdf {"zpl_fit":"none"} 41829c9e79e0c4a0
+letter.pdf {"zpl_fit":"height"} 41829c9e79e0c4a0
+letter.pdf {"zpl_max_width_dots":400,"zpl_max_height_dots":600} 101242fa0f2eaae8
+letter.pdf {"label_width_dots":200,"label_height_dots":300,"zpl_fit":"width"} 72541df7eadcccbe
+letter.pdf {"zpl_x":0,"zpl_y":0} 4eb3c040476f89b6
+letter.pdf {"zpl_x":-5,"zpl_y":-10} 25ff39832d3ac240
+letter.pdf {"zpl_y":10} c574156144ff5867
+letter.pdf {"zpl_threshold":200,"zpl_invert":true} d936d9d8f4b0cee2
+letter.pdf {"cups_name":"Zebra_ZD421-203dpi_ZPL"} 76d0e0277f4eedde
+letter.pdf {"zpl_dpi":300} 3a836c0973436a1f
+letter.pdf {"zpl_page":1} 76d0e0277f4eedde
+letter.pdf {"zpl_page":"2"} err:pdf_render
+"#;
+
+    #[test]
+    fn pdf_labels_are_byte_identical() {
+        let Some(tool) = which("pdftoppm") else {
+            eprintln!("no pdftoppm installed; skipping PDF golden output");
+            return;
+        };
+        let out = run_with_timeout(&tool, &["-v"], Duration::from_secs(30)).unwrap();
+        let version = format!("{}{}", out.stdout, out.stderr);
+        if !version.contains(GOLDEN_PDFTOPPM) {
+            eprintln!(
+                "{} is not {GOLDEN_PDFTOPPM}; skipping PDF golden output",
+                version.trim()
+            );
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        // Frame and boxes on a Letter page (cropped to its content), and a
+        // two-page 4×6 document.
+        let frame = "0 g 100 100 288 6 re f 100 100 6 432 re f 382 100 6 432 re f \
+                     100 526 288 6 re f 150 300 120 80 re f 140 150 3 120 re f";
+        let fixtures = vec![
+            ("roadrunner.pdf", test_label("pdf")),
+            (
+                "two.pdf",
+                write_pdf(
+                    td.path(),
+                    "two.pdf",
+                    &pdf_with_boxes(288, 432, &[(36, 36, 72, 36), (36, 36, 144, 72)]),
+                ),
+            ),
+            (
+                "letter.pdf",
+                write_pdf(
+                    td.path(),
+                    "letter.pdf",
+                    &pdf_with_content(612, 792, &[frame]),
+                ),
+            ),
+        ];
+        let options: Vec<&str> = GOLDEN_OPTIONS
+            .iter()
+            .chain(GOLDEN_PDF_OPTIONS)
+            .copied()
+            .collect();
+        // The real label on a 600 dpi head too: the largest normal raster.
+        // First, so the slowest case does not start last.
+        let mut cases = vec![(
+            fixtures[0].0,
+            fixtures[0].1.as_path(),
+            r#"{"cups_name":"Zebra_ZT411-600dpi_ZPL"}"#,
+        )];
+        cases.extend(golden_cases(&fixtures, &options));
+        assert_golden(PDF_GOLDEN, &golden_rows(&cases));
     }
 }
