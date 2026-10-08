@@ -1,10 +1,12 @@
 //! Small helpers shared across modules: Python-ish JSON coercion and durable writes.
 
-use std::ffi::OsString;
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path};
 
 use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
@@ -112,9 +114,10 @@ pub fn write_durable(path: &Path, data: &[u8], mode: u32, sync_dir: bool) -> io:
 type Owner = (u32, u32);
 
 /// Owner for a file that `euid` is about to replace, or `None` to keep the
-/// writer's own. Only root changes anything: the replaced file's owner wins,
-/// unless the file is missing or itself root-owned (left by an older root
-/// run), in which case the directory's owner (the service user) does.
+/// writer's own. Only root changes anything: the replaced file's owner wins
+/// (a symlink's own owner, not its target's), unless the file is missing or
+/// itself root-owned (left by an older root run), in which case the
+/// directory's owner (the service user) does.
 fn owner_for_rewrite(euid: u32, existing: Option<Owner>, dir: Option<Owner>) -> Option<Owner> {
     if euid != 0 {
         return None;
@@ -130,8 +133,8 @@ fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn owner_of(path: &Path) -> Option<Owner> {
-    fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
+fn owner(m: &fs::Metadata) -> Owner {
+    (m.uid(), m.gid())
 }
 
 /// Apply [`owner_for_rewrite`] to the open temp file before it is renamed
@@ -141,7 +144,13 @@ fn keep_service_owner(tmp: &File, path: &Path, dir: &Path) {
     if euid != 0 {
         return;
     }
-    let Some((uid, gid)) = owner_for_rewrite(euid, owner_of(path), owner_of(dir)) else {
+    // lstat: a symlink planted at `path` must not pick who owns the new file
+    // (for credentials.json, who can read the token). The rename replaces
+    // the link itself, not its target. The directory's own symlink, if any
+    // (to a data partition, say), is followed.
+    let existing = fs::symlink_metadata(path).ok().map(|m| owner(&m));
+    let dir_owner = fs::metadata(dir).ok().map(|m| owner(&m));
+    let Some((uid, gid)) = owner_for_rewrite(euid, existing, dir_owner) else {
         return;
     };
     if let Err(e) = std::os::unix::fs::fchown(tmp, Some(uid), Some(gid)) {
@@ -156,28 +165,86 @@ fn keep_service_owner(tmp: &File, path: &Path, dir: &Path) {
 /// `fs::create_dir_all`, except that directories root creates get the owner
 /// of the closest directory that already existed.
 fn create_dirs(dir: &Path) -> io::Result<()> {
-    let euid = euid();
-    if euid != 0 || dir.is_dir() {
+    if euid() != 0 || dir.is_dir() {
         return fs::create_dir_all(dir);
     }
-    let missing: Vec<&Path> = dir
+    create_dirs_as_root(dir, &|_| {})
+}
+
+/// Root's half of [`create_dirs`]. The service user owns the directories this
+/// usually runs in, so it can rename a directory root has just made and put a
+/// symlink in its place; a chown by path would then hand the link's target
+/// (say /etc) to that user. So each missing directory is made with mkdirat
+/// relative to its open parent, reopened there with O_NOFOLLOW, and chowned
+/// through that descriptor: no name made here, the last one or one on the
+/// way to it, is resolved through a path again, and a swapped-in symlink
+/// fails the call instead. `after_mkdir` lets tests do the swap.
+fn create_dirs_as_root(dir: &Path, after_mkdir: &dyn Fn(&Path)) -> io::Result<()> {
+    // The closest ancestor that exists; it may be a symlink (to a data
+    // partition, say), and is followed like any existing directory.
+    let base = dir
         .ancestors()
-        .take_while(|p| !p.as_os_str().is_empty() && !p.exists())
-        .collect();
-    fs::create_dir_all(dir)?;
-    let existing = match missing.last().and_then(|top| top.parent()) {
-        Some(p) if p.as_os_str().is_empty() => Path::new("."),
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    if let Some((uid, gid)) = owner_for_rewrite(euid, None, owner_of(existing)) {
-        for d in &missing {
-            if let Err(e) = std::os::unix::fs::chown(d, Some(uid), Some(gid)) {
-                log::warn!(target: LOG, "could not hand {} to uid {uid}: {e}", d.display());
+        .find(|p| p.as_os_str().is_empty() || p.exists())
+        .unwrap_or(Path::new(""));
+    let rest = dir.strip_prefix(base).map_err(io::Error::other)?;
+    let mut parent = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(if base.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            base
+        })?;
+    let new_owner = owner_for_rewrite(0, None, parent.metadata().ok().map(|m| owner(&m)));
+    let mut made = base.to_path_buf();
+    for part in rest.components() {
+        let name = part.as_os_str();
+        made.push(name);
+        // Only names this call makes are handed over, never "..", nor a
+        // directory another writer made first.
+        let created = matches!(part, Component::Normal(_)) && mkdir_at(&parent, name)?;
+        if created {
+            after_mkdir(&made);
+        }
+        let child = open_dir_at(&parent, name)?;
+        if let (true, Some((uid, gid))) = (created, new_owner) {
+            if let Err(e) = std::os::unix::fs::fchown(&child, Some(uid), Some(gid)) {
+                log::warn!(target: LOG, "could not hand {} to uid {uid}: {e}", made.display());
             }
         }
+        parent = child;
     }
     Ok(())
+}
+
+/// mkdirat(2) with `create_dir_all`'s mode: `Ok(true)` when this call made
+/// `name`, `Ok(false)` when something already has that name.
+fn mkdir_at(parent: &File, name: &OsStr) -> io::Result<bool> {
+    let c = CString::new(name.as_bytes())?;
+    // SAFETY: `parent` is an open descriptor and `c` a NUL-terminated string.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o777) } == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    if e.kind() == io::ErrorKind::AlreadyExists {
+        Ok(false)
+    } else {
+        Err(e)
+    }
+}
+
+/// Open the directory `name` inside `parent`. A symlink there is not
+/// followed: the open fails (ENOTDIR, as O_DIRECTORY is checked first).
+fn open_dir_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    let c = CString::new(name.as_bytes())?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: as above; without O_CREAT, openat reads no mode argument.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened here and nothing else owns it.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
@@ -267,6 +334,68 @@ mod tests {
         assert_eq!(owner_for_rewrite(0, None, None), None);
     }
 
+    /// Plants a symlink to `target` where the walk has just made `name`, the
+    /// way the service user could between root's mkdir and its chown.
+    fn swap_for_link<'a>(
+        name: &'a str,
+        target: &'a Path,
+        swapped: &'a std::cell::Cell<bool>,
+    ) -> impl Fn(&Path) + 'a {
+        move |made: &Path| {
+            if made.ends_with(name) && !swapped.get() {
+                let mut away = made.as_os_str().to_owned();
+                away.push(".moved");
+                fs::rename(made, away).unwrap();
+                std::os::unix::fs::symlink(target, made).unwrap();
+                swapped.set(true);
+            }
+        }
+    }
+
+    /// The walk's open met the planted link and refused it: ENOTDIR on Linux,
+    /// where O_DIRECTORY is checked before O_NOFOLLOW's ELOOP.
+    fn refused_link(e: &io::Error) -> bool {
+        matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
+    }
+
+    #[test]
+    fn root_dir_walk_never_follows_a_swapped_in_symlink() {
+        // Root's walk, run unprivileged: handing a directory to our own uid
+        // is allowed, so everything but the ownership itself is exercised.
+        let td = tempfile::tempdir().unwrap();
+        let deep = td.path().join("queue").join("new");
+        create_dirs_as_root(&deep, &|_| {}).unwrap();
+        assert!(deep.is_dir());
+        create_dirs_as_root(&deep, &|_| {}).unwrap();
+        let rel = td.path().join("rel");
+        create_dirs_as_root(&rel.join("..").join("rel").join("x"), &|_| {}).unwrap();
+        assert!(rel.join("x").is_dir());
+
+        // "jobs" is swapped for a link before root opens it, so "new" would
+        // be made, and chowned, inside the link's target (/etc, say).
+        let elsewhere = tempfile::tempdir().unwrap();
+        let swapped = std::cell::Cell::new(false);
+        let err = create_dirs_as_root(
+            &td.path().join("jobs").join("new"),
+            &swap_for_link("jobs", elsewhere.path(), &swapped),
+        )
+        .unwrap_err();
+        assert!(swapped.get());
+        assert!(refused_link(&err), "{err}");
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+
+        // The same for the last directory: nothing past the link is touched.
+        let swapped = std::cell::Cell::new(false);
+        let err = create_dirs_as_root(
+            &td.path().join("spool").join("new"),
+            &swap_for_link("new", elsewhere.path(), &swapped),
+        )
+        .unwrap_err();
+        assert!(swapped.get());
+        assert!(refused_link(&err), "{err}");
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
     /// Needs root: `sudo cargo test`, or unprivileged with
     /// `unshare --map-root-user --map-auto cargo test -- --ignored root_write`.
     #[test]
@@ -300,5 +429,40 @@ mod tests {
         let status_json = td.path().join("status.json");
         crate::statusio::write_status(&status_json, &mut Default::default()).unwrap();
         assert_eq!(owner(&status_json), (1000, 1000, 0o600));
+
+        // A symlink planted at the target does not pick the new file's owner:
+        // the link (root's here) is replaced, and its target is not touched.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::chown(&victim, Some(2000), Some(2000)).unwrap();
+        let linked = td.path().join("credentials-linked.json");
+        std::os::unix::fs::symlink(&victim, &linked).unwrap();
+        write_durable(&linked, b"{}", 0o600, false).unwrap();
+        assert!(fs::symlink_metadata(&linked).unwrap().is_file());
+        assert_eq!(owner(&linked), (1000, 1000, 0o600));
+        assert_eq!(owner(&victim).0, 2000);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+
+        // A directory root just made, swapped for a link to a root-owned
+        // directory, never gets that directory chowned to the service user.
+        let rooted = tempfile::tempdir().unwrap();
+        let before = owner(rooted.path());
+        assert_eq!(before.0, 0);
+        let swapped = std::cell::Cell::new(false);
+        let made = td.path().join("jobs").join("new");
+        let err = create_dirs_as_root(&made, &swap_for_link("jobs", rooted.path(), &swapped))
+            .unwrap_err();
+        assert!(swapped.get());
+        assert!(refused_link(&err), "{err}");
+        assert_eq!(owner(rooted.path()), before);
+        assert_eq!(fs::read_dir(rooted.path()).unwrap().count(), 0);
+        let swapped = std::cell::Cell::new(false);
+        let made = td.path().join("spool").join("new");
+        let err =
+            create_dirs_as_root(&made, &swap_for_link("new", rooted.path(), &swapped)).unwrap_err();
+        assert!(swapped.get());
+        assert!(refused_link(&err), "{err}");
+        assert_eq!(owner(rooted.path()), before);
     }
 }

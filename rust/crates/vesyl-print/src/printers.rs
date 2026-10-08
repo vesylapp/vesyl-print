@@ -1629,10 +1629,14 @@ fn ipp_query_queue_with(
                     );
                     // Prefer device base state when more severe / informative.
                     parsed.status = status_from_state_and_reasons(&dev.base_status, &merged);
-                    // Raw messages only, as above: a derived label for either
-                    // side's reasons would drop the other side's.
-                    let msg = dev.state_message.or(parsed.state_message.clone());
-                    parsed.status_message = human_status_message(&merged, msg.as_deref());
+                    // The device's raw message, else labels for all merged
+                    // reasons (a label for one side's reasons would drop the
+                    // other side's). Never the local message: with no
+                    // actionable local reason it is a CUPS progress note
+                    // ("Waiting for printer to finish.") that would hide why
+                    // the device stopped.
+                    parsed.status_message =
+                        human_status_message(&merged, dev.state_message.as_deref());
                     parsed.status_reasons = merged;
                 }
             }
@@ -2473,6 +2477,63 @@ mod tests {
         assert_eq!(
             st.status_message.as_deref(),
             Some("Toner low; Out of paper")
+        );
+    }
+
+    #[test]
+    fn local_progress_message_does_not_hide_device_reasons() {
+        // The device is probed only when the local queue has no actionable
+        // reason, so the local message is CUPS's progress note. It must not
+        // replace the reason the device stopped.
+        let local = "
+        printer-state (enum) = processing
+        printer-state-reasons (keyword) = none
+        printer-state-message (textWithoutLanguage) = Waiting for printer to finish.
+        ";
+        let device = "
+        printer-state (enum) = stopped
+        printer-state-reasons (keyword) = media-empty-error
+        ";
+        let ipp = |uri: &str, body: &str, _: f64| {
+            if body.contains("Get-Jobs") {
+                String::new()
+            } else if uri.contains("localhost") {
+                local.to_string()
+            } else {
+                device.to_string()
+            }
+        };
+        let st = cups_queue_status_with(
+            "Brother_X",
+            Some("ipps://brother.local/ipp/print"),
+            &ipp,
+            &|_| String::new(),
+        );
+        assert_eq!(st.status, "stopped");
+        assert_eq!(st.status_reasons, ["media-empty-error"]);
+        assert_eq!(st.status_message.as_deref(), Some("Out of paper"));
+
+        // Without device reasons there is no merge: the local note stays.
+        let idle_device = device.replace("media-empty-error", "none");
+        let ipp = |uri: &str, body: &str, _: f64| {
+            if body.contains("Get-Jobs") {
+                String::new()
+            } else if uri.contains("localhost") {
+                local.to_string()
+            } else {
+                idle_device.clone()
+            }
+        };
+        let st = cups_queue_status_with(
+            "Brother_X",
+            Some("ipps://brother.local/ipp/print"),
+            &ipp,
+            &|_| String::new(),
+        );
+        assert_eq!(st.status, "printing");
+        assert_eq!(
+            st.status_message.as_deref(),
+            Some("Waiting for printer to finish.")
         );
     }
 
