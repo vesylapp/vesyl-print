@@ -20,11 +20,16 @@ use crate::statusio::{self, CloudState, PairingState};
 use crate::update::{self, ReleaseManifest, UpdateEnv};
 use crate::{printers, sysinfo, JsonObject};
 
+/// Parsing follows Python's argparse, which this CLI replaces: unambiguous
+/// prefixes of long options are accepted (`--ch` for `--check`) and a
+/// repeated option keeps its last value. Both settings reach every subcommand.
 #[derive(Parser, Debug)]
 #[command(
     name = "vesyl-print",
     version = agent_version(),
-    about = "VESYL print node — claim, enroll, status, queues, agent, print-test, update"
+    about = "VESYL print node — claim, enroll, status, queues, agent, print-test, update",
+    infer_long_args = true,
+    args_override_self = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -36,6 +41,7 @@ pub enum Command {
     /// Pair this node with an 8-char claim code
     Claim {
         /// Claim code (dashes optional)
+        #[arg(allow_negative_numbers = true)]
         code: String,
         /// Optional display name for this node
         #[arg(long)]
@@ -123,7 +129,7 @@ pub struct PrintTestArgs {
     #[arg(long)]
     title: Option<String>,
     /// Number of copies (default 1)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, allow_negative_numbers = true)]
     copies: i64,
     /// Submit with lp -o raw (ZPL/EPL thermal queues)
     #[arg(long)]
@@ -662,20 +668,13 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
             restart,
             ..
         } => {
+            // Signatures required: a key that cannot be loaded is an error.
+            let pem = update::manifest_public_key(cfg)?;
             let manifest = update::fetch_manifest(&url)?;
-            let key_path = (!cfg.update_public_key_path.is_empty())
-                .then(|| PathBuf::from(&cfg.update_public_key_path));
-            let pem = update::load_public_key_pem(key_path.as_deref(), None).ok();
-            update::apply_release(
-                &manifest,
-                env,
-                pem.as_deref(),
-                cfg.update_require_signature && pem.is_some(),
-            )?;
-            if restart {
-                update::restart_services(env.apply_helper.as_deref());
-            }
+            let previous = update::slot_before_activation(env);
+            update::apply_release(&manifest, env, pem.as_deref(), cfg.update_require_signature)?;
             writeln!(out, "applied {}", manifest.version)?;
+            after_manual_activation(deps, out, &manifest.version, previous, restart)?;
             Ok(0)
         }
 
@@ -691,8 +690,17 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
                 hb.insert("desired_agent_version".into(), json!(v));
                 hb.insert("update_url".into(), json!(url));
             }
-            let ust = update::maybe_update_from_heartbeat(&hb, cfg, env, None, None, false);
+            // Restart only once update_status.json says pending_health, so the
+            // restarted agent always finds the health gate armed.
+            let apply_env = UpdateEnv {
+                restart: false,
+                ..env.clone()
+            };
+            let ust = update::maybe_update_from_heartbeat(&hb, cfg, &apply_env, None, None, false);
             update::write_update_status(&cfg.update_status_path(), &ust)?;
+            if ust.status == update::STATUS_PENDING_HEALTH && env.restart {
+                update::restart_services(env.apply_helper.as_deref());
+            }
             writeln!(out, "{}", serde_json::to_string_pretty(&ust.to_dict())?)?;
             Ok(if ust.status == update::STATUS_FAILED {
                 1
@@ -744,24 +752,14 @@ fn apply_local(
             manifest.artifact_sha256
         ));
     }
-    let pem = if !cfg.update_public_key_path.is_empty() {
-        Some(update::load_public_key_pem(
-            Some(Path::new(&cfg.update_public_key_path)),
-            None,
-        )?)
-    } else {
-        match update::load_public_key_pem(None, None) {
-            Ok(p) => Some(p),
-            Err(_) if cfg.update_require_signature => {
-                return die("no public key; set update_require_signature false for lab");
-            }
-            Err(_) => None,
-        }
-    };
-    if cfg.update_require_signature && pem.is_some() {
+    // Verification is skipped only when signatures are disabled in config; an
+    // unreadable configured key is an error.
+    let pem = update::manifest_public_key(cfg)?;
+    if cfg.update_require_signature {
         update::verify_manifest(&manifest, pem.as_deref(), true)?;
     }
     let root = &deps.update_env.install_root;
+    let previous = update::slot_before_activation(&deps.update_env);
     let release_dir = root.join("releases").join(&manifest.version);
     if release_dir.exists() {
         fs::remove_dir_all(&release_dir)?;
@@ -775,11 +773,51 @@ fn apply_local(
         manifest.version,
         root.join("current").display()
     )?;
-    if restart {
+    after_manual_activation(deps, out, &manifest.version, previous, restart)?;
+    Ok(0)
+}
+
+/// After `update apply --file/--manifest-url` activated `version`.
+///
+/// With `--restart`, arm the post-update health gate first (as the heartbeat
+/// path does), so a new slot that cannot reach the API rolls itself back to
+/// `previous`. Without it the old agent keeps running; arming the gate then
+/// would make that agent roll the activation back (running version mismatch).
+fn after_manual_activation(
+    deps: &Deps,
+    out: &mut dyn Write,
+    version: &str,
+    previous: Option<String>,
+    restart: bool,
+) -> Result<(), Die> {
+    if !restart {
+        writeln!(
+            out,
+            "{version} starts on the next service restart (--restart also arms the post-update health gate)"
+        )?;
+        return Ok(());
+    }
+    let st = update::arm_health_gate(&deps.cfg, &deps.cfg.update_status_path(), version, previous)
+        .map_err(|e| {
+            Die(format!(
+                "activated {version} but could not arm the health gate ({e}); services not restarted"
+            ))
+        })?;
+    let rollback = match &st.previous_version {
+        Some(prev) => format!("rollback to {prev}"),
+        None => "no previous slot to roll back to".into(),
+    };
+    writeln!(
+        out,
+        "pending_health until {} ({rollback})",
+        st.health_deadline_at.as_deref().unwrap_or("?")
+    )?;
+    // `restart` is false only in tests (UpdateEnv::detect always sets it).
+    if deps.update_env.restart {
         update::restart_services(deps.update_env.apply_helper.as_deref());
         writeln!(out, "services restarted")?;
     }
-    Ok(0)
+    Ok(())
 }
 
 /// Submit a local file through the durable job pipeline (no cloud).
@@ -1088,36 +1126,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn update_apply_local_file() {
-        let td = tempfile::tempdir().unwrap();
-        let d = Deps {
-            cfg: Config {
-                update_require_signature: false,
-                ..deps(td.path(), "http://127.0.0.1:9").cfg
-            },
-            ..deps(td.path(), "http://127.0.0.1:9")
-        };
-        // Release tarball with the Rust binary entrypoint.
-        let src = td.path().join("src");
+    /// Release tarball (Rust binary entrypoint) and its unsigned manifest,
+    /// whose `artifact_url` points at the tarball (`file://`).
+    fn release(td: &Path, version: &str) -> (PathBuf, PathBuf) {
+        let src = td.join(format!("src-{version}"));
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("vesyl-print"), b"bin").unwrap();
-        let tarball = td.path().join("r.tar.gz");
+        let tarball = td.join(format!("vesyl-print-{version}.tar.gz"));
         let gz = flate2::write::GzEncoder::new(
             fs::File::create(&tarball).unwrap(),
             flate2::Compression::default(),
         );
         let mut tar = tar::Builder::new(gz);
-        tar.append_dir_all("vesyl-print-0.9.0", &src).unwrap();
+        tar.append_dir_all(format!("vesyl-print-{version}"), &src)
+            .unwrap();
         tar.into_inner().unwrap().finish().unwrap();
-        let manifest = td.path().join("m.json");
-        let sha = update::sha256_file(&tarball).unwrap();
+        let manifest = td.join(format!("m-{version}.json"));
         fs::write(
             &manifest,
-            json!({"version": "0.9.0", "artifact_url": "file:///x", "artifact_sha256": sha})
-                .to_string(),
+            json!({
+                "version": version,
+                "artifact_url": url::Url::from_file_path(&tarball).unwrap().to_string(),
+                "artifact_sha256": update::sha256_file(&tarball).unwrap(),
+            })
+            .to_string(),
         )
         .unwrap();
+        (tarball, manifest)
+    }
+
+    fn file_url(p: &Path) -> String {
+        url::Url::from_file_path(p).unwrap().to_string()
+    }
+
+    fn unsigned_deps(td: &Path) -> Deps {
+        let d = deps(td, "http://127.0.0.1:9");
+        Deps {
+            cfg: Config {
+                update_require_signature: false,
+                ..d.cfg
+            },
+            ..d
+        }
+    }
+
+    /// The slot an operator activates the new release from.
+    fn installed_slot(d: &Deps, version: &str) {
+        let root = &d.update_env.install_root;
+        fs::create_dir_all(root.join("releases").join(version)).unwrap();
+        update::flip_current(root, version).unwrap();
+    }
+
+    #[test]
+    fn update_apply_local_file() {
+        let td = tempfile::tempdir().unwrap();
+        let d = unsigned_deps(td.path());
+        let (tarball, manifest) = release(td.path(), "0.9.0");
 
         let (r, out) = run_args(
             &d,
@@ -1136,6 +1200,10 @@ mod tests {
             update::current_release_version(&d.update_env.install_root).as_deref(),
             Some("0.9.0")
         );
+        // Without --restart the old agent keeps running: no gate is armed
+        // (it would roll the activation back), only a hint is printed.
+        assert!(out.contains("--restart also arms the post-update health gate"));
+        assert!(!d.cfg.update_status_path().exists());
 
         fs::write(&manifest, json!({"version": "0.9.1", "artifact_url": "file:///x", "artifact_sha256": "0".repeat(64)}).to_string()).unwrap();
         let (r, _) = run_args(
@@ -1161,6 +1229,285 @@ mod tests {
             r.unwrap_err().0,
             "not paired and no --manifest-url / --file"
         );
+    }
+
+    /// `update apply … --restart` must leave pending_health for the restarted
+    /// agent, with the slot it replaced as the rollback target.
+    fn assert_gate_armed(d: &Deps, out: &str, version: &str, previous: &str) {
+        let st = update::read_update_status(&d.cfg.update_status_path()).expect("status");
+        assert_eq!(st.status, update::STATUS_PENDING_HEALTH, "{out}");
+        assert_eq!(st.target_version.as_deref(), Some(version));
+        assert_eq!(st.previous_version.as_deref(), Some(previous));
+        assert!(st.health_deadline_at.is_some());
+        assert!(out.contains(&format!("(rollback to {previous})")), "{out}");
+        // UpdateEnv.restart is false in tests: nothing was really restarted.
+        assert!(!out.contains("services restarted"));
+
+        // The armed gate does its job: the new slot never reaches the API.
+        let expired = update::UpdateStatus {
+            health_deadline_at: Some("2000-01-01T00:00:00+00:00".into()),
+            ..st
+        };
+        let after = update::process_pending_health(
+            expired,
+            &d.cfg,
+            &d.update_env,
+            update::WhoamiResult::Error,
+            Some("timeout"),
+            None,
+        );
+        assert_eq!(after.status, update::STATUS_ROLLED_BACK);
+        assert_eq!(
+            update::current_release_version(&d.update_env.install_root).as_deref(),
+            Some(previous)
+        );
+    }
+
+    #[test]
+    fn update_apply_file_with_restart_arms_health_gate() {
+        let td = tempfile::tempdir().unwrap();
+        let d = unsigned_deps(td.path());
+        installed_slot(&d, "0.8.0");
+        let (tarball, manifest) = release(td.path(), "0.9.0");
+        let (r, out) = run_args(
+            &d,
+            &[
+                "update",
+                "apply",
+                "--file",
+                tarball.to_str().unwrap(),
+                "--manifest",
+                manifest.to_str().unwrap(),
+                "--restart",
+            ],
+        );
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert!(out.starts_with("activated 0.9.0"));
+        assert_gate_armed(&d, &out, "0.9.0", "0.8.0");
+    }
+
+    #[test]
+    fn update_apply_manifest_url_with_restart_arms_health_gate() {
+        let td = tempfile::tempdir().unwrap();
+        let d = unsigned_deps(td.path());
+        installed_slot(&d, "0.8.0");
+        let (_, manifest) = release(td.path(), "0.9.0");
+        let url = file_url(&manifest);
+        let (r, out) = run_args(
+            &d,
+            &["update", "apply", "--manifest-url", &url, "--restart"],
+        );
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert!(out.starts_with("applied 0.9.0"));
+        assert_gate_armed(&d, &out, "0.9.0", "0.8.0");
+
+        // Without --restart: activated, but no gate (the old agent still runs).
+        let td = tempfile::tempdir().unwrap();
+        let d = unsigned_deps(td.path());
+        installed_slot(&d, "0.8.0");
+        let (_, manifest) = release(td.path(), "0.9.0");
+        let (r, out) = run_args(
+            &d,
+            &["update", "apply", "--manifest-url", &file_url(&manifest)],
+        );
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert!(!d.cfg.update_status_path().exists());
+    }
+
+    #[test]
+    fn update_apply_fails_closed_on_unreadable_key() {
+        let td = tempfile::tempdir().unwrap();
+        // A DER key where PEM is expected (or a corrupt / unreadable file).
+        let der = td.path().join("update_public.der");
+        fs::write(
+            &der,
+            [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0xff],
+        )
+        .unwrap();
+        let base = deps(td.path(), "http://127.0.0.1:9");
+        let d = Deps {
+            cfg: Config {
+                update_public_key_path: der.display().to_string(),
+                ..base.cfg
+            },
+            ..base
+        };
+        assert!(d.cfg.update_require_signature);
+        installed_slot(&d, "0.8.0");
+        // Unsigned: had verification been skipped, these would install.
+        let (tarball, manifest) = release(td.path(), "0.9.0");
+        let url = file_url(&manifest);
+        for argv in [
+            vec!["update", "apply", "--manifest-url", &url, "--restart"],
+            vec![
+                "update",
+                "apply",
+                "--file",
+                tarball.to_str().unwrap(),
+                "--manifest",
+                manifest.to_str().unwrap(),
+            ],
+        ] {
+            let (r, out) = run_args(&d, &argv);
+            let err = r.unwrap_err().0;
+            assert!(err.contains("is not a PEM file"), "{argv:?}: {err} {out}");
+            assert_eq!(
+                update::current_release_version(&d.update_env.install_root).as_deref(),
+                Some("0.8.0"),
+                "{argv:?} activated a release"
+            );
+        }
+        assert!(!d.cfg.update_status_path().exists());
+
+        // Signatures turned off in config is the only way to skip the check.
+        let lab = Deps {
+            cfg: Config {
+                update_require_signature: false,
+                ..d.cfg.clone()
+            },
+            ..deps(td.path(), "http://127.0.0.1:9")
+        };
+        let (r, out) = run_args(&lab, &["update", "apply", "--manifest-url", &url]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert_eq!(
+            update::current_release_version(&lab.update_env.install_root).as_deref(),
+            Some("0.9.0")
+        );
+    }
+
+    #[test]
+    fn update_apply_rejects_unsigned_manifest_with_bundled_key() {
+        let td = tempfile::tempdir().unwrap();
+        let d = deps(td.path(), "http://127.0.0.1:9");
+        installed_slot(&d, "0.8.0");
+        let (tarball, manifest) = release(td.path(), "0.9.0");
+        let url = file_url(&manifest);
+        for argv in [
+            vec!["update", "apply", "--manifest-url", &url],
+            vec![
+                "update",
+                "apply",
+                "--file",
+                tarball.to_str().unwrap(),
+                "--manifest",
+                manifest.to_str().unwrap(),
+            ],
+        ] {
+            let (r, _) = run_args(&d, &argv);
+            assert_eq!(r.unwrap_err().0, "manifest missing signature", "{argv:?}");
+        }
+        assert_eq!(
+            update::current_release_version(&d.update_env.install_root).as_deref(),
+            Some("0.8.0")
+        );
+    }
+
+    #[test]
+    fn argparse_style_abbreviations_and_repeats() {
+        let parse = |argv: &[&str]| {
+            Cli::try_parse_from(std::iter::once("vesyl-print").chain(argv.iter().copied()))
+        };
+        let cmd = |argv: &[&str]| {
+            parse(argv)
+                .unwrap_or_else(|e| panic!("{argv:?}: {e}"))
+                .command
+        };
+
+        assert!(matches!(
+            cmd(&["status", "--ch"]),
+            Command::Status { check: true }
+        ));
+        assert!(matches!(
+            cmd(&["status", "--check", "--check"]),
+            Command::Status { check: true }
+        ));
+        match cmd(&[
+            "update",
+            "rollback",
+            "--vers",
+            "0.3.17",
+            "--rest",
+            "--restart",
+        ]) {
+            Command::Update {
+                action: UpdateAction::Rollback { version, restart },
+            } => {
+                assert_eq!(version.as_deref(), Some("0.3.17"));
+                assert!(restart);
+            }
+            other => panic!("{other:?}"),
+        }
+        match cmd(&[
+            "update",
+            "apply",
+            "--manifest-u",
+            "https://x/m.json",
+            "--manifest",
+            "m.json",
+        ]) {
+            Command::Update {
+                action:
+                    UpdateAction::Apply {
+                        manifest_url,
+                        manifest,
+                        ..
+                    },
+            } => {
+                assert_eq!(manifest_url.as_deref(), Some("https://x/m.json"));
+                // An exact name beats the longer option it prefixes.
+                assert_eq!(manifest.as_deref(), Some(Path::new("m.json")));
+            }
+            other => panic!("{other:?}"),
+        }
+        match cmd(&[
+            "print-test",
+            "--fi",
+            "l.pdf",
+            "--q",
+            "Zebra",
+            "--cop",
+            "2",
+            "--cop",
+            "3",
+        ]) {
+            Command::PrintTest(a) => {
+                assert_eq!(a.file, Path::new("l.pdf"));
+                assert_eq!(a.queue.as_deref(), Some("Zebra"));
+                assert_eq!(a.copies, 3);
+            }
+            other => panic!("{other:?}"),
+        }
+        match cmd(&["claim", "AB7K2Q9M", "--na", "Pack 1", "--name", "Pack 2"]) {
+            Command::Claim { code, name } => {
+                assert_eq!(code, "AB7K2Q9M");
+                assert_eq!(name.as_deref(), Some("Pack 2"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            cmd(&["agent", "--verb", "-v"]),
+            Command::Agent { verbose: true }
+        ));
+        // Negative numbers are values, as in argparse (copies < 1 prints one).
+        match cmd(&["print-test", "--file", "l.pdf", "--copies", "-1"]) {
+            Command::PrintTest(a) => assert_eq!(a.copies, -1),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            cmd(&["claim", "-12345678"]),
+            Command::Claim { code, .. } if code == "-12345678"
+        ));
+
+        // What argparse rejects stays rejected (exit status 2).
+        for bad in [
+            &["update", "apply", "--man", "x"][..],
+            &["claim", "AB7K2Q9M", "EXTRA"],
+            &["status", "--bogus"],
+            &["update", "apply", "--version"],
+        ] {
+            let err = parse(bad).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{bad:?}: {err}");
+        }
     }
 
     #[test]

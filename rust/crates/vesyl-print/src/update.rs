@@ -36,10 +36,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::{agent_version, Config, ENV_INSTALL_ROOT};
+use crate::net::{self, Redirects, Timeouts};
 use crate::util::{opt_str, py_int, py_str, truthy, write_durable};
 use crate::JsonObject;
 
 const LOG: &str = "vesyl-print.update";
+
+/// `last_error` prefix written when the post-update health gate fails.
+const HEALTH_FAILED: &str = "health failed";
 
 /// Public key shipped with this build (rotated by shipping a new release).
 const BUNDLED_PUBLIC_KEY_PEM: &str = include_str!("../../../../keys/update_public.pem");
@@ -400,7 +404,21 @@ pub fn load_public_key_pem(
         return Ok(t.to_string());
     }
     if let Some(p) = path.filter(|p| p.is_file()) {
-        return fs::read_to_string(p).map_err(io_err("bad_public_key"));
+        let raw = fs::read(p).map_err(|e| {
+            UpdateError::new(
+                format!("cannot read update public key {}: {e}", p.display()),
+                "bad_public_key",
+            )
+        })?;
+        return String::from_utf8(raw).map_err(|_| {
+            UpdateError::new(
+                format!(
+                    "update public key {} is not a PEM file (DER or corrupt?)",
+                    p.display()
+                ),
+                "bad_public_key",
+            )
+        });
     }
     if !BUNDLED_PUBLIC_KEY_PEM.trim().is_empty() {
         return Ok(BUNDLED_PUBLIC_KEY_PEM.to_string());
@@ -466,24 +484,33 @@ pub fn verify_manifest(
     verify_ed25519(&pem, &manifest.canonical_bytes(), sig)
 }
 
-// --- download / install ----------------------------------------------------
-
-fn http_agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .user_agent("vesyl-print-agent")
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
-        .build()
-        .into()
+/// The key every apply path verifies manifests with, per config.
+///
+/// `Ok(None)` only when `update_require_signature` is off. When signatures
+/// are required, a configured key that cannot be read is an error: a broken
+/// key file must fail the update, never quietly turn verification off.
+pub fn manifest_public_key(cfg: &Config) -> Result<Option<String>, UpdateError> {
+    if !cfg.update_require_signature {
+        return Ok(None);
+    }
+    let key_path =
+        (!cfg.update_public_key_path.is_empty()).then(|| Path::new(&cfg.update_public_key_path));
+    load_public_key_pem(key_path, None).map(Some)
 }
 
+// --- download / install ----------------------------------------------------
+
 /// Open a URL for streaming. `file://` is supported for lab installs/tests.
-fn open_url(url: &str, timeout: Duration, what: &str) -> Result<Box<dyn Read + Send>, UpdateError> {
+///
+/// HTTP goes through [`net::agent`]: per-phase timeouts (a slow but steady
+/// download is not cut off at a fixed deadline, as with urllib), urllib's
+/// proxy rules, redirects followed, and no transparent decompression, so the
+/// SHA-256 always covers the bytes the server sent.
+fn open_url(
+    url: &str,
+    timeouts: Timeouts,
+    what: &str,
+) -> Result<Box<dyn Read + Send>, UpdateError> {
     if let Some(path) = url::Url::parse(url)
         .ok()
         .filter(|u| u.scheme() == "file")
@@ -493,13 +520,17 @@ fn open_url(url: &str, timeout: Duration, what: &str) -> Result<Box<dyn Read + S
             .map(|f| Box::new(f) as Box<dyn Read + Send>)
             .map_err(|e| UpdateError::new(format!("network error: {e}"), "download_failed"));
     }
-    let resp = http_agent(timeout)
+    let resp = net::agent(url, timeouts, Redirects::Follow)
         .get(url)
         .header("Accept", "*/*")
+        // What urllib sends: a CDN must not compress the tarball on the fly.
+        .header("Accept-Encoding", "identity")
         .call()
         .map_err(|e| UpdateError::new(format!("network error: {e}"), "download_failed"))?;
     let status = resp.status().as_u16();
-    if status >= 400 {
+    // urllib raises for anything it could not turn into a 2xx (incl. a 3xx
+    // without a usable Location).
+    if !(200..300).contains(&status) {
         return Err(UpdateError::new(
             format!("HTTP {status} {what}"),
             "download_failed",
@@ -510,7 +541,7 @@ fn open_url(url: &str, timeout: Duration, what: &str) -> Result<Box<dyn Read + S
 
 pub fn http_get_bytes(url: &str) -> Result<Vec<u8>, UpdateError> {
     let mut out = Vec::new();
-    open_url(url, Duration::from_secs(120), &format!("fetching {url}"))?
+    open_url(url, Timeouts::ARTIFACT, &format!("fetching {url}"))?
         .read_to_end(&mut out)
         .map_err(|e| UpdateError::new(format!("network error: {e}"), "download_failed"))?;
     Ok(out)
@@ -527,7 +558,7 @@ pub fn http_download_to_file(
     }
     let tmp = PathBuf::from(format!("{}.part", dest.display()));
     let result = (|| {
-        let mut reader = open_url(url, Duration::from_secs(300), "downloading artifact")?;
+        let mut reader = open_url(url, Timeouts::ARTIFACT, "downloading artifact")?;
         let mut out = File::create(&tmp).map_err(io_err("download_failed"))?;
         let mut h = Sha256::new();
         let mut buf = vec![0u8; 1024 * 1024];
@@ -1133,7 +1164,9 @@ pub fn process_pending_health(
                 st.target_version = Some(expected);
                 st.previous_version = None;
                 st.health_deadline_at = None;
-                st.last_error = Some(format!("health failed: {reason}; rolled back to {rolled}"));
+                st.last_error = Some(format!(
+                    "{HEALTH_FAILED}: {reason}; rolled back to {rolled}"
+                ));
                 if env.restart {
                     restart_services(env.apply_helper.as_deref());
                 }
@@ -1143,7 +1176,7 @@ pub fn process_pending_health(
                 log::error!(target: LOG, "auto-rollback failed: {}", e.message);
                 st.status = STATUS_FAILED.into();
                 st.last_error = Some(format!(
-                    "health failed: {reason}; rollback error: {}",
+                    "{HEALTH_FAILED}: {reason}; rollback error: {}",
                     e.message
                 ));
                 st
@@ -1154,10 +1187,61 @@ pub fn process_pending_health(
     st.status = STATUS_FAILED.into();
     st.health_deadline_at = None;
     st.last_error = Some(format!(
-        "health failed: {reason} (no previous slot to roll back to)"
+        "{HEALTH_FAILED}: {reason} (no previous slot to roll back to)"
     ));
     log::error!(target: LOG, "{}", st.last_error.as_deref().unwrap_or_default());
     st
+}
+
+/// Channel recorded in `update_status.json` (local-only; wms-api sends none).
+fn status_channel(cfg: &Config) -> String {
+    if cfg.update_channel.is_empty() {
+        "stable".to_string()
+    } else {
+        cfg.update_channel.clone()
+    }
+}
+
+/// The slot to roll back to if the activation about to happen fails its
+/// health gate: the version `current` points at now, else the running version
+/// (a lab install whose slot is not version-named). Call before activating.
+pub fn slot_before_activation(env: &UpdateEnv) -> Option<String> {
+    current_release_version(&env.install_root)
+        .or_else(|| Some(env.running_version.clone()).filter(|v| !v.is_empty()))
+}
+
+/// Arm the post-update health gate for `version` after an activation outside
+/// the heartbeat path (`update apply --file/--manifest-url --restart`): the
+/// restarted agent must reach the API, or it rolls back to `previous`.
+/// Writes `status_path` (call before restarting) and returns the status.
+pub fn arm_health_gate(
+    cfg: &Config,
+    status_path: &Path,
+    version: &str,
+    previous: Option<String>,
+) -> std::io::Result<UpdateStatus> {
+    let mut st = read_update_status(status_path).unwrap_or_default();
+    let previous = previous.filter(|p| !same_version(p, version));
+    mark_pending_health(
+        &mut st,
+        version,
+        previous,
+        health_gate_seconds(cfg),
+        Some(status_channel(cfg)),
+    );
+    write_update_status(status_path, &st)?;
+    Ok(st)
+}
+
+/// True when this status records that its target failed the health gate on
+/// this node (rolled back, or failed with no way to roll back).
+fn failed_health_gate(st: &UpdateStatus) -> bool {
+    st.is(STATUS_ROLLED_BACK)
+        || (st.is(STATUS_FAILED)
+            && st
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(HEALTH_FAILED)))
 }
 
 /// Inspect a heartbeat response and optionally apply an update.
@@ -1165,6 +1249,8 @@ pub fn process_pending_health(
 /// After a successful activate, status becomes `pending_health` (not idle);
 /// the new process must call [`process_pending_health`] after restart. When
 /// `jobs_busy`, download/install is deferred so slots never flip mid-print.
+/// A version that already failed its health gate here is not re-applied for
+/// the same desired version (see below).
 pub fn maybe_update_from_heartbeat(
     hb: &JsonObject,
     cfg: &Config,
@@ -1193,12 +1279,7 @@ pub fn maybe_update_from_heartbeat(
         .or_else(|| hb.get("desired_version").filter(|v| truthy(v)))
         .map(|v| py_str(v).trim().to_string());
     // Channel is local-only (not sent by wms-api); kept for status display.
-    let channel = if cfg.update_channel.is_empty() {
-        "stable".to_string()
-    } else {
-        cfg.update_channel.clone()
-    };
-    st.channel = Some(channel);
+    st.channel = Some(status_channel(cfg));
     let sticky = |st: &UpdateStatus| st.is(STATUS_FAILED) || st.is(STATUS_ROLLED_BACK);
 
     let Some(desired) = desired else {
@@ -1209,11 +1290,26 @@ pub fn maybe_update_from_heartbeat(
         return st;
     };
 
-    st.target_version = Some(desired.clone());
+    // The version this status is about, before it becomes `desired`.
+    let prev_target = st.target_version.replace(desired.clone());
     if same_version(&desired, &st.current_version) {
         if !sticky(&st) {
             st.status = STATUS_IDLE.into();
         }
+        return st;
+    }
+
+    // Re-applying a version that failed its health gate here would loop
+    // download → activate → restart → gate → rollback for as long as the
+    // server asks for it. Hold until the desired version changes; a manual
+    // `vesyl-print update apply` (which starts from a fresh status) still works.
+    if failed_health_gate(&st) && prev_target.is_some_and(|t| same_version(&t, &desired)) {
+        log::info!(
+            target: LOG,
+            "not re-applying {desired}: it failed its health gate on this node ({}); \
+             waiting for a different desired version or a manual update",
+            st.status
+        );
         return st;
     }
 
@@ -1227,7 +1323,18 @@ pub fn maybe_update_from_heartbeat(
 
     // Do not begin download/install while a job is mid-pipeline.
     if jobs_busy {
-        if !sticky(&st) && !st.is(STATUS_DOWNLOADING) && !st.is(STATUS_INSTALLING) {
+        if st.is(STATUS_DOWNLOADING) || st.is(STATUS_INSTALLING) {
+            // Only this function writes these, and it always moves on before
+            // returning, so here they are left over from a process killed
+            // mid-update. Keeping them would keep jobs paused, and the held
+            // jobs keep jobs_busy true: nothing would print again. `failed`
+            // releases the pause; the next idle heartbeat downloads afresh.
+            st.last_error = Some(format!(
+                "update interrupted while {} (agent restarted mid-update)",
+                st.status
+            ));
+            st.status = STATUS_FAILED.into();
+        } else if !sticky(&st) {
             st.status = STATUS_IDLE.into();
         }
         log::info!(target: LOG, "update deferred: jobs in flight ({} → {desired})", st.current_version);
@@ -1254,11 +1361,7 @@ pub fn maybe_update_from_heartbeat(
     };
 
     let root = &env.install_root;
-    // If running from a slot that isn't version-named, keep running version as prev.
-    let previous = current_release_version(root).or_else(|| {
-        let v = &env.running_version;
-        (!v.is_empty() && !same_version(v, &desired)).then(|| v.clone())
-    });
+    let previous = slot_before_activation(env);
 
     let persist = |st: &UpdateStatus| {
         if let Some(p) = status_path {
@@ -1272,30 +1375,21 @@ pub fn maybe_update_from_heartbeat(
         st.status = STATUS_DOWNLOADING.into();
         // Persist early so the LCD can show "Updating…" during the download.
         persist(&st);
+        // With signatures required, an unreadable key fails here (closed).
+        let pem = manifest_public_key(cfg)?;
         log::info!(target: LOG, "applying update {desired} from {manifest_url}");
         let manifest = fetch_manifest(&manifest_url)?;
         if !same_version(&manifest.version, &desired) {
             log::info!(target: LOG, "manifest version {} (desired {desired})", manifest.version);
         }
-        let pem = if !cfg.update_public_key_path.is_empty() {
-            Some(load_public_key_pem(
-                Some(Path::new(&cfg.update_public_key_path)),
-                None,
-            )?)
-        } else {
-            load_public_key_pem(None, None).ok()
-        };
         st.status = STATUS_INSTALLING.into();
         // Persist installing so a crash mid-apply is visible.
         persist(&st);
 
-        apply_release(
-            &manifest,
-            env,
-            pem.as_deref(),
-            cfg.update_require_signature && pem.is_some(),
-        )?;
-        let prev = previous.clone().filter(|p| *p != manifest.version);
+        apply_release(&manifest, env, pem.as_deref(), cfg.update_require_signature)?;
+        let prev = previous
+            .clone()
+            .filter(|p| !same_version(p, &manifest.version));
         let channel = st.channel.clone();
         mark_pending_health(
             &mut st,
@@ -1330,7 +1424,9 @@ pub fn maybe_update_from_heartbeat(
         if let (Some(t), Some(cur)) = (target, current_release_version(root)) {
             if same_version(&cur, &t) && e.code == "activate_failed" {
                 log::warn!(target: LOG, "error after activate of {t} (keeping pending_health): {}", e.message);
-                let (prev, channel) = (st.previous_version.clone(), st.channel.clone());
+                // Roll back to the slot we left, not a stale previous_version.
+                let prev = previous.clone().filter(|p| !same_version(p, &t));
+                let channel = st.channel.clone();
                 mark_pending_health(&mut st, &t, prev, health_gate_seconds(cfg), channel);
                 persist(&st);
                 return st;
@@ -1346,7 +1442,32 @@ pub fn maybe_update_from_heartbeat(
 pub fn write_update_status(path: &Path, status: &UpdateStatus) -> std::io::Result<()> {
     let mut raw = serde_json::to_string_pretty(&status.to_dict()).map_err(std::io::Error::other)?;
     raw.push('\n');
-    write_durable(path, raw.as_bytes(), 0o644, false)
+    write_durable(path, raw.as_bytes(), 0o644, false)?;
+    give_to_dir_owner(path);
+    Ok(())
+}
+
+/// The CLI often runs as root while the agent runs as the service user that
+/// owns the state dir. A root-owned status file cannot be rewritten in place
+/// by a rolled-back Python agent, which would leave `pending_health` (and the
+/// job pause) stuck, so hand the file to the directory's owner.
+fn give_to_dir_owner(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let Some(dir_meta) = path.parent().and_then(|d| fs::metadata(d).ok()) else {
+        return;
+    };
+    if dir_meta.uid() == 0 {
+        return;
+    }
+    // lchown: the directory's owner could swap in a symlink after the rename,
+    // and root must never chown whatever such a link points at.
+    if let Err(e) = std::os::unix::fs::lchown(path, Some(dir_meta.uid()), Some(dir_meta.gid())) {
+        log::warn!(target: LOG, "chown {}: {e}", path.display());
+    }
 }
 
 pub fn read_update_status(path: &Path) -> Option<UpdateStatus> {
@@ -2013,5 +2134,446 @@ mod tests {
         write_update_status(&path, &st).unwrap();
         assert!(should_pause_jobs_from_path(&path));
         assert_eq!(read_update_status(&path).unwrap(), st);
+    }
+
+    // --- OTA decisions (C11 / C12 / C15) --------------------------------------
+
+    /// Unsigned `file://` manifest (and its tarball) for `version`.
+    fn local_manifest(td: &Path, version: &str) -> String {
+        let tarball = build_release(&td.join(format!("rel-{version}")), version);
+        let manifest = td.join(format!("m-{version}.json"));
+        fs::write(
+            &manifest,
+            json!({
+                "version": version,
+                "artifact_url": url::Url::from_file_path(&tarball).unwrap().to_string(),
+                "artifact_sha256": sha256_file(&tarball).unwrap(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        url::Url::from_file_path(&manifest).unwrap().to_string()
+    }
+
+    fn desire(td: &Path, version: &str) -> JsonObject {
+        obj(json!({
+            "desired_agent_version": version,
+            "update_url": local_manifest(td, version),
+        }))
+    }
+
+    fn unsigned_ok(td: &Path) -> Config {
+        Config {
+            update_require_signature: false,
+            ..cfg(td)
+        }
+    }
+
+    #[test]
+    fn rolled_back_version_is_not_reapplied() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let rolled = UpdateStatus {
+            status: STATUS_ROLLED_BACK.into(),
+            current_version: "0.4.0".into(),
+            target_version: Some("0.5.0".into()),
+            last_error: Some("health failed: timeout; rolled back to 0.4.0".into()),
+            ..Default::default()
+        };
+        let hb = desire(td.path(), "0.5.0");
+        for _ in 0..2 {
+            let st = maybe_update_from_heartbeat(
+                &hb,
+                &c,
+                &env(&root),
+                Some(rolled.clone()),
+                None,
+                false,
+            );
+            assert_eq!(st.status, STATUS_ROLLED_BACK);
+            assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
+            assert_eq!(st.last_error, rolled.last_error);
+            assert_eq!(current_name(&root), "0.4.0");
+            assert!(!root.join("releases/0.5.0").exists(), "re-downloaded 0.5.0");
+        }
+
+        // A different desired version is applied as usual.
+        let st = maybe_update_from_heartbeat(
+            &desire(td.path(), "0.5.1"),
+            &c,
+            &env(&root),
+            Some(rolled),
+            None,
+            false,
+        );
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(st.previous_version.as_deref(), Some("0.4.0"));
+        assert_eq!(current_name(&root), "0.5.1");
+    }
+
+    #[test]
+    fn gate_rollback_is_not_followed_by_a_reinstall() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        // 0.4.0 never reached the API: the gate rolls back to 0.3.0 ...
+        let out = process_pending_health(
+            pending("2000-01-01T00:00:00+00:00".into()),
+            &c,
+            &env(&root),
+            WhoamiResult::Error,
+            Some("timeout"),
+            None,
+        );
+        assert_eq!(out.status, STATUS_ROLLED_BACK);
+        assert_eq!(current_name(&root), "0.3.0");
+        // ... and the restarted 0.3.0 agent keeps hearing desired 0.4.0.
+        let old = UpdateEnv {
+            running_version: "0.3.0".into(),
+            ..env(&root)
+        };
+        let st = maybe_update_from_heartbeat(
+            &desire(td.path(), "0.4.0"),
+            &c,
+            &old,
+            Some(out),
+            None,
+            false,
+        );
+        assert_eq!(st.status, STATUS_ROLLED_BACK);
+        assert_eq!(current_name(&root), "0.3.0");
+    }
+
+    #[test]
+    fn only_health_gate_failures_block_a_retry() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let hb = desire(td.path(), "0.5.0");
+        let failed = |err: &str| UpdateStatus {
+            status: STATUS_FAILED.into(),
+            current_version: "0.4.0".into(),
+            target_version: Some("0.5.0".into()),
+            last_error: Some(err.into()),
+            ..Default::default()
+        };
+        // Gate failed with nothing to roll back to: hold.
+        let held = failed("health failed: timeout (no previous slot to roll back to)");
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), Some(held), None, false);
+        assert_eq!(st.status, STATUS_FAILED);
+        assert_eq!(current_name(&root), "0.4.0");
+        // A download error is transient: retried.
+        let st = maybe_update_from_heartbeat(
+            &hb,
+            &c,
+            &env(&root),
+            Some(failed("network error: Connection refused")),
+            None,
+            false,
+        );
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(current_name(&root), "0.5.0");
+    }
+
+    #[test]
+    fn stale_download_status_is_released_while_jobs_busy() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let hb = desire(td.path(), "0.5.0");
+        let path = td.path().join("update_status.json");
+        for stale in [STATUS_DOWNLOADING, STATUS_INSTALLING] {
+            // Left behind by a process killed mid-update.
+            let st = UpdateStatus {
+                status: stale.into(),
+                current_version: "0.4.0".into(),
+                target_version: Some("0.5.0".into()),
+                ..Default::default()
+            };
+            write_update_status(&path, &st).unwrap();
+            assert!(should_pause_jobs_from_path(&path));
+            // Held push jobs make jobs_busy true; that must not keep the pause.
+            let st = maybe_update_from_heartbeat(
+                &hb,
+                &c,
+                &env(&root),
+                read_update_status(&path),
+                Some(&path),
+                true,
+            );
+            write_update_status(&path, &st).unwrap();
+            assert_eq!(st.status, STATUS_FAILED, "{stale}");
+            assert_eq!(
+                st.last_error.as_deref(),
+                Some(
+                    format!("update interrupted while {stale} (agent restarted mid-update)")
+                        .as_str()
+                )
+            );
+            assert!(!should_pause_jobs_from_path(&path), "{stale}");
+            assert_eq!(current_name(&root), "0.4.0");
+        }
+        // Once the held jobs have printed, the next heartbeat downloads afresh.
+        let st = maybe_update_from_heartbeat(
+            &hb,
+            &c,
+            &env(&root),
+            read_update_status(&path),
+            Some(&path),
+            false,
+        );
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(current_name(&root), "0.5.0");
+    }
+
+    #[test]
+    fn unreadable_configured_key_fails_closed() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let der = td.path().join("update_public.der");
+        fs::write(
+            &der,
+            [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0xff],
+        )
+        .unwrap();
+        let c = Config {
+            update_public_key_path: der.display().to_string(),
+            ..cfg(td.path())
+        };
+        assert!(c.update_require_signature);
+        let hb = desire(td.path(), "0.5.0");
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, None, false);
+        assert_eq!(st.status, STATUS_FAILED);
+        assert!(
+            st.last_error
+                .as_deref()
+                .unwrap()
+                .contains("is not a PEM file"),
+            "{:?}",
+            st.last_error
+        );
+        assert_eq!(current_name(&root), "0.4.0");
+
+        // Only signatures disabled in config skip verification (and the key).
+        let lab = Config {
+            update_require_signature: false,
+            ..c
+        };
+        let st = maybe_update_from_heartbeat(&hb, &lab, &env(&root), None, None, false);
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+    }
+
+    #[test]
+    fn manifest_key_follows_config() {
+        let td = tempfile::tempdir().unwrap();
+        let on = cfg(td.path());
+        assert_eq!(
+            manifest_public_key(&on).unwrap().as_deref(),
+            Some(BUNDLED_PUBLIC_KEY_PEM)
+        );
+        let off = Config {
+            update_require_signature: false,
+            update_public_key_path: "/nonexistent/key.pem".into(),
+            ..cfg(td.path())
+        };
+        assert_eq!(manifest_public_key(&off).unwrap(), None);
+        // A configured path that does not exist falls back to the bundled key
+        // (Python does the same): verification still happens.
+        let missing = Config {
+            update_public_key_path: td.path().join("nope.pem").display().to_string(),
+            ..cfg(td.path())
+        };
+        assert_eq!(
+            manifest_public_key(&missing).unwrap().as_deref(),
+            Some(BUNDLED_PUBLIC_KEY_PEM)
+        );
+        // One that exists but cannot be read is an error.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            let locked = td.path().join("locked.pem");
+            fs::write(&locked, BUNDLED_PUBLIC_KEY_PEM).unwrap();
+            crate::util::set_mode(&locked, 0o000).unwrap();
+            let err = manifest_public_key(&Config {
+                update_public_key_path: locked.display().to_string(),
+                ..cfg(td.path())
+            })
+            .unwrap_err();
+            assert_eq!(err.code, "bad_public_key");
+            assert!(
+                err.message.starts_with("cannot read update public key"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_key_verifies_heartbeat_update() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let pem_path = td.path().join("lab_public.pem");
+        fs::write(
+            &pem_path,
+            key.verifying_key()
+                .to_public_key_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+                .unwrap(),
+        )
+        .unwrap();
+        let c = Config {
+            update_public_key_path: pem_path.display().to_string(),
+            ..cfg(td.path())
+        };
+        // Unsigned → refused.
+        let hb = desire(td.path(), "0.5.0");
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, None, false);
+        assert_eq!(st.last_error.as_deref(), Some("manifest missing signature"));
+        // Signed with the configured key → installed.
+        let manifest_path = url::Url::parse(hb["update_url"].as_str().unwrap())
+            .unwrap()
+            .to_file_path()
+            .unwrap();
+        let mut m = ReleaseManifest::from_dict(
+            serde_json::from_str::<Value>(&fs::read_to_string(&manifest_path).unwrap())
+                .unwrap()
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        let sig = base64::engine::general_purpose::STANDARD
+            .encode(key.sign(&m.canonical_bytes()).to_bytes());
+        m.raw.insert("signature".into(), sig.into());
+        fs::write(&manifest_path, Value::Object(m.raw).to_string()).unwrap();
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, None, false);
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(current_name(&root), "0.5.0");
+    }
+
+    #[test]
+    fn arm_health_gate_writes_pending_health() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("update_status.json");
+        let st = arm_health_gate(&cfg(td.path()), &path, "0.5.0", Some("0.4.0".into())).unwrap();
+        assert_eq!(read_update_status(&path).unwrap(), st);
+        assert_eq!(st.status, STATUS_PENDING_HEALTH);
+        assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
+        assert_eq!(st.previous_version.as_deref(), Some("0.4.0"));
+        assert_eq!(st.channel.as_deref(), Some("stable"));
+        assert!(st.health_deadline_at.is_some());
+        // Reinstalling the same version leaves nothing to roll back to.
+        let st = arm_health_gate(&cfg(td.path()), &path, "0.5.0", Some("0.5.0".into())).unwrap();
+        assert!(st.previous_version.is_none());
+    }
+
+    #[test]
+    fn slot_before_activation_prefers_current() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        assert_eq!(
+            slot_before_activation(&env(&root)).as_deref(),
+            Some("0.4.0")
+        );
+        let lab = UpdateEnv {
+            running_version: "0.3.9".into(),
+            ..env(&td.path().join("empty"))
+        };
+        assert_eq!(slot_before_activation(&lab).as_deref(), Some("0.3.9"));
+    }
+
+    // --- artifact transport (C31) ----------------------------------------------
+
+    use crate::cloud::http_stub::{self, respond};
+
+    #[test]
+    fn gzip_encoded_artifact_is_hashed_as_sent() {
+        let td = tempfile::tempdir().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(b"tarball bytes").unwrap();
+        let wire = gz.finish().unwrap();
+        let sha = hex(&Sha256::digest(&wire));
+        let served = wire.clone();
+        // A CDN that labels .tar.gz objects with Content-Encoding: gzip.
+        let srv =
+            http_stub::serve(move |_, s| respond(s, 200, &[("Content-Encoding", "gzip")], &served));
+        let dest = td.path().join("a.tar.gz");
+        http_download_to_file(&format!("{}/a.tar.gz", srv.base_url), &dest, &sha).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), wire);
+        assert_eq!(
+            srv.requests()[0].header("Accept-Encoding"),
+            Some("identity")
+        );
+    }
+
+    #[test]
+    fn artifact_redirects_are_followed_and_errors_reported() {
+        let td = tempfile::tempdir().unwrap();
+        let srv = http_stub::serve(|req, s| match req.path.as_str() {
+            "/download/a.tar.gz" => respond(s, 302, &[("Location", "/objects/a.tar.gz")], b""),
+            "/objects/a.tar.gz" => respond(s, 200, &[], b"hello-ota"),
+            "/nolocation" => respond(s, 302, &[], b""),
+            _ => respond(s, 404, &[], b""),
+        });
+        let sha = hex(&Sha256::digest(b"hello-ota"));
+        let dest = td.path().join("a.tar.gz");
+        http_download_to_file(&format!("{}/download/a.tar.gz", srv.base_url), &dest, &sha).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"hello-ota");
+
+        let err =
+            http_download_to_file(&format!("{}/missing", srv.base_url), &dest, &sha).unwrap_err();
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            ("download_failed", "HTTP 404 downloading artifact")
+        );
+        let err = http_download_to_file(&format!("{}/nolocation", srv.base_url), &dest, &sha)
+            .unwrap_err();
+        assert_eq!(err.code, "download_failed");
+        assert!(!td.path().join("a.tar.gz.part").exists());
+    }
+
+    #[test]
+    fn slow_download_is_not_cut_off_at_a_fixed_deadline() {
+        // 2.5 s of body with 1 s connect/response timeouts: urllib's timeout is
+        // per socket operation, so the Python agent finishes this download.
+        let body: Vec<u8> = (0..40u8).collect();
+        let served = body.clone();
+        let srv = http_stub::serve(move |_, s| {
+            http_stub::trickle(s, &served, 10, Duration::from_millis(250))
+        });
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(1),
+            response: Duration::from_secs(1),
+            body: Duration::from_secs(30),
+        };
+        let mut got = Vec::new();
+        open_url(
+            &format!("{}/a.tar.gz", srv.base_url),
+            timeouts,
+            "downloading artifact",
+        )
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn stalled_download_fails() {
+        let srv = http_stub::serve(|_, s| {
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc");
+            let _ = s.flush();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(1),
+            response: Duration::from_secs(1),
+            body: Duration::from_millis(500),
+        };
+        let started = std::time::Instant::now();
+        let mut got = Vec::new();
+        let result = open_url(&srv.base_url, timeouts, "downloading artifact")
+            .unwrap()
+            .read_to_end(&mut got);
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }
