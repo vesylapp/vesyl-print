@@ -4679,4 +4679,62 @@ Zebra-48                ben            1024   Wed 08 Oct 2026 01:03:00 AM CDT
         };
         assert!(query_cups(&only_active, &keys[2..]).unwrap().is_empty());
     }
+
+    /// J3: a job `lp` already took is finished from where `lpstat` finds it
+    /// ([`Pipeline::resume`]), never printed again. Still not completed:
+    /// active, and the history is not read. In the history: printed, or
+    /// failed when canceled or aborted. In neither listing: forgotten, which
+    /// leaves it delivered (read as printed, it would claim a label no one
+    /// saw). CUPS down at either query: an error, never a state.
+    #[test]
+    fn lookup_cups_job_reads_where_cups_has_the_job() {
+        let calls: LpstatCalls = Arc::default();
+        let c = calls.clone();
+        let lpstat = move |args: &[&str]| {
+            c.lock().unwrap().push(args.join(" "));
+            ok(if args[1] == "not-completed" {
+                "Zebra-44                ben            1024   Wed 08 Oct 2026 01:04:00 AM CDT\n"
+            } else {
+                COMPLETED
+            })
+        };
+        let lookup = |key: &str| {
+            calls.lock().unwrap().clear();
+            let state = lookup_cups_job(&lpstat, key);
+            (state, calls.lock().unwrap().clone())
+        };
+
+        let (state, asked) = lookup("Zebra-44");
+        assert_eq!(state, Ok(CupsJobState::Active));
+        assert_eq!(asked, ["-W not-completed"]);
+        for (key, expected, why) in [
+            ("Zebra-43", CupsJobState::Printed, "completed successfully"),
+            ("Zebra-42", CupsJobState::Failed, "canceled by user"),
+            ("Zebra-40", CupsJobState::Failed, "aborted by system"),
+            ("Zebra-39", CupsJobState::Forgotten, "not in the history"),
+            ("Zebra-4", CupsJobState::Forgotten, "prefix of listed ids"),
+        ] {
+            let (state, asked) = lookup(key);
+            assert_eq!(state, Ok(expected), "{key}: {why}");
+            assert_eq!(asked, ["-W not-completed", "-W completed -l"], "{key}");
+        }
+
+        let down = lookup_cups_job(&|_: &[&str]| scheduler_down(), "Zebra-43").unwrap_err();
+        assert!(
+            down.contains("not-completed failed: lpstat: Scheduler is not running"),
+            "{down}"
+        );
+        let history_down = |args: &[&str]| {
+            if args[1] == "not-completed" {
+                ok("")
+            } else {
+                scheduler_down()
+            }
+        };
+        let down = lookup_cups_job(&history_down, "Zebra-43").unwrap_err();
+        assert!(
+            down.contains("completed -l failed: lpstat: Scheduler is not running"),
+            "{down}"
+        );
+    }
 }
