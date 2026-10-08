@@ -1,17 +1,32 @@
-"""Agent ↔ LCD status file (JSON under state_dir)."""
+"""Agent → LCD status files (JSON under state_dir, written by the Rust agent).
+
+- ``status.json``: pairing, cloud and identity (:func:`read_status`).
+- ``printers.json``: the agent's printer inventory, rewritten about every
+  15 s while it runs (:func:`read_printers`)::
+
+      {"updated_at": "<utc iso>",
+       "printers": [{"cups_name", "uri", "display_name", "status",
+                     "status_reasons", "status_message", "supports_raw"}, ...]}
+
+  A snapshot older than :data:`PRINTERS_STALE_AFTER_S` (120 s, by its
+  ``updated_at``, or the file mtime when that is missing or unparseable)
+  means the agent stopped refreshing it: the printers are still listed, but
+  every ``status`` reads ``"unknown"`` (no ``status_message``), so the LCD
+  never shows a stale "idle".
+"""
 
 from __future__ import annotations
 
 import json
-import os
-import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 PairingState = Literal["unpaired", "paired", "revoked"]
 CloudState = Literal["unknown", "online", "offline"]
+
+PRINTERS_STALE_AFTER_S = 120.0
 
 
 @dataclass
@@ -26,40 +41,6 @@ class AgentStatus:
     last_error: str | None = None
     agent_version: str | None = None
     updated_at: str | None = None
-    extra: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)
-        extra = d.pop("extra", {}) or {}
-        d.update(extra)
-        return d
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def write_status(path: Path, status: AgentStatus) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    status.updated_at = _utc_now_iso()
-    raw = json.dumps(status.to_dict(), indent=2) + "\n"
-    # Atomic write so LCD never reads a partial file.
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=".status.", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(raw)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
 
 
 def read_status(path: Path) -> AgentStatus | None:
@@ -90,3 +71,80 @@ def read_status(path: Path) -> AgentStatus | None:
         agent_version=data.get("agent_version"),
         updated_at=data.get("updated_at"),
     )
+
+
+@dataclass
+class PrintersSnapshot:
+    """``printers.json`` as the display uses it (statuses already blanked when stale)."""
+
+    printers: list[dict[str, Any]] = field(default_factory=list)
+    updated_at: str | None = None
+    stale: bool = False
+
+
+def _parse_utc(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        ts = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def load_printers(
+    path: Path,
+    *,
+    now: datetime | None = None,
+    stale_after_s: float = PRINTERS_STALE_AFTER_S,
+) -> PrintersSnapshot:
+    """Read ``printers.json``. Raises ``OSError`` / ``ValueError`` when it is
+    missing, unreadable or not ``{"printers": [...]}``."""
+    path = Path(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("printers"), list):
+        raise ValueError(f"{path}: expected an object with a printers list")
+    items = [dict(p) for p in data["printers"] if isinstance(p, dict)]
+
+    now_dt = now or datetime.now(timezone.utc)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    updated = _parse_utc(data.get("updated_at"))
+    age: float | None
+    if updated is not None:
+        age = (now_dt - updated).total_seconds()
+    else:
+        try:
+            age = now_dt.timestamp() - path.stat().st_mtime
+        except OSError:
+            age = None
+    stale = age is None or age > stale_after_s
+    if stale:
+        items = [
+            {**p, "status": "unknown", "status_message": None, "status_reasons": []}
+            for p in items
+        ]
+    raw_updated = data.get("updated_at")
+    return PrintersSnapshot(
+        printers=items,
+        updated_at=raw_updated if isinstance(raw_updated, str) else None,
+        stale=stale,
+    )
+
+
+def read_printers(
+    path: Path,
+    *,
+    now: datetime | None = None,
+    stale_after_s: float = PRINTERS_STALE_AFTER_S,
+) -> PrintersSnapshot | None:
+    """:func:`load_printers`, or ``None`` when the file is missing or unreadable."""
+    try:
+        return load_printers(path, now=now, stale_after_s=stale_after_s)
+    except (OSError, ValueError):
+        return None

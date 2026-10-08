@@ -1,7 +1,9 @@
-# Optional but required for Phase D ActionCable push (PrintNodeChannel).
-# Pull-path jobs work without it. Debian: apt install python3-websocket
-websocket-client>=1.6.0
+# Python packages for the LCD display stack (main.py, stream_lcd.py,
+# wifi_setup.py, framebuffer.py). The agent and CLI are the Rust binary
+# (vesyl-print) and need nothing from here.
+# On the Pi these come from apt (setup.sh): python3-pil python3-numpy python3-segno
+Pillow>=9.4
+numpy>=1.24
 
-# Required for OTA Ed25519 signature verification.
-# Debian: apt install python3-cryptography
-cryptography>=41.0.0
+# Optional: Wi-Fi setup QR code on the LCD (text fallback without it).
+segno>=1.5

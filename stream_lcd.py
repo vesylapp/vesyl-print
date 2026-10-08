@@ -45,6 +45,7 @@ DEFAULT_SCALE = 1.0
 DEFAULT_QUALITY = 80
 _STATS_CACHE_S = 2.0
 _CLAIM_CODE_LEN = 8
+_CLAIM_TIMEOUT_S = 60.0
 _BASE_DIR = Path(__file__).resolve().parent
 _ASSETS_DIR = _BASE_DIR / "assets"
 
@@ -916,10 +917,16 @@ def run_test_print(
     fmt: str,
     *,
     inventory: list[dict[str, Any]] | None = None,
-    submit: Callable[..., str] | None = None,
+    submit: Callable[[str, str], str] | None = None,
+    printers_path: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Send the Road Runner sample label to a configured CUPS queue."""
-    from display_status import test_print_formats
+    """Send the Road Runner sample label to a configured CUPS queue.
+
+    The queue and its formats come from the agent's printers.json (stale
+    snapshots still name the queues); the print runs ``vesyl-print
+    test-print`` through :func:`display_status.submit_test_print`.
+    """
+    from display_status import submit_test_print, test_print_formats
 
     cups = (cups_name or "").strip()
     kind = (fmt or "pdf").strip().lower()
@@ -930,11 +937,15 @@ def run_test_print(
 
     items = inventory
     if items is None:
-        try:
-            import printers
+        import statusio
 
-            items = list(printers.inventory_payload())
-        except Exception as e:
+        try:
+            if printers_path is None:
+                from config import load_config
+
+                printers_path = load_config().printers_path
+            items = statusio.load_printers(Path(printers_path)).printers
+        except (OSError, ValueError) as e:
             raise TestPrintError(
                 f"printer inventory unavailable: {e}", status=503
             ) from e
@@ -958,11 +969,9 @@ def run_test_print(
         )
 
     if submit is None:
-        from test_label import submit_test_label
-
-        submit = submit_test_label
+        submit = submit_test_print
     try:
-        result = submit(queue, kind, wait_cups=False)
+        result = submit(queue, kind)
     except TestPrintError:
         raise
     except Exception as e:
@@ -984,17 +993,20 @@ def claim_device(
     name: str | None = None,
     cfg: Any = None,
 ) -> dict[str, Any]:
-    """Pair this node with an 8-char claim code. Never returns device_token."""
-    import auth
+    """Pair this node with an 8-char claim code. Never returns device_token.
+
+    Validates the code and refuses an already-paired node here, then runs
+    ``vesyl-print claim CODE [--name NAME] --json``, which calls the cloud and
+    writes credentials.json and status.json.
+    """
+    import os
+
     import statusio
-    import sysinfo
-    from cloud import CloudClient, CloudError
-    from config import AGENT_VERSION, default_platform, load_config, write_default_config
+    from config import ENV_CONFIG_DIR, ENV_STATE_DIR, load_config
+    from display_status import cli_option, run_vesyl_print
 
     if cfg is None:
         cfg = load_config()
-    cfg.ensure_dirs()
-    write_default_config(cfg.config_path)
 
     clean = normalize_claim_code(code)
     if len(clean) != _CLAIM_CODE_LEN:
@@ -1005,53 +1017,43 @@ def claim_device(
         )
 
     # Refuse if already paired with local credentials.
-    if auth.load_credentials(cfg.credentials_path) is not None:
+    if Path(cfg.credentials_path).is_file():
         st = statusio.read_status(cfg.status_path)
         if st and st.pairing == "paired":
             raise ClaimError("This node is already claimed", status=409)
 
-    client = CloudClient(cfg.api_base_url)
-    try:
-        data = client.claim(
-            clean,
-            hostname=sysinfo.hostname(),
-            agent_version=AGENT_VERSION,
-            platform=default_platform(),
-            name=(name.strip() if name else None) or None,
-        )
-    except CloudError as e:
-        raise ClaimError(e.message or "Claim failed", status=e.status or 502) from e
+    args = ["claim", clean]
+    clean_name = (name.strip() if name else None) or None
+    if clean_name:
+        args += cli_option("--name", clean_name)
+    args.append("--json")
+    # Pin the CLI to the directories checked above.
+    env = dict(os.environ)
+    env[ENV_CONFIG_DIR] = str(cfg.config_dir)
+    env[ENV_STATE_DIR] = str(cfg.state_dir)
+    out = run_vesyl_print(args, timeout=_CLAIM_TIMEOUT_S, env=env)
+    if out.get("ok") is not True:
+        try:
+            status = int(out.get("status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        # A failed claim never answers with a success status.
+        if not 400 <= status <= 599:
+            status = 502
+        raise ClaimError(str(out.get("error") or "") or "Claim failed", status=status)
 
-    token = data.get("device_token")
-    if not token:
-        raise ClaimError("Claim response missing device_token", status=502)
-
-    creds = auth.credentials_from_pair_response(data)
-    auth.save_credentials(cfg.credentials_path, creds)
-    statusio.write_status(
-        cfg.status_path,
-        statusio.AgentStatus(
-            pairing="paired",
-            cloud="offline",
-            node_id=creds.node_id,
-            name=creds.name,
-            organization_name=creds.organization_name,
-            warehouse_name=creds.warehouse_label(),
-            agent_version=AGENT_VERSION,
-        ),
-    )
     log.info(
         "stream claim ok node_id=%s org=%s warehouse=%s",
-        creds.node_id,
-        creds.organization_name,
-        creds.warehouse_label(),
+        out.get("node_id"),
+        out.get("organization_name"),
+        out.get("warehouse_name"),
     )
     return {
         "ok": True,
-        "node_id": creds.node_id,
-        "name": creds.name,
-        "organization_name": creds.organization_name,
-        "warehouse_name": creds.warehouse_label(),
+        "node_id": out.get("node_id"),
+        "name": out.get("name"),
+        "organization_name": out.get("organization_name"),
+        "warehouse_name": out.get("warehouse_name"),
     }
 
 
@@ -1066,14 +1068,22 @@ def collect_stats(
     state_dir: Path | str | None = None,
     api_base_url: str | None = None,
     include_printers: bool = True,
+    printers_path: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Gather pairing / system / print / OTA snapshot for the stream page."""
+    """Gather pairing / system / print / OTA snapshot for the stream page.
+
+    Printers come from the agent's printers.json (``printers_path``, default
+    ``state_dir/printers.json``); a missing or unreadable file lists none.
+    """
     # Lazy imports keep standalone stream import light when modules fail.
     import statusio
     import sysinfo
-    import update as update_mod
     from config import AGENT_VERSION, default_platform
-    from display_status import format_agent_version, heartbeat_age_label
+    from display_status import (
+        format_agent_version,
+        heartbeat_age_label,
+        read_update_status,
+    )
 
     st = None
     if status_path:
@@ -1119,11 +1129,11 @@ def collect_stats(
     }
 
     printers_list: list[dict[str, Any]] = []
-    if include_printers:
+    if printers_path is None and state_dir:
+        printers_path = Path(state_dir) / "printers.json"
+    if include_printers and printers_path:
         try:
-            import printers
-
-            for item in printers.inventory_payload():
+            for item in statusio.load_printers(Path(printers_path)).printers:
                 cups = item.get("cups_name")
                 formats = _printer_test_formats(item)
                 printers_list.append(
@@ -1146,7 +1156,7 @@ def collect_stats(
 
     ust = None
     if update_status_path:
-        ust = update_mod.read_update_status(Path(update_status_path))
+        ust = read_update_status(Path(update_status_path))
     update_info: dict[str, Any] = {
         "status": ust.status if ust else "idle",
         "current_version": (
@@ -1546,6 +1556,7 @@ def _default_stats_collector() -> Callable[[], dict[str, Any]]:
             config_dir=cfg.config_dir,
             state_dir=cfg.state_dir,
             api_base_url=cfg.api_base_url,
+            printers_path=cfg.printers_path,
         )
 
     return _collect
