@@ -70,32 +70,46 @@ impl WaitCups {
     }
 }
 
-fn env_var(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.is_empty())
+/// One environment variable, `None` when unset (`Some("")` when set but
+/// empty). Everything here reads the environment through such a function,
+/// so tests can inject one.
+fn real_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
 }
 
-fn home_dir() -> PathBuf {
-    env_var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+/// `key` when it is set to something other than "": Python's
+/// `os.environ.get(key)` in a truth test, how the LCD's config.py reads
+/// every variable but HOME.
+fn set_var(env: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> {
+    env(key).filter(|v| !v.is_empty())
+}
+
+/// The home directory config.py gets from `Path.home()`, so the agent and
+/// the LCD agree on the user dirs: HOME when set ("" meaning `/`), else the
+/// account's passwd entry; `/` when neither is known (where Python fails).
+fn home_dir(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    crate::util::home_dir(env).unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn user_config_dir(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
-    match env("XDG_CONFIG_HOME") {
+    match set_var(env, "XDG_CONFIG_HOME") {
         Some(xdg) => PathBuf::from(xdg).join("vesyl-print"),
-        None => home_dir().join(".config").join("vesyl-print"),
+        None => home_dir(env).join(".config").join("vesyl-print"),
     }
 }
 
 fn user_state_dir(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
-    match env("XDG_STATE_HOME").or_else(|| env("XDG_DATA_HOME")) {
+    match set_var(env, "XDG_STATE_HOME").or_else(|| set_var(env, "XDG_DATA_HOME")) {
         Some(xdg) => PathBuf::from(xdg).join("vesyl-print"),
-        None => home_dir().join(".local").join("share").join("vesyl-print"),
+        None => home_dir(env)
+            .join(".local")
+            .join("share")
+            .join("vesyl-print"),
     }
 }
 
 fn resolve_config_dir_with(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
-    if let Some(dir) = env(ENV_CONFIG_DIR) {
+    if let Some(dir) = set_var(env, ENV_CONFIG_DIR) {
         return PathBuf::from(dir);
     }
     let system = Path::new("/etc/vesyl-print");
@@ -106,7 +120,7 @@ fn resolve_config_dir_with(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
 }
 
 fn resolve_state_dir_with(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
-    if let Some(dir) = env(ENV_STATE_DIR) {
+    if let Some(dir) = set_var(env, ENV_STATE_DIR) {
         return PathBuf::from(dir);
     }
     let system = Path::new("/var/lib/vesyl-print");
@@ -117,11 +131,17 @@ fn resolve_state_dir_with(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
 }
 
 pub fn resolve_config_dir() -> PathBuf {
-    resolve_config_dir_with(&env_var)
+    resolve_config_dir_with(&real_env)
 }
 
 pub fn resolve_state_dir() -> PathBuf {
-    resolve_state_dir_with(&env_var)
+    resolve_state_dir_with(&real_env)
+}
+
+/// `e` with `path` in front, so the error says which directory or file it
+/// is about (not just "Permission denied (os error 13)").
+fn at_path(path: &Path) -> impl Fn(std::io::Error) -> std::io::Error + '_ {
+    move |e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
 }
 
 /// Guess ActionCable URL from REST base (used when cable_url omitted).
@@ -227,12 +247,19 @@ impl Config {
     /// Create config/state dirs used by agent and CLI. Root (an operator
     /// running the CLI) makes them the closest existing directory owner's,
     /// so a `sudo vesyl-print …` on a fresh device leaves them to the
-    /// service user that owns the trees `setup.sh` made.
+    /// service user that owns the trees `setup.sh` made (and never follows
+    /// a symlink that user could have planted: see
+    /// [`create_dir_all_owned`]). An error names the directory.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
-        create_dir_all_owned(&self.config_dir)?;
-        create_dir_all_owned(&self.state_dir)?;
-        create_dir_all_owned(&self.queue_dir())?;
-        create_dir_all_owned(&self.processed_dir())
+        for dir in [
+            &self.config_dir,
+            &self.state_dir,
+            &self.queue_dir(),
+            &self.processed_dir(),
+        ] {
+            create_dir_all_owned(dir).map_err(at_path(dir))?;
+        }
+        Ok(())
     }
 
     /// Apply config.json keys. A bad value stops processing at that key
@@ -287,7 +314,7 @@ impl Config {
 
 /// Load config.json + env overrides. Missing file is fine (defaults).
 pub fn load_config(config_dir: Option<&Path>, state_dir: Option<&Path>) -> Config {
-    load_config_with(config_dir, state_dir, &env_var)
+    load_config_with(config_dir, state_dir, &real_env)
 }
 
 pub(crate) fn load_config_with(
@@ -321,7 +348,7 @@ pub(crate) fn load_config_with(
         }
     }
 
-    if let Some(url) = env(ENV_API_URL) {
+    if let Some(url) = set_var(env, ENV_API_URL) {
         cfg.api_base_url = url;
     }
     cfg.api_base_url = cfg.api_base_url.trim_end_matches('/').to_string();
@@ -332,7 +359,7 @@ pub(crate) fn load_config_with(
 
 /// Write a starter config.json if missing. Returns path written/existing.
 /// Root (`sudo vesyl-print claim`) writes it as the config dir's owner,
-/// like every file [`write_durable`] writes.
+/// like every file [`write_durable`] writes. An error names the file.
 pub fn write_default_config(path: Option<&Path>) -> std::io::Result<PathBuf> {
     let cfg = load_config(None, None);
     let out = path
@@ -355,7 +382,7 @@ pub fn write_default_config(path: Option<&Path>) -> std::io::Result<PathBuf> {
     });
     let mut raw = serde_json::to_string_pretty(&payload).expect("static json");
     raw.push('\n');
-    write_durable(&out, raw.as_bytes(), 0o644, false)?;
+    write_durable(&out, raw.as_bytes(), 0o644, false).map_err(at_path(&out))?;
     Ok(out)
 }
 
@@ -457,6 +484,80 @@ mod tests {
         fs::write(&path, own).unwrap();
         assert_eq!(write_default_config(Some(&path)).unwrap(), path);
         assert_eq!(fs::read_to_string(&path).unwrap(), own);
+    }
+
+    /// The user dirs come from the injected environment like config.py's
+    /// `Path.home()`: HOME wins (even "", which is `/`), and without it the
+    /// passwd home is used, never `/`. Empty XDG variables count as unset.
+    #[test]
+    fn user_dirs_follow_home_like_the_lcd() {
+        let home = |h: &'static str| move |k: &str| (k == "HOME").then(|| h.to_string());
+        assert_eq!(
+            user_config_dir(&home("/home/vesyl")),
+            Path::new("/home/vesyl/.config/vesyl-print")
+        );
+        assert_eq!(
+            user_state_dir(&home("/home/vesyl/")),
+            Path::new("/home/vesyl/.local/share/vesyl-print")
+        );
+        assert_eq!(
+            user_config_dir(&home("")),
+            Path::new("/.config/vesyl-print")
+        );
+        let env: HashMap<&str, String> = HashMap::from([
+            ("HOME", "/home/vesyl".to_string()),
+            ("XDG_CONFIG_HOME", String::new()),
+            ("XDG_STATE_HOME", String::new()),
+            ("XDG_DATA_HOME", "/data".to_string()),
+            (ENV_CONFIG_DIR, String::new()),
+        ]);
+        let env = |k: &str| env.get(k).cloned();
+        assert_eq!(
+            user_config_dir(&env),
+            Path::new("/home/vesyl/.config/vesyl-print")
+        );
+        assert_eq!(user_state_dir(&env), Path::new("/data/vesyl-print"));
+        if !Path::new("/etc/vesyl-print").is_dir() {
+            assert_eq!(
+                resolve_config_dir_with(&env),
+                Path::new("/home/vesyl/.config/vesyl-print")
+            );
+        }
+
+        // No HOME: the account's passwd entry (util's tests check that
+        // lookup against /etc/passwd), not `/`.
+        let passwd = crate::util::home_dir(&|_| None);
+        let dir = user_config_dir(&|_| None);
+        if let Some(passwd) = passwd.filter(|p| p != Path::new("/")) {
+            assert_eq!(dir, passwd.join(".config").join("vesyl-print"));
+            assert_eq!(
+                user_state_dir(&|_| None),
+                passwd.join(".local").join("share").join("vesyl-print")
+            );
+        }
+    }
+
+    /// A directory or config.json that cannot be made is named in the
+    /// error, not just the OS error ("Not a directory (os error 20)").
+    #[test]
+    fn dir_and_config_errors_name_the_path() {
+        let td = tempfile::tempdir().unwrap();
+        let file = td.path().join("file");
+        fs::write(&file, "x").unwrap();
+        let cfg = Config {
+            config_dir: td.path().join("etc"),
+            state_dir: file.join("state"),
+            ..Config::default()
+        };
+        let err = cfg.ensure_dirs().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory);
+        let prefix = format!("{}: ", cfg.state_dir.display());
+        assert!(err.to_string().starts_with(&prefix), "{err}");
+
+        let config = file.join("config.json");
+        let err = write_default_config(Some(&config)).unwrap_err();
+        let prefix = format!("{}: ", config.display());
+        assert!(err.to_string().starts_with(&prefix), "{err}");
     }
 
     /// `sudo vesyl-print claim` (or test-print, update …) on a fresh device:

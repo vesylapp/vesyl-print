@@ -8,7 +8,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::util::{opt_str, py_str, set_mode, truthy, write_durable};
+use crate::util::{opt_str, py_str, truthy, write_durable};
 use crate::JsonObject;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,11 +229,15 @@ pub fn load_credentials(path: &Path) -> Option<Credentials> {
 }
 
 /// Atomically write credentials.json with mode 0600. Never logs token.
+///
+/// The mode is set on the temp file before the rename, never again by path:
+/// the service user owns the config dir, so after a root write (`sudo
+/// vesyl-print claim`) it could already have swapped the new file for a
+/// symlink, and a chmod by path would follow it.
 pub fn save_credentials(path: &Path, creds: &Credentials) -> io::Result<()> {
     let mut raw = serde_json::to_string_pretty(creds).map_err(io::Error::other)?;
     raw.push('\n');
-    write_durable(path, raw.as_bytes(), 0o600, false)?;
-    set_mode(path, 0o600)
+    write_durable(path, raw.as_bytes(), 0o600, false)
 }
 
 /// Delete credentials file. Returns true if a file was removed.
@@ -328,6 +332,10 @@ mod tests {
         assert_eq!(credentials_mode(&path), Some(0o600));
         let loaded = load_credentials(&path).unwrap();
         assert_eq!(loaded, creds);
+        // A looser file it replaces does not loosen the new one.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        save_credentials(&path, &creds).unwrap();
+        assert_eq!(credentials_mode(&path), Some(0o600));
     }
 
     #[test]

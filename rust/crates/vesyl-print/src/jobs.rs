@@ -1441,13 +1441,10 @@ pub fn materialize_content(
     Ok((path, true))
 }
 
+/// `~` expanded as Python's `Path.expanduser` did: see
+/// [`crate::util::expand_user`] (HOME, else the passwd home).
 fn expand_user(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return Path::new(&home).join(rest);
-        }
-    }
-    PathBuf::from(p)
+    crate::util::expand_user(p)
 }
 
 /// Default content fetcher for `*_uri` jobs.
