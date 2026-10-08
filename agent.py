@@ -6,6 +6,8 @@ import logging
 import os
 import queue
 import signal
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -818,25 +820,110 @@ def run_agent(cfg: Config | None = None) -> None:
 # Release slots that ship the Rust binary run it instead of this module. The
 # systemd unit still says ``python3 …/agent.py`` so a rollback to a
 # Python-only slot keeps working. Set VESYL_PRINT_PYTHON_AGENT=1 to force Python.
+#
+# The binary must first show it runs here: ``vesyl-print --version`` has to
+# exit 0 within RUST_PROBE_TIMEOUT_S and report this slot's VERSION. Otherwise
+# a wrong-architecture build, a missing loader, a too-old glibc or a stale
+# binary would kill every start before the post-update health gate could roll
+# back, and take the CLI (``update rollback`` included) down with it. On any
+# failure the Python agent/CLI carries on, with a warning on stderr (the
+# journal, under systemd).
 RUST_BINARY = "vesyl-print"
 ENV_FORCE_PYTHON = "VESYL_PRINT_PYTHON_AGENT"
+RUST_PROBE_TIMEOUT_S = 5.0
+
+
+def _slot_dir() -> Path:
+    return Path(__file__).resolve().parent
 
 
 def rust_binary(base_dir: Path | None = None) -> Path | None:
     """The slot's Rust binary, if present, executable and not disabled."""
     if os.environ.get(ENV_FORCE_PYTHON):
         return None
-    candidate = (base_dir or Path(__file__).resolve().parent) / RUST_BINARY
+    candidate = (base_dir or _slot_dir()) / RUST_BINARY
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return candidate
     return None
 
 
-def exec_rust(argv: list[str]) -> None:
-    """Replace this process with the Rust binary when the slot ships one."""
-    binary = rust_binary()
-    if binary is not None:
-        os.execv(str(binary), [str(binary), *argv])
+def _bare_version(text: str) -> str:
+    text = text.strip()
+    return text[1:] if text.startswith("v") else text
+
+
+def slot_version(base_dir: Path | None = None) -> str | None:
+    """The slot's VERSION file: the version its Rust binary must report."""
+    try:
+        text = ((base_dir or _slot_dir()) / "VERSION").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return _bare_version(text) or None
+
+
+def probe_rust_binary(
+    binary: Path,
+    expected_version: str | None,
+    *,
+    timeout: float = RUST_PROBE_TIMEOUT_S,
+) -> str | None:
+    """Run ``<binary> --version``; return why the binary is unusable, or None."""
+    if not expected_version:
+        return "the slot has no VERSION file to check it against"
+    expected = f"{RUST_BINARY} {_bare_version(expected_version)}"
+    try:
+        proc = subprocess.run(
+            [str(binary), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"`--version` did not finish within {timeout:g}s"
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return f"it cannot be executed: {e}"
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    if proc.returncode != 0:
+        if proc.returncode < 0:
+            how = f"was killed by signal {-proc.returncode}"
+        else:
+            how = f"exited with status {proc.returncode}"
+        err = proc.stderr.decode("utf-8", "replace").strip() or out
+        detail = err.splitlines()[0][:200] if err else ""
+        return f"`--version` {how}" + (f": {detail}" if detail else "")
+    name, _, version = out.partition(" ")
+    if f"{name} {_bare_version(version)}" != expected:
+        return f"`--version` printed {out!r}, expected {expected!r}"
+    return None
+
+
+def exec_rust(argv: list[str], *, base_dir: Path | None = None) -> None:
+    """Replace this process with the slot's Rust binary when it ships a usable one.
+
+    Returns, so the caller carries on with the Python agent/CLI, when there is
+    no binary, it is disabled, it fails the ``--version`` probe, or ``execv``
+    itself fails.
+    """
+    binary = rust_binary(base_dir)
+    if binary is None:
+        return
+    problem = probe_rust_binary(binary, slot_version(binary.parent))
+    if problem is None:
+        try:
+            os.execv(str(binary), [str(binary), *argv])
+        except OSError as e:
+            problem = f"exec failed: {e}"
+        else:
+            return  # a real execv never returns; only a stubbed one does
+    print(
+        f"vesyl-print: WARNING: not running {binary}: {problem}. Using the "
+        f"Python implementation instead (set {ENV_FORCE_PYTHON}=1 to skip the "
+        "binary).",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def main() -> None:

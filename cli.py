@@ -604,6 +604,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         # Installed slot with the Rust binary: it implements every subcommand.
+        # exec_rust returns (and this Python CLI handles the command, e.g. a
+        # recovery `update rollback`) when the binary is absent, disabled, or
+        # cannot run on this device.
         agent_mod.exec_rust(sys.argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
