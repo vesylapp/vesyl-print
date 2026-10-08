@@ -1,0 +1,21 @@
+rust/crates/vesyl-print/src/cli.rs
+  s_2883cba6969ed7::t_8ca5ce4d8af906 1358-1365
+rust/crates/vesyl-print/src/net.rs
+  s_2883cba6969ed7::t_5f641ca8afd85b 193,199-213,340-350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "740f156fa9dd6a5a43783e6f04bd9e9394534593",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
