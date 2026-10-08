@@ -1,0 +1,25 @@
+rust/crates/vesyl-print/src/zpl.rs
+  s_2883cba6969ed7::t_ca116a59fa50f3 248-251
+  s_2883cba6969ed7::t_d15c9a8adab3c9 1778-1783,1785,1791-1803
+  s_2883cba6969ed7::t_345ea97f680fe2 2175
+  s_2883cba6969ed7::t_2638eb9e4e8a5b 2176,2181,2184,2186-2187,2191-2211
+  s_2883cba6969ed7::t_a1d68b7dc662ac 1982-1983
+  s_2883cba6969ed7::t_fa51a947ddb080 2188-2190
+  s_2883cba6969ed7::t_d540738c7b34f2 2338-2345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "801910a870000091aeb335f3686ab9b59ad462ca",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
