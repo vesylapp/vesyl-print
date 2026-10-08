@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./scripts/build-release.sh [VERSION]            # default: the VERSION file
-#   UPDATE_PRIVATE_KEY_FILE=/path/to/key.pem ./scripts/build-release.sh 0.4.0
+#   UPDATE_PRIVATE_KEY_FILE=/path/to/key.pem ./scripts/build-release.sh 0.5.0
 #
 # By default this builds the tarball and signs its manifest in one go. CI runs
 # the steps in separate jobs, so the signing key never shares a runner with
@@ -242,8 +242,8 @@ PACKAGE_FILTER=(
   --exclude='*'
 )
 # What a device needs from the tree: the units run vesyl-print and main.py,
-# setup.sh provisions from it, test-print sends the test labels, and the
-# auto-provision test page is base.jpg.
+# setup.sh provisions from it (with both root helpers), test-print sends the
+# test labels, and base.jpg is the sample image (printers::test_image).
 REQUIRED_FILES=(
   vesyl-print
   VERSION

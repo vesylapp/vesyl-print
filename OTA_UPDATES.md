@@ -82,10 +82,10 @@ Production (preferred):
 
 ```text
 /opt/vesyl-print/
-  current -> releases/0.4.0          # atomic symlink
+  current -> releases/0.5.1          # atomic symlink
   releases/
-    0.4.0/                           # previous (rollback)
-    0.4.1/                           # active tree (vesyl-print binary, LCD *.py, assets)
+    0.5.0/                           # previous (rollback)
+    0.5.1/                           # active tree (vesyl-print binary, LCD *.py, assets)
   update/                            # download staging
 ```
 
@@ -127,7 +127,7 @@ CI (`.github/workflows/release.yml`) runs on tag `vX.Y.Z` and uploads:
 | `vesyl-print` | Rust agent + CLI, aarch64, glibc ≥ 2.31 (Debian bullseye and newer) |
 | `*.py` | LCD display (Python, for now) |
 | `assets/` | logo, boot splash, 4x6 test labels (`vesyl-print test-print`) |
-| `base.jpg` | auto-provision test page |
+| `base.jpg` | sample image (`vesyl-print print-test --file …/current/base.jpg`) |
 | `setup.sh`, `vesyl-print-*.service`, `scripts/` (not `build-release.sh`), `overlays/`, `keys/update_public.pem` | provisioning from the extracted tarball |
 | `VERSION`, `README.md`, `OTA_UPDATES.md` | version, docs |
 
@@ -157,15 +157,15 @@ never shares a runner with build code:
 | `VERIFY_ONLY=1` | publish | refuse unless the manifest names this version, URL and sha256 and verifies with `keys/update_public.pem` | same as SIGN_ONLY |
 
 With no mode set it builds and signs in one go (local use:
-`UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 0.4.1`).
+`UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 0.5.0`).
 
 **Manifest fields (contract):**
 
 ```json
 {
-  "version": "0.4.1",
+  "version": "0.5.0",
   "channel": "stable",
-  "artifact_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.4.1/vesyl-print-0.4.1-linux-aarch64.tar.gz",
+  "artifact_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.5.0/vesyl-print-0.5.0-linux-aarch64.tar.gz",
   "artifact_sha256": "<64 hex>",
   "min_agent_version": "0.4.0",
   "released_at": "2026-10-08T16:05:00+00:00",
@@ -201,7 +201,10 @@ The agent and CLI are the `vesyl-print` binary; there is no Python agent and no
 fallback to one. The LCD display stack (`main.py` and its modules) is still
 Python and ships in the same slot. It reads the agent's state files
 (`status.json`, `printers.json`, `update_status.json`) and calls the CLI
-(`vesyl-print claim --json`, `vesyl-print test-print --json`).
+(`vesyl-print claim CODE [--name N] --json`, `vesyl-print test-print --queue
+Q --format pdf|zpl --json`). Printer setup (new CUPS queues) runs in the
+agent, once per start; the LCD only reads `printers.json`, and shows every
+status as unknown once that file is older than 120 s.
 
 A slot is runnable only with the `vesyl-print` binary, which the agent unit
 execs from the slot root: the agent rejects archives without the binary, the
@@ -217,7 +220,15 @@ pick one), and keeps config, credentials and the queue. Until then the
 `min_agent_version` floor makes a Python 0.3.x agent refuse new releases. Lab
 devices that ran the 0.4 bridge (Python units handing off to the binary) report
 0.4.x and are not covered by that floor: re-provision them before offering them
-a newer release.
+a newer release. The lab Pi ran two such lab builds, 0.4.0 and 0.4.1 (signed
+with a throwaway lab key), so the first real release is 0.5.0 (§4.8).
+
+A release tarball never holds `keys/tailscale.key`, so re-provisioning a
+device that is already on the tailnet leaves Tailscale alone ("No Tailscale
+auth key — skip Tailscale"). Afterwards `setup.sh` deletes the extracted
+`vesyl-print-X.Y.Z/` it ran from (`SKIP_SOURCE_CLEANUP=1` keeps it); it never
+deletes the install root, a slot, a git checkout or a directory with another
+name.
 
 ### 4.3 Device-side flow
 
@@ -274,8 +285,23 @@ health gate uses the same path.
 Rules:
 
 - Drop-in mode **0440**, validated with `visudo -cf` before install.
-- Helpers owned by root, not writable by the service user.
+- Helpers owned by root, not writable by the service user. `setup.sh` writes
+  the install root into each one (`INSTALL_ROOT=` in `apply-update`,
+  `INSTALL_ROOT = Path(…)` in `wifi-setup`) and stops before changing
+  anything if that line is not there exactly once.
 - No shell wrappers or `NOPASSWD: ALL`.
+- **Known issue: `wifi-setup` is a root-escalation path for the service
+  user.** The helper file is root-owned, but it runs as root through
+  NOPASSWD sudo and imports `wifi_setup.py` (and `sysinfo.py`) from
+  `<install root>/current`, a tree the service user owns, and
+  `wifi_setup.py` spawns `current/wifi_portal.py` as root. Whatever the
+  service user writes into the active slot runs as root. Planned fix:
+  `setup.sh` installs root-owned copies of `wifi_setup.py`, `sysinfo.py` and
+  `wifi_portal.py` next to the helper in `/usr/local/lib/vesyl-print/`, the
+  helper imports only from its own directory, and the portal is spawned from
+  there. Until provisioning changes, the image's cloud-init also gives the
+  service user `NOPASSWD: ALL` sudo, so these helper restrictions do not
+  limit what that account can do as root.
 
 `apply-update` trusts none of its arguments as a path, since sudoers lets the
 service user pass anything:
@@ -303,13 +329,13 @@ separate `GET /print/v1/update` for v1).
 
 ```json
 {
-  "agent_version": "0.3.0",
+  "agent_version": "0.5.0",
   "hostname": "VESYL-PRINT-…",
   "platform": "linux-aarch64",
   "printers": [ … ],
   "update": {
-    "status": "idle|downloading|installing|failed|rolled_back",
-    "current_version": "0.3.0",
+    "status": "idle|checking|downloading|installing|pending_health|failed|rolled_back",
+    "current_version": "0.5.0",
     "target_version": null,
     "last_error": null,
     "last_checked_at": "…"
@@ -325,9 +351,9 @@ separate `GET /print/v1/update` for v1).
   "node_id": "…",
   "status": "online",
   "last_seen_at": "…",
-  "desired_agent_version": "0.4.0",
+  "desired_agent_version": "0.5.1",
   "update_channel": "stable",
-  "update_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json"
+  "update_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.5.1/vesyl-print-0.5.1.manifest.json"
 }
 ```
 
@@ -376,11 +402,21 @@ Env: `VESYL_PRINT_INSTALL_ROOT` overrides install root.
 vesyl-print version
 vesyl-print update check              # heartbeat; print desired if paired
 vesyl-print update apply              # use cloud desired + update_url
-vesyl-print update apply --version 0.4.0
-vesyl-print update apply --manifest-url https://…
-vesyl-print update apply --file ./rel.tar.gz --manifest ./rel.manifest.json
+vesyl-print update apply --version 0.5.0
+vesyl-print update apply --manifest-url https://… [--restart]
+vesyl-print update apply --file ./rel.tar.gz --manifest ./rel.manifest.json [--restart]
 vesyl-print update rollback [--version X] [--restart]
 ```
+
+`update apply` with no source (the cloud's desired version, or `--version`)
+runs the heartbeat path of §4.3: install, `pending_health`, restart the
+services, and the new agent runs the health gate. `--manifest-url` and
+`--file` only install and activate the slot. With `--restart` they also arm
+the health gate (`pending_health`, deadline `update_health_gate_seconds`,
+rollback to the slot that was active) and then restart the services. Without
+`--restart` nothing is restarted and no gate is armed (the running agent
+could only let it expire and roll back): the new slot starts on the next
+service restart, and no health gate checks it.
 
 ### 4.8 Version source of truth
 
@@ -391,6 +427,13 @@ vesyl-print update rollback [--version X] [--restart]
 - Heartbeat, CLI and the LCD footer report that version  
 
 Release process must bump `VERSION` (and tags) in the same commit as the ship.
+
+**First Rust-only release: v0.5.0.** The lab Pi has run two lab builds, 0.4.0
+and 0.4.1, signed with a throwaway lab key. A device whose running version
+equals the desired one stays idle (§4.3 step 3), so a real 0.4.0 or 0.4.1
+would never replace the lab build of the same number. Tag `v0.5.0` with
+`VERSION` bumped to 0.5.0 in the same commit. `MIN_AGENT_VERSION` keeps its
+default of 0.4.0, the Python-era cutoff (§4.2).
 
 ### 4.9 Implementation map
 
@@ -406,7 +449,7 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 | Build, sign, verify | `scripts/build-release.sh` |
 | CI publish | `.github/workflows/release.yml` → GitHub Releases |
 | Signing docs | `keys/README.md` |
-| Tests | `update.rs` unit tests; `rust/crates/vesyl-print/tests/build_release.rs` and `apply_update.rs` (drive the scripts) |
+| Tests | `update.rs` unit tests; `rust/crates/vesyl-print/tests/build_release.rs`, `apply_update.rs` and `setup_sh.rs` (drive the scripts; the `root_*` ones run `setup.sh` in a chroot) |
 
 ---
 
