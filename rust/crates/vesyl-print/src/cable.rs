@@ -29,6 +29,8 @@ pub const CHANNEL_NAME: &str = "PrintNodeChannel";
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a session may sit in its handshake before the agent replaces it.
+pub const HANDSHAKE_GRACE: Duration = Duration::from_secs(30);
 /// Read poll granularity: how quickly the socket thread notices `stop()`.
 const READ_POLL: Duration = Duration::from_millis(250);
 
@@ -111,6 +113,8 @@ struct Inner {
     finished: Flag,
     sender: Mutex<Option<SendFn>>,
     thread_id: Mutex<Option<ThreadId>>,
+    /// When the current socket thread was spawned (handshake grace period).
+    started_at: Mutex<Option<Instant>>,
 }
 
 /// Background WebSocket client for PrintNodeChannel.
@@ -134,6 +138,7 @@ impl ActionCableClient {
                 finished: Flag::default(),
                 sender: Mutex::new(None),
                 thread_id: Mutex::new(None),
+                started_at: Mutex::new(None),
             }),
         }
     }
@@ -144,6 +149,17 @@ impl ActionCableClient {
 
     pub fn subscribed(&self) -> bool {
         self.inner.subscribed.is_set() && self.connected()
+    }
+
+    /// Socket thread alive and not stopped, but no `welcome` yet: the TLS /
+    /// WebSocket handshake is still in progress. Only counts for `grace` after
+    /// start so a server that never welcomes us still gets replaced.
+    pub fn connecting(&self, grace: Duration) -> bool {
+        let running = self.inner.thread_id.lock().unwrap().is_some()
+            && !self.inner.finished.is_set()
+            && !self.inner.stop.is_set();
+        let recent = (*self.inner.started_at.lock().unwrap()).is_some_and(|t| t.elapsed() < grace);
+        running && recent && !self.inner.connected.is_set()
     }
 
     /// Spawn the socket thread (no-op if already running).
@@ -164,6 +180,7 @@ impl ActionCableClient {
             .name("vesyl-print-cable".into())
             .spawn(move || inner.run())?;
         *self.inner.thread_id.lock().unwrap() = Some(handle.thread().id());
+        *self.inner.started_at.lock().unwrap() = Some(Instant::now());
         Ok(())
     }
 
@@ -451,6 +468,12 @@ impl PrintCableSession {
 
     pub fn connected(&self) -> bool {
         self.current().is_some_and(|c| c.connected())
+    }
+
+    /// Handshake still in progress (see [`ActionCableClient::connecting`]).
+    pub fn connecting(&self) -> bool {
+        self.current()
+            .is_some_and(|c| c.connecting(HANDSHAKE_GRACE))
     }
 
     /// Fetch ticket and start client (non-blocking handshake).
@@ -783,6 +806,51 @@ mod tests {
         assert!(!sess.subscribed());
         assert!(!sess.perform("heartbeat", JsonObject::new()));
         sess.stop();
+    }
+
+    /// A session that is still handshaking must not look "dead" to the agent.
+    #[test]
+    fn connecting_until_welcome_within_grace() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            // Never send welcome until released.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            let _ = ws.send(Message::text(fixture("welcome.json")));
+            // Stay connected until the client goes away.
+            while ws.read().is_ok() {}
+        });
+        let client = ActionCableClient::new(
+            &format!("ws://{addr}/print/cable"),
+            ClientCallbacks::default(),
+        );
+        client.start().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !client.connecting(Duration::from_secs(30)) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            client.connecting(Duration::from_secs(30)),
+            "handshaking client counts as connecting"
+        );
+        assert!(!client.connecting(Duration::ZERO), "grace period expired");
+        assert!(!client.connected());
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !client.connected() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(client.connected());
+        assert!(
+            !client.connecting(Duration::from_secs(30)),
+            "welcomed client is connected, not connecting"
+        );
+        client.stop(Duration::from_secs(2));
+        assert!(!client.connecting(Duration::from_secs(30)));
+        server.join().unwrap();
     }
 
     /// End-to-end against a local tungstenite server speaking ActionCable.

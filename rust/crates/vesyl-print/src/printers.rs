@@ -1736,14 +1736,40 @@ fn inventory_item(
 /// `status_reasons` (list), `status_message` (str|null), `supports_raw`
 /// (bool — CUPS/raw-path capability heuristic).
 pub fn inventory_payload() -> Vec<Value> {
-    configured_network_queues()
-        .into_iter()
-        .map(|(queue, uri)| {
-            let st = cups_queue_status(&queue, Some(&uri));
-            let raw = queue_supports_raw(&queue, Some(&uri));
-            inventory_item(&queue, &uri, display_name(&queue), st, raw)
-        })
-        .collect()
+    // Each queue costs several CUPS round trips (about 1 s per `lpoptions`
+    // call on a Pi, up to ~5 s for an ipps:// IPP query), and the agent loop
+    // waits on this every heartbeat. Query queues concurrently and run
+    // `lpoptions -p` once per queue; the result is identical to Python's
+    // sequential, per-key version.
+    let queues = configured_network_queues();
+    let mut items = Vec::with_capacity(queues.len());
+    for chunk in queues.chunks(INVENTORY_PARALLELISM) {
+        thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|(queue, uri)| {
+                    scope.spawn(move || {
+                        let st = cups_queue_status(queue, Some(uri));
+                        let opts = run("lpoptions", &["-p", queue], 3);
+                        inventory_entry(queue, uri, &opts, st)
+                    })
+                })
+                .collect();
+            items.extend(handles.into_iter().filter_map(|h| h.join().ok()));
+        });
+    }
+    items
+}
+
+/// Max queues queried at once by [`inventory_payload`].
+const INVENTORY_PARALLELISM: usize = 8;
+
+/// One inventory item from a queue's `lpoptions -p` output and status.
+fn inventory_entry(queue: &str, uri: &str, lpoptions_out: &str, st: QueueStatus) -> Value {
+    let lpopt = |_: &str, key: &str| parse_lpoption(lpoptions_out, key);
+    // device_uri is known, so the queue-list lookup is never used.
+    let raw = queue_supports_raw_with(queue, Some(uri), &lpopt, &Vec::new);
+    inventory_item(queue, uri, display_name_from(lpoptions_out, queue), st, raw)
 }
 
 #[cfg(test)]
@@ -1751,6 +1777,36 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::net::TcpListener;
+
+    #[test]
+    fn inventory_entry_matches_per_key_lookups() {
+        let raw_opts =
+            "copies=1 printer-info='Zebra ZD421' printer-make-and-model='Local Raw Printer'";
+        let ipp_opts = "printer-info='Office' printer-make-and-model='Brother HL-L3280CDW series, driverless, 2.1.1'";
+        let st = || QueueStatus {
+            status: "idle".into(),
+            status_reasons: vec![],
+            status_message: None,
+        };
+        let z = inventory_entry("Zebra_ZD421", "socket://10.0.0.172:9100", raw_opts, st());
+        assert_eq!(z["supports_raw"], true);
+        assert_eq!(
+            z["display_name"],
+            display_name_from(raw_opts, "Zebra_ZD421")
+        );
+        let b = inventory_entry("Brother", "ipps://b.local:443/ipp/print", ipp_opts, st());
+        assert_eq!(b["supports_raw"], false);
+        assert_eq!(b["display_name"], display_name_from(ipp_opts, "Brother"));
+        assert_eq!(
+            b["supports_raw"],
+            queue_supports_raw_with(
+                "Brother",
+                Some("ipps://b.local:443/ipp/print"),
+                &|_, k| parse_lpoption(ipp_opts, k),
+                &Vec::new
+            )
+        );
+    }
 
     #[test]
     fn parses_lpstat_v() {

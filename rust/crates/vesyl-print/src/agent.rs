@@ -507,7 +507,10 @@ impl Agent {
                 let mut slot = holder.lock().unwrap();
                 if let Some(s) = slot.as_ref() {
                     // Subscribed, or handshake in progress — leave it alone.
-                    if s.subscribed() || s.connected() {
+                    // (Python only checked `connected`, which is set on `welcome`,
+                    // so a slow loop iteration could tear down a session that
+                    // was still connecting.)
+                    if s.subscribed() || s.connected() || s.connecting() {
                         return Some(s.clone());
                     }
                 }
@@ -617,8 +620,10 @@ impl Agent {
                 let try_due = elapsed_since(last_cable_try, secs(5.0))
                     && cable_retry_after.is_none_or(|t| now >= t);
                 if need && try_due {
-                    last_cable_try = Some(now);
                     sess = ensure_cable(self);
+                    // Measure the retry gap from the attempt itself, not the
+                    // cycle start: run_once can take ~15 s on a Pi (CUPS inventory).
+                    last_cable_try = Some(Instant::now());
                     if sess.is_none() {
                         cable_retry_after = Some(now + secs((backoff * 3.0).clamp(10.0, 60.0)));
                         backoff = (backoff * 2.0).min(max_backoff);
