@@ -1,10 +1,11 @@
 //! `vesyl-print agent` as a process: SIGTERM lets the request in flight
-//! finish, the tools the agent runs start with no signal blocked, and the
-//! agent refuses to run as root.
+//! finish but starts no update, the tools the agent runs start with no
+//! signal blocked, and the agent refuses to run as root.
 //!
 //! The agent runs with its config and state in temp dirs, its API on a
-//! loopback stub, the cable and the job pull off, and fake CUPS tools and
-//! `ip` first on PATH: printer setup finds no printer and no network to scan.
+//! loopback stub, the cable and the job pull off, and fake CUPS tools, `ip`
+//! and restart tools first on PATH: printer setup finds no printer and no
+//! network to scan, and an update's restart would only be logged.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -13,7 +14,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{mpsc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,10 @@ fn exec_lock() -> MutexGuard<'static, ()> {
 /// `ip` (the networks printer setup would scan).
 const FAKE_TOOLS: &[&str] = &["lp", "lpstat", "lpinfo", "lpoptions", "lpadmin", "ip"];
 
+/// What an update's restart runs: `systemctl restart --no-block <unit>`, or
+/// `sudo -n <apply-update helper> restart` where the helper is installed.
+const RESTART_TOOLS: &[&str] = &["systemctl", "sudo"];
+
 /// SIGINT and SIGTERM in a /proc `SigBlk` mask.
 const STOP_BITS: u64 = (1 << (libc::SIGINT - 1)) | (1 << (libc::SIGTERM - 1));
 
@@ -45,8 +50,8 @@ fn write_exe(path: &Path, text: &str) {
 }
 
 /// A paired print node in a temp dir: config and state directories, a fake
-/// token, and fake tools that find nothing and log the signal mask they
-/// started with.
+/// token, fake tools that find nothing and log the signal mask they started
+/// with, and fake restart tools that log how they were called.
 struct Node {
     _td: tempfile::TempDir,
     root: PathBuf,
@@ -54,6 +59,11 @@ struct Node {
 
 impl Node {
     fn new(api_base_url: &str) -> Node {
+        Node::with_config(api_base_url, json!({}))
+    }
+
+    /// A node whose config.json also has `overrides`.
+    fn with_config(api_base_url: &str, overrides: Value) -> Node {
         let td = tempfile::tempdir().unwrap();
         let node = Node {
             root: td.path().to_path_buf(),
@@ -61,13 +71,16 @@ impl Node {
         };
         fs::create_dir_all(node.config_dir()).unwrap();
         fs::create_dir_all(node.state_dir()).unwrap();
-        let config = json!({
+        let mut config = json!({
             "api_base_url": api_base_url,
             "cable_enabled": false,
             "pull_jobs_enabled": false,
             "auto_update_enabled": false,
             "heartbeat_seconds": 30,
         });
+        if let Value::Object(overrides) = overrides {
+            config.as_object_mut().unwrap().extend(overrides);
+        }
         fs::write(node.config_dir().join("config.json"), config.to_string()).unwrap();
         let creds = json!({"node_id": "node-1", "device_token": "fake-test-token"});
         fs::write(
@@ -89,6 +102,15 @@ impl Node {
             );
             write_exe(&bin.join(tool), &script);
         }
+        for tool in RESTART_TOOLS {
+            let script = format!(
+                "#!/bin/sh\n\
+                 # Fake {tool}: logs how it was called.\n\
+                 echo \"{tool} $*\" >> '{}'\n",
+                node.restart_log().display()
+            );
+            write_exe(&bin.join(tool), &script);
+        }
         node
     }
 
@@ -100,8 +122,23 @@ impl Node {
         self.root.join("state")
     }
 
+    /// Where the releases and the `current` link would go.
+    fn install_root(&self) -> PathBuf {
+        self.root.join("opt")
+    }
+
     fn sigblk_log(&self) -> PathBuf {
         self.root.join("sigblk.log")
+    }
+
+    fn restart_log(&self) -> PathBuf {
+        self.root.join("restarts.log")
+    }
+
+    /// Every call of a restart tool, as `tool args…`.
+    fn restarts(&self) -> Vec<String> {
+        let raw = fs::read_to_string(self.restart_log()).unwrap_or_default();
+        raw.lines().map(String::from).collect()
     }
 
     /// `vesyl-print agent` with none of this process's environment.
@@ -113,7 +150,7 @@ impl Node {
             .env("HOME", &self.root)
             .env("VESYL_PRINT_CONFIG_DIR", self.config_dir())
             .env("VESYL_PRINT_STATE_DIR", self.state_dir())
-            .env("VESYL_PRINT_INSTALL_ROOT", self.root.join("opt"))
+            .env("VESYL_PRINT_INSTALL_ROOT", self.install_root())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -121,15 +158,21 @@ impl Node {
             let _guard = exec_lock();
             cmd.spawn().unwrap()
         };
-        let mut stderr = child.stderr.take().unwrap();
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        let (line_tx, lines) = mpsc::channel();
         let log = thread::spawn(move || {
-            let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text);
+            let (mut text, mut line) = (String::new(), Vec::new());
+            while stderr.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                let line = String::from_utf8_lossy(&std::mem::take(&mut line)).into_owned();
+                text.push_str(&line);
+                let _ = line_tx.send(line);
+            }
             text
         });
         Agent {
             child,
             log: Some(log),
+            lines,
         }
     }
 
@@ -175,6 +218,8 @@ struct Agent {
     child: Child,
     /// Collects the agent's log (its stderr); taken by `finish`.
     log: Option<thread::JoinHandle<String>>,
+    /// Each log line as it comes.
+    lines: mpsc::Receiver<String>,
 }
 
 impl Drop for Agent {
@@ -209,6 +254,19 @@ impl Agent {
 
     fn running(&mut self) -> bool {
         self.child.try_wait().unwrap().is_none()
+    }
+
+    /// Whether the agent logs a line containing `needle` within `within`.
+    fn logged(&self, needle: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) if line.contains(needle) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
     }
 
     /// `(name, SigBlk)` of every thread of the agent (names cut to 15 bytes).
@@ -255,41 +313,104 @@ struct Api {
     /// One message per heartbeat request, once it has been read.
     heartbeat: mpsc::Receiver<()>,
     release: mpsc::Sender<()>,
+    /// The path of every request, in order.
+    paths: Arc<Mutex<Vec<String>>>,
+}
+
+impl Api {
+    fn paths(&self) -> Vec<String> {
+        self.paths.lock().unwrap().clone()
+    }
+}
+
+/// What the API stub serves besides whoami and the heartbeat.
+#[derive(Default)]
+struct Served {
+    /// An object whose fields are added to the heartbeat reply (an update
+    /// directive).
+    heartbeat: Value,
+    /// Other paths and their bodies (a release manifest and artifact).
+    files: Vec<(String, Vec<u8>)>,
 }
 
 fn held_heartbeat_api() -> Api {
+    held_heartbeat_api_serving(|_| Served::default())
+}
+
+/// [`held_heartbeat_api`] also serving what `served` makes of its base URL.
+fn held_heartbeat_api_serving(served: impl FnOnce(&str) -> Served) -> Api {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let served = served(&base_url);
     let (arrived, heartbeat) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
+    let paths: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = paths.clone();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { return };
             let Some(path) = read_request(&mut stream) else {
                 continue;
             };
-            let (status, body) = match path.as_str() {
-                "/print/v1/whoami" => (200, json!({"node_id": "node-1", "name": "Pack 1"})),
+            seen.lock().unwrap().push(path.clone());
+            let api_reply =
+                |status: u16, body: Value| (status, "application/json", body.to_string().into());
+            let (status, kind, body): (_, _, Vec<u8>) = match path.as_str() {
+                "/print/v1/whoami" => {
+                    api_reply(200, json!({"node_id": "node-1", "name": "Pack 1"}))
+                }
                 "/print/v1/heartbeat" => {
                     let _ = arrived.send(());
                     let _ = released.recv_timeout(Duration::from_secs(60));
-                    (200, json!({"ok": true, "last_seen_at": LAST_SEEN}))
+                    let mut reply = json!({"ok": true, "last_seen_at": LAST_SEEN});
+                    if let (Some(reply), Some(extra)) =
+                        (reply.as_object_mut(), served.heartbeat.as_object())
+                    {
+                        reply.extend(extra.clone());
+                    }
+                    api_reply(200, reply)
                 }
-                _ => (404, json!({"error": "not found"})),
+                other => match served.files.iter().find(|(p, _)| p == other) {
+                    Some((_, bytes)) => (200, "application/octet-stream", bytes.clone()),
+                    None => api_reply(404, json!({"error": "not found"})),
+                },
             };
-            let body = body.to_string();
             let _ = write!(
                 stream,
-                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} X\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
+            let _ = stream.write_all(&body);
         }
     });
     Api {
         base_url,
         heartbeat,
         release,
+        paths,
     }
+}
+
+/// A release artifact for `version`, laid out as build-release.sh lays them
+/// out but holding only the `vesyl-print` entrypoint an install checks for.
+fn release_tarball(version: &str) -> Vec<u8> {
+    let exe = b"#!/bin/sh\nexit 0\n";
+    let mut header = tar::Header::new_gnu();
+    header.set_size(exe.len() as u64);
+    header.set_mode(0o755);
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut tar = tar::Builder::new(gz);
+    let path = format!("vesyl-print-{version}/vesyl-print");
+    tar.append_data(&mut header, path, &exe[..]).unwrap();
+    tar.into_inner().unwrap().finish().unwrap()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Read one request; its path.
@@ -407,6 +528,71 @@ fn sigterm_lets_the_heartbeat_in_flight_finish() {
     for (tool, mask) in &tools {
         assert_eq!(*mask, 0, "{tool} started with signals blocked: {mask:x}");
     }
+}
+
+/// A stop that lands while the heartbeat is in flight starts no update its
+/// reply announces. The update would download, switch slots and restart
+/// the services, and that restart replaces the operator's stop job:
+/// `systemctl stop` would end with the agent running again, on the new
+/// slot. The next start applies the update.
+#[test]
+fn a_stop_during_the_heartbeat_starts_no_update() {
+    if skip_as_root() {
+        return;
+    }
+    let artifact = release_tarball("9.9.9");
+    let sha256 = sha256_hex(&artifact);
+    let api = held_heartbeat_api_serving(move |base| {
+        let manifest = json!({
+            "version": "9.9.9",
+            "artifact_url": format!("{base}/vesyl-print-9.9.9.tar.gz"),
+            "artifact_sha256": sha256,
+        });
+        Served {
+            heartbeat: json!({
+                "desired_agent_version": "9.9.9",
+                "update_url": format!("{base}/manifest.json"),
+            }),
+            files: vec![
+                ("/manifest.json".into(), manifest.to_string().into_bytes()),
+                ("/vesyl-print-9.9.9.tar.gz".into(), artifact),
+            ],
+        }
+    });
+    // Updates on; the test release is unsigned.
+    let node = Node::with_config(
+        &api.base_url,
+        json!({"auto_update_enabled": true, "update_require_signature": false}),
+    );
+    let agent = agent_in_heartbeat(&node, &api);
+    agent.signal(libc::SIGTERM);
+    // The reply comes once the agent is stopping.
+    let stopping = agent.logged("SIGTERM received", Duration::from_secs(20));
+    api.release.send(()).unwrap();
+    let (status, log) = agent.finish(Duration::from_secs(60));
+    assert!(stopping, "the agent did not take the SIGTERM\n{log}");
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "{status:?}\n{log}");
+
+    let fetched = api.paths();
+    assert!(
+        !fetched
+            .iter()
+            .any(|p| p == "/manifest.json" || p.ends_with(".tar.gz")),
+        "an update started after the stop: {fetched:?}\n{log}"
+    );
+    assert!(log.contains("any update waits for the next start"), "{log}");
+    assert!(log.contains("agent stopped"), "{log}");
+    let install = node.install_root();
+    assert!(
+        fs::symlink_metadata(install.join("current")).is_err(),
+        "{log}"
+    );
+    assert!(!install.join("releases").exists(), "{log}");
+    assert_eq!(node.restarts(), Vec::<String>::new(), "{log}");
+    // The heartbeat itself went through.
+    let st = node.status();
+    assert_eq!(st["cloud"], "online", "{st}");
+    assert_eq!(st["last_heartbeat_at"], LAST_SEEN, "{st}");
 }
 
 /// A second stop signal (Ctrl-C twice) ends the agent at once, even with a

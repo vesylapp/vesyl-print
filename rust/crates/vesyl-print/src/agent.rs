@@ -585,6 +585,14 @@ impl Agent {
     /// `jobs_busy`: when true, OTA download/install is deferred (job work in
     /// flight, e.g. buffered ActionCable jobs) so we never flip slots mid-print.
     pub fn run_once(&self, jobs_busy: bool) -> AgentStatus {
+        self.run_once_with_stop(jobs_busy, &AtomicBool::new(false))
+    }
+
+    /// [`Agent::run_once`] for [`Agent::run`], which passes its `stop`: once
+    /// that is set, the heartbeat's reply starts no update. An update runs
+    /// on to its restart, and that restart replaces a `systemctl stop`
+    /// still in progress: the agent would come back, on the new slot.
+    fn run_once_with_stop(&self, jobs_busy: bool, stop: &AtomicBool) -> AgentStatus {
         let creds = auth::load_credentials(&self.cfg.credentials_path());
 
         // Promote sticky false "failed" (self-restart SIGTERM) to pending_health
@@ -689,6 +697,12 @@ impl Agent {
                 self.write_status(&mut st);
 
                 // OTA: desired version + optional update_url on heartbeat response.
+                // None once the agent is stopping: checked now that the reply
+                // is in, as a stop lets the request in flight finish.
+                if stop.load(Ordering::SeqCst) {
+                    log::info!(target: LOG, "stopping — any update waits for the next start");
+                    return st;
+                }
                 let ust = update::maybe_update_from_heartbeat(
                     &hb,
                     &self.cfg,
@@ -1019,7 +1033,7 @@ impl Agent {
             // files (retryable failures) must not hold off every OTA.
             let jobs_busy = !lock(&push_jobs).is_empty();
             let st = if elapsed_since(last_hb, hb_interval) {
-                let st = self.heartbeat_step(|| self.run_once(jobs_busy));
+                let st = self.heartbeat_step(|| self.run_once_with_stop(jobs_busy, &stop));
                 last_hb = Some(Instant::now());
                 // Re-read: an OTA may have activated (pending_health) or failed.
                 ota_pause = update::should_pause_jobs_from_path(&cfg.update_status_path());
@@ -1302,10 +1316,11 @@ const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 /// are blocked instead, here on the calling thread before it starts any
 /// other (threads inherit the mask), and one thread takes them with
 /// sigwait(). The first sets `stop`: the agent finishes its current step,
-/// a request in flight included, and [`Agent::run`] returns. A second one
-/// ends the process at once. Child processes (lp, lpstat) still start with
-/// nothing blocked: std would pass the mask on, so
-/// [`printers::run_with_timeout`] empties it before exec.
+/// a request in flight included (though a heartbeat then starts no
+/// update), and [`Agent::run`] returns. A second one ends the process at
+/// once. Child processes (lp, lpstat) still start with nothing blocked: std
+/// would pass the mask on, so [`printers::run_with_timeout`] empties it
+/// before exec.
 pub fn stop_on_signals(stop: Arc<AtomicBool>) -> io::Result<()> {
     let set = signal_set(&STOP_SIGNALS);
     let mut old = signal_set(&[]);
@@ -2130,6 +2145,44 @@ mod tests {
         let ust = update::read_update_status(&agent.cfg.update_status_path()).unwrap();
         assert_eq!(ust.status, update::STATUS_FAILED);
         assert_eq!(ust.target_version.as_deref(), Some("9.9.9"));
+    }
+
+    /// A stop that lands while the heartbeat is in flight (the request now
+    /// finishes) starts no update its reply announces: the update would run
+    /// on to its restart, and that restart replaces the stop.
+    #[test]
+    fn a_stop_during_the_heartbeat_starts_no_update() {
+        let td = tempfile::tempdir().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let base: Arc<OnceLock<String>> = Arc::default();
+        let (b, s) = (base.clone(), stop.clone());
+        let srv = stub(move |_, path| match path {
+            "/print/v1/whoami" => (200, WHOAMI.into()),
+            "/print/v1/heartbeat" => {
+                // systemctl stop, while the request is in flight.
+                s.store(true, Ordering::SeqCst);
+                (
+                    200,
+                    json!({"desired_agent_version": "9.9.9",
+                           "update_url": format!("{}/manifest.json", b.get().unwrap())})
+                    .to_string(),
+                )
+            }
+            _ => (404, r#"{"error":"not found"}"#.into()),
+        });
+        base.set(srv.base_url.clone()).unwrap();
+        let mut agent = test_agent(td.path(), &srv.base_url);
+        agent.cfg.cable_enabled = false;
+        pair(&agent);
+
+        agent.run(stop);
+
+        assert_eq!(srv.count("/print/v1/heartbeat"), 1);
+        assert_eq!(srv.count("/manifest.json"), 0, "an update started");
+        let st = statusio::read_status(&agent.cfg.status_path()).unwrap();
+        assert_eq!(st.cloud, CloudState::Online);
+        // Nothing recorded about it either: the next start decides afresh.
+        assert!(update::read_update_status(&agent.cfg.update_status_path()).is_none());
     }
 
     /// A fresh process cannot be mid-download: a status left at downloading
