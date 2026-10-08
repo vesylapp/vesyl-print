@@ -808,7 +808,14 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
             };
             let mut hb = heartbeat_now(deps, &creds)?;
             if let Some(v) = version {
-                let url = hb_str(&hb, "update_url", "update_url")
+                // The heartbeat's update_url is the manifest of the server's
+                // desired version: it serves for `v` only when that is `v` as
+                // written (version_cmp would take 0.9.1-rc.1 for 0.9.1). Any
+                // other version's manifest comes from releases_base_url.
+                let server_wants_v =
+                    hb_str(&hb, "desired_agent_version", "desired_version").as_deref() == Some(&v);
+                let url = hb_str(&hb, "update_url", "manifest_url")
+                    .filter(|_| server_wants_v)
                     .unwrap_or_else(|| update::default_manifest_url(&cfg.releases_base_url, &v));
                 hb.insert("desired_agent_version".into(), json!(v));
                 hb.insert("update_url".into(), json!(url));
@@ -2227,15 +2234,21 @@ mod tests {
     /// `auto_update_enabled: false` keeps the agent from installing a desired
     /// version on its own, not an operator: `update apply` installs the
     /// heartbeat's desired version, and `update apply --version` its own.
+    /// The heartbeat's `update_url` is the manifest of the server's desired
+    /// version, so `--version` takes it for exactly that version only.
     #[test]
     fn update_apply_online_installs_with_auto_update_disabled() {
         let td = tempfile::tempdir().unwrap();
         let (_, m090) = release(td.path(), "0.9.0");
-        let (_, m091) = release(td.path(), "0.9.1");
-        // --version finds its manifest under releases_base_url.
+        let (_, rc) = release(td.path(), "0.9.1-rc.1");
+        // --version finds its manifest under releases_base_url, which has
+        // no 0.9.0: that comes only from the heartbeat's update_url.
         let cdn = td.path().join("cdn");
         fs::create_dir_all(&cdn).unwrap();
-        fs::copy(&m091, cdn.join("vesyl-print-0.9.1.manifest.json")).unwrap();
+        for v in ["0.9.1", "0.9.2"] {
+            let (_, m) = release(td.path(), v);
+            fs::copy(&m, cdn.join(format!("vesyl-print-{v}.manifest.json"))).unwrap();
+        }
         // This node, with auto-update off, its heartbeats answered with `hb`.
         let node = |hb: Value| {
             let srv = http_stub::serve(move |_, s| respond(s, 200, &[], hb.to_string().as_bytes()));
@@ -2250,21 +2263,27 @@ mod tests {
                 ..d
             }
         };
-        let desired =
-            node(json!({"desired_agent_version": "0.9.0", "update_url": file_url(&m090)}));
+        let asking = node(json!({"desired_agent_version": "0.9.0", "update_url": file_url(&m090)}));
+        // A pre-release of 0.9.1, which version_cmp counts as 0.9.1.
+        let canary =
+            node(json!({"desired_agent_version": "0.9.1-rc.1", "update_url": file_url(&rc)}));
         let silent = node(json!({"ok": true}));
-        installed_slot(&desired, "0.8.0");
+        installed_slot(&asking, "0.8.0");
         let creds = auth::credentials_from_pair_response(
             json!({"node_id": "n1", "device_token": "tok"})
                 .as_object()
                 .unwrap(),
         )
         .unwrap();
-        auth::save_credentials(&desired.cfg.credentials_path(), &creds).unwrap();
-        let root = &desired.update_env.install_root;
+        auth::save_credentials(&asking.cfg.credentials_path(), &creds).unwrap();
+        let root = &asking.update_env.install_root;
+        // Each apply moves `current`: 0.8.0, 0.9.0, 0.9.1, 0.9.0, 0.9.1, 0.9.2.
         for (d, argv, version) in [
-            (&desired, &["update", "apply"][..], "0.9.0"),
-            (&silent, &["update", "apply", "--version", "0.9.1"], "0.9.1"),
+            (&asking, &["update", "apply"][..], "0.9.0"),
+            (&asking, &["update", "apply", "--version", "0.9.1"], "0.9.1"),
+            (&asking, &["update", "apply", "--version", "0.9.0"], "0.9.0"),
+            (&canary, &["update", "apply", "--version", "0.9.1"], "0.9.1"),
+            (&silent, &["update", "apply", "--version", "0.9.2"], "0.9.2"),
         ] {
             let (r, out) = run_args(d, argv);
             assert_eq!(r.unwrap(), 0, "{argv:?}: {out}");
