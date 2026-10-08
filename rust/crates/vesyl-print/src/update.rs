@@ -7,7 +7,8 @@
 //!   current -> releases/0.4.0
 //!   releases/0.3.0/
 //!   releases/0.4.0/
-//!   update/                  # staging
+//!   releases/0.5.0.staging/  # an install, put together before it is swapped in
+//!   update/                  # downloads
 //! ```
 //!
 //! Lab/dev without root uses `{state_dir}/app/` the same way.
@@ -26,6 +27,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -58,6 +60,31 @@ const RESTART_MISSED: &str = "restart never happened";
 /// `update apply` without --restart, which may well be a newer version.
 const CURRENT_CHANGED: &str = "current changed";
 
+/// `last_error` prefix `update rollback` writes (see [`record_manual_rollback`]).
+const MANUAL_ROLLBACK: &str = "manual rollback";
+
+/// [`UpdateError`] code of an install the agent's stop cut short before
+/// anything was activated: not a failure, and tried again on the next start.
+const STOPPED: &str = "stopped";
+
+/// [`UpdateError`] code of an install this machine could not carry out (a
+/// full or read-only disk, a permission), whatever the release: retried.
+const INSTALL_FAILED: &str = "install_failed";
+
+/// [`UpdateError`] code of a release that is not the version asked for: its
+/// manifest names another, or its archive does.
+const VERSION_MISMATCH: &str = "version_mismatch";
+
+/// [`UpdateError`] code of a reinstall of the slot `current` points at on a
+/// filesystem that cannot swap two directories in one step.
+const NO_EXCHANGE: &str = "no_exchange";
+
+/// After a failure that may pass (see [`fails_for_good`]), the next attempt
+/// at the same version waits this long, doubled after each failure in a
+/// row up to [`RETRY_MAX_SECONDS`].
+const RETRY_FIRST_SECONDS: i64 = 60;
+const RETRY_MAX_SECONDS: i64 = 3600;
+
 /// Public key shipped with this build (rotated by shipping a new release).
 const BUNDLED_PUBLIC_KEY_PEM: &str = include_str!("../../../../keys/update_public.pem");
 
@@ -83,7 +110,8 @@ const JOB_PAUSE_STATUSES: &[&str] = &[STATUS_DOWNLOADING, STATUS_INSTALLING, STA
 /// `scripts/apply-update` requires before it activates one.
 const SLOT_BINARY: &str = "vesyl-print";
 
-/// [`extract_tarball`] unpacks into `<slot>` + this, beside the slot.
+/// An install puts the release together in `<slot>` + this, beside the
+/// slot (see [`Staged`]).
 const STAGING_SUFFIX: &str = ".staging";
 
 /// Installed root-owned helper (NOPASSWD sudoers on appliances).
@@ -96,12 +124,19 @@ fn version_re() -> &'static Regex {
 
 /// A release version: the pattern `scripts/apply-update` (and
 /// build-release.sh, setup.sh) checks, except that a last dot-component of
-/// `staging` is refused. `<version>.staging` is the directory an extract
+/// `staging` is refused. `<version>.staging` is the directory an install
 /// leaves beside its slot if it dies midway, so such a name never counts as
 /// a release ([`list_releases`], `current`), and no manifest can name a slot
 /// that is another version's staging dir.
 pub fn is_version(s: &str) -> bool {
     version_re().is_match(s) && !s.ends_with(STAGING_SUFFIX)
+}
+
+/// `v` as a release version is written: trimmed, without a leading `v`
+/// (`v0.5.0` is 0.5.0, as in the release tags). Check it with [`is_version`].
+pub fn normalize_version(v: &str) -> &str {
+    let v = v.trim();
+    v.strip_prefix('v').unwrap_or(v)
 }
 
 /// True when `dir` is a slot the units can start and `scripts/apply-update`
@@ -135,6 +170,45 @@ fn io_err(code: &'static str) -> impl Fn(std::io::Error) -> UpdateError {
     move |e| UpdateError::new(e.to_string(), code)
 }
 
+/// [`STOPPED`] once the agent is stopping. An OTA checks this between its
+/// steps: a `systemctl stop` must neither wait for the rest of a download
+/// nor be undone by the restart at its end.
+fn unless_stopping(stop: &AtomicBool, when: &str) -> Result<(), UpdateError> {
+    if stop.load(Ordering::SeqCst) {
+        return Err(UpdateError::new(
+            format!("update stopped {when}: the agent is stopping"),
+            STOPPED,
+        ));
+    }
+    Ok(())
+}
+
+/// True for an [`UpdateError`] code that another try at the same release
+/// would only repeat: what was fetched is not a release this node can
+/// install (its manifest, signature, checksum, archive or version), or this
+/// agent is too old for it. Anything else (the network, an HTTP error, the
+/// disk, the helper) may pass, and is retried after a while.
+fn fails_for_good(code: &str) -> bool {
+    matches!(
+        code,
+        "bad_manifest"
+            | "bad_signature"
+            | "bad_checksum"
+            | "bad_archive"
+            | "too_old"
+            | VERSION_MISMATCH
+            | NO_EXCHANGE
+    )
+}
+
+/// Seconds to wait before the next attempt after `attempts` failures in a
+/// row that may pass: [`RETRY_FIRST_SECONDS`], doubling, at most
+/// [`RETRY_MAX_SECONDS`].
+fn retry_delay_seconds(attempts: i64) -> i64 {
+    let doublings = (attempts.max(1) - 1).min(16) as u32;
+    (RETRY_FIRST_SECONDS << doublings).min(RETRY_MAX_SECONDS)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateStatus {
     pub status: String,
@@ -152,6 +226,16 @@ pub struct UpdateStatus {
     /// after it is judged by the gate (see `replaced_by_gated_activation`).
     /// Written to `update_status.json` only while set.
     pub armed_at: Option<String>,
+    /// The [`UpdateError`] code of the failed install of `target_version`
+    /// that `last_error` describes: whether it is held or retried (see
+    /// [`fails_for_good`]). Written only while set.
+    pub last_error_code: Option<String>,
+    /// Failed installs of `target_version` in a row. Written only while
+    /// not 0.
+    pub attempts: i64,
+    /// No new attempt at `target_version` before this (RFC 3339): the
+    /// backoff after a failure that may pass. Written only while set.
+    pub retry_at: Option<String>,
 }
 
 impl Default for UpdateStatus {
@@ -167,6 +251,9 @@ impl Default for UpdateStatus {
             health_deadline_at: None,
             health_attempts: 0,
             armed_at: None,
+            last_error_code: None,
+            attempts: 0,
+            retry_at: None,
         }
     }
 }
@@ -192,14 +279,33 @@ impl UpdateStatus {
             "health_attempts": self.health_attempts,
         });
         let mut d = v.as_object().cloned().expect("object");
-        if let Some(armed) = &self.armed_at {
-            d.insert("armed_at".into(), armed.clone().into());
+        // Fields added since: only while set, so the file stays as it was
+        // for every status that does not need them.
+        for (key, value) in [
+            ("armed_at", &self.armed_at),
+            ("last_error_code", &self.last_error_code),
+            ("retry_at", &self.retry_at),
+        ] {
+            if let Some(v) = value {
+                d.insert(key.into(), v.clone().into());
+            }
+        }
+        if self.attempts != 0 {
+            d.insert("attempts".into(), self.attempts.into());
         }
         d
     }
 
     fn is(&self, status: &str) -> bool {
         self.status == status
+    }
+
+    /// Forget the failed attempts at `target_version` (after a success, or
+    /// when there is another version to try).
+    fn clear_failures(&mut self) {
+        self.last_error_code = None;
+        self.attempts = 0;
+        self.retry_at = None;
     }
 }
 
@@ -597,11 +703,14 @@ pub fn http_get_bytes(url: &str) -> Result<Vec<u8>, UpdateError> {
     Ok(out)
 }
 
-/// Stream `url` to `dest` via `dest.part`, verifying SHA-256.
+/// Stream `url` to `dest` via `dest.part`, verifying SHA-256. Once `stop`
+/// is set it gives up after the read in progress ([`STOPPED`]); like any
+/// failure, that removes the `.part` file.
 pub fn http_download_to_file(
     url: &str,
     dest: &Path,
     expected_sha256: &str,
+    stop: &AtomicBool,
 ) -> Result<(), UpdateError> {
     if let Some(parent) = dest.parent() {
         crate::util::create_dir_all_owned(parent).map_err(io_err("download_failed"))?;
@@ -613,6 +722,7 @@ pub fn http_download_to_file(
         let mut h = Sha256::new();
         let mut buf = vec![0u8; 1024 * 1024];
         loop {
+            unless_stopping(stop, "while downloading")?;
             let n = reader
                 .read(&mut buf)
                 .map_err(|e| UpdateError::new(format!("network error: {e}"), "download_failed"))?;
@@ -706,14 +816,14 @@ fn unsafe_archive_path(p: &Path) -> bool {
         || p.components().any(|c| matches!(c, Component::ParentDir))
 }
 
-/// Remove `dir` — a release slot about to be unpacked again, or a staging
-/// dir an extract left behind — so it can be unpacked afresh. One the agent
-/// cannot delete, because root unpacked it (an `update apply` run as root
-/// before slots were handed to the install owner, or one that died
-/// midway), is renamed aside to `.<name>.stale-<n>` in the same directory
-/// instead. That needs write access to that directory only, and the service
-/// user owns `releases/`. [`clean_stale`] deletes such leftovers once an
-/// install can. A missing `dir` is fine.
+/// Remove `dir` — a staging dir an install left behind, the slot an install
+/// swapped out, or one it replaces without a swap — so the name is free
+/// again. One the agent cannot delete, because root unpacked it (an `update
+/// apply` run as root before slots were handed to the install owner, or one
+/// that died midway), is renamed aside to `.<name>.stale-<n>` in the same
+/// directory instead. That needs write access to that directory only, and
+/// the service user owns `releases/`. [`clean_stale`] deletes such leftovers
+/// once an install can. A missing `dir` is fine.
 pub fn clear_release_dir(dir: &Path) -> Result<(), UpdateError> {
     // lstat: a symlink in its place is removed itself, never followed.
     let Ok(meta) = fs::symlink_metadata(dir) else {
@@ -742,7 +852,7 @@ pub fn clear_release_dir(dir: &Path) -> Result<(), UpdateError> {
                 "cannot remove {} ({e}) or move it aside ({e2})",
                 dir.display()
             ),
-            "bad_archive",
+            INSTALL_FAILED,
         )),
     }
 }
@@ -808,43 +918,136 @@ pub fn extract_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), UpdateErro
             "exists",
         ));
     }
-    Staged::unpack(tarball, dest_dir)?.put_in_place(dest_dir)
+    let staged = Staged::unpack(tarball, dest_dir)?;
+    if let Err(e) = staged.hand_over() {
+        staged.discard();
+        return Err(e);
+    }
+    staged.put_in_place(dest_dir, false)
 }
 
-/// A release unpacked into `<slot>.staging`, beside its slot, and not yet in
-/// place: an install checks it there, before it touches the slot itself.
+/// True when `e`, or an error it wraps, came from a system call: a full or
+/// read-only disk, a missing permission. That is this machine's state,
+/// which can change, never the archive's content.
+fn from_the_os(e: &std::io::Error) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = next {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.raw_os_error().is_some())
+        {
+            return true;
+        }
+        next = err.source();
+    }
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    /// While a test sets this, [`exchange`] fails on its thread as it does
+    /// on a filesystem without RENAME_EXCHANGE (see `tests::without_exchange`).
+    static EXCHANGE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Swap the entries at `a` and `b` in one step: renameat2(2) with
+/// RENAME_EXCHANGE (Linux 3.15; not every filesystem has it).
+fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(test)]
+    if EXCHANGE_UNSUPPORTED.with(|u| u.get()) {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+    let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+    // SAFETY: both are valid NUL-terminated paths, resolved from the
+    // current directory as rename(2) resolves them.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// True when `e` says the kernel or the filesystem cannot [`exchange`].
+fn exchange_unsupported(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+    )
+}
+
+/// Flush the filesystem that holds `dir` (syncfs(2)), so that a release
+/// just unpacked there is on the disk before it is put in place: after a
+/// power loss, a slot must not turn out to hold files the disk never got.
+fn sync_filesystem(dir: &Path) {
+    use std::os::fd::AsRawFd;
+    if let Ok(d) = File::open(dir) {
+        // SAFETY: `d` stays open for the duration of the call.
+        unsafe { libc::syncfs(d.as_raw_fd()) };
+    }
+}
+
+/// A release put together beside its slot, in `<slot>.staging`, and not yet
+/// in place: an install checks it there, before it touches the slot itself.
 struct Staged {
-    /// The staging dir.
+    /// `<slot>.staging`: the release (the archive's single top-level
+    /// directory, else all the archive holds). A sibling of the slot, so
+    /// the two trade places without either moving to another directory,
+    /// which would need write access to the directory moved (to update its
+    /// `..`), and root may own the slot it replaces.
     dir: PathBuf,
-    /// The release in it: the archive's single top-level directory, else
-    /// the staging dir itself.
-    tree: PathBuf,
+    /// The name of the archive's single top-level directory, if it has one.
+    top: Option<String>,
 }
 
 impl Staged {
-    /// Unpack `tarball` into a fresh staging dir for the slot `dest_dir`.
-    /// Rejects absolute paths, `..`, and links that point outside the archive.
+    /// Unpack `tarball` for the slot `dest_dir`: into `.<slot>.unpack`
+    /// beside it, from where the release moves to `<slot>.staging`. Rejects
+    /// absolute paths, `..`, and links that point outside the archive.
     fn unpack(tarball: &Path, dest_dir: &Path) -> Result<Staged, UpdateError> {
         let parent = dest_dir.parent().unwrap_or(Path::new("."));
-        crate::util::create_dir_all_owned(parent).map_err(io_err("bad_archive"))?;
+        crate::util::create_dir_all_owned(parent).map_err(io_err(INSTALL_FAILED))?;
         clean_stale(parent);
         let mut staging = dest_dir.as_os_str().to_owned();
         staging.push(STAGING_SUFFIX);
         let staging = PathBuf::from(staging);
-        // Left by an extract that died midway, perhaps one run as root.
+        // Hidden: never a version, whatever the archive holds.
+        let mut unpacked = std::ffi::OsString::from(".");
+        unpacked.push(dest_dir.file_name().unwrap_or_default());
+        unpacked.push(".unpack");
+        let unpacked = parent.join(unpacked);
+        // Left by an install that died midway, perhaps one run as root.
         clear_release_dir(&staging)?;
+        clear_release_dir(&unpacked)?;
         // Root hands it to the owner of `releases/`, so the agent can clear
         // whatever a crash leaves in it.
-        crate::util::create_dir_all_owned(&staging).map_err(io_err("bad_archive"))?;
+        crate::util::create_dir_all_owned(&unpacked).map_err(io_err(INSTALL_FAILED))?;
 
+        // A system call that failed (a full disk, say) says nothing about
+        // the archive: such a failure is retried, a bad archive is not.
+        let fail = |e: std::io::Error| {
+            let code = if from_the_os(&e) {
+                INSTALL_FAILED
+            } else {
+                "bad_archive"
+            };
+            UpdateError::new(format!("extract failed: {e}"), code)
+        };
         let open = || -> Result<tar::Archive<flate2::read::GzDecoder<File>>, UpdateError> {
-            let f = File::open(tarball)
-                .map_err(|e| UpdateError::new(format!("extract failed: {e}"), "bad_archive"))?;
+            let f = File::open(tarball).map_err(fail)?;
             Ok(tar::Archive::new(flate2::read::GzDecoder::new(f)))
         };
         let extract = || -> Result<Vec<fs::DirEntry>, UpdateError> {
-            let fail =
-                |e: std::io::Error| UpdateError::new(format!("extract failed: {e}"), "bad_archive");
             // Pass 1: validate every member before writing anything.
             for entry in open()?.entries().map_err(fail)? {
                 let entry = entry.map_err(fail)?;
@@ -860,38 +1063,102 @@ impl Staged {
             // Pass 2: unpack.
             let mut archive = open()?;
             archive.set_preserve_permissions(false);
-            archive.unpack(&staging).map_err(fail)?;
-            Ok(fs::read_dir(&staging).map_err(fail)?.flatten().collect())
+            archive.unpack(&unpacked).map_err(fail)?;
+            Ok(fs::read_dir(&unpacked).map_err(fail)?.flatten().collect())
         };
         let children = match extract() {
             Ok(children) => children,
             Err(e) => {
-                let _ = fs::remove_dir_all(&staging);
+                let _ = fs::remove_dir_all(&unpacked);
                 return Err(e);
             }
         };
         // If archive has a single top-level dir, peel it. Never a symlink:
         // moved to where the slot goes, its target would resolve elsewhere.
-        let tree = match children.as_slice() {
-            [only] if only.file_type().is_ok_and(|t| t.is_dir()) => only.path(),
-            _ => staging.clone(),
+        let (tree, top) = match children.as_slice() {
+            [only] if only.file_type().is_ok_and(|t| t.is_dir()) => (
+                only.path(),
+                Some(only.file_name().to_string_lossy().into_owned()),
+            ),
+            _ => (unpacked.clone(), None),
         };
-        Ok(Staged { dir: staging, tree })
+        let moved = fs::rename(&tree, &staging);
+        // Empty now, or holding what could not be moved.
+        let _ = fs::remove_dir_all(&unpacked);
+        moved.map_err(io_err(INSTALL_FAILED))?;
+        Ok(Staged { dir: staging, top })
     }
 
-    /// Move the release to `dest_dir`, which must not exist, and remove the
-    /// staging dir. An operator running `update apply` as root must not leave
-    /// a root-owned slot the non-root agent can never replace or remove, so
-    /// the slot, `VERSION` and all, goes to the owner of `releases/`.
-    fn put_in_place(self, dest_dir: &Path) -> Result<(), UpdateError> {
-        if let Err(e) = fs::rename(&self.tree, dest_dir) {
-            self.discard();
-            return Err(UpdateError::new(e.to_string(), "bad_archive"));
+    /// Refuse a release whose archive names a version other than `version`
+    /// in its top-level directory, as `scripts/build-release.sh` packs it
+    /// (`vesyl-print-<version>/`): a manifest that points at the artifact of
+    /// another release. Any other layout says nothing about the version.
+    fn check_version(&self, version: &str) -> Result<(), UpdateError> {
+        let packed = self
+            .top
+            .as_deref()
+            .and_then(|t| t.strip_prefix("vesyl-print-"))
+            .filter(|v| is_version(v));
+        match packed {
+            Some(packed) if packed != version => Err(UpdateError::new(
+                format!("archive holds vesyl-print-{packed}, not version {version}"),
+                VERSION_MISMATCH,
+            )),
+            _ => Ok(()),
         }
-        if self.tree != self.dir {
-            let _ = fs::remove_dir_all(&self.dir);
+    }
+
+    /// An operator running `update apply` as root must not leave a
+    /// root-owned slot the non-root agent can never replace or remove, so
+    /// the release, `VERSION` and all, goes to the owner of `releases/`
+    /// before it is put in place.
+    fn hand_over(&self) -> Result<(), UpdateError> {
+        crate::util::hand_tree_to_parent_owner(&self.dir).map_err(io_err(INSTALL_FAILED))
+    }
+
+    /// Put the release in place at `dest_dir`. A slot already there trades
+    /// places with it in one step ([`exchange`]) and is removed after, so
+    /// `dest_dir` always holds one whole release: a reinstall of the
+    /// version `current` points at never leaves `current` dangling, nor
+    /// does a crash midway. Where the filesystem cannot swap, a slot that
+    /// is not `active` is cleared first; the `active` one is left as it is,
+    /// and the install refused.
+    fn put_in_place(self, dest_dir: &Path, active: bool) -> Result<(), UpdateError> {
+        let placed = if fs::symlink_metadata(dest_dir).is_err() {
+            fs::rename(&self.dir, dest_dir).map_err(io_err(INSTALL_FAILED))
+        } else {
+            match exchange(&self.dir, dest_dir) {
+                Ok(()) => Ok(()),
+                Err(e) if active => Err(UpdateError::new(
+                    format!(
+                        "cannot swap the new release in for {} in one step ({e}); \
+                         `current` points at it, so it was left as it is",
+                        dest_dir.display()
+                    ),
+                    if exchange_unsupported(&e) {
+                        NO_EXCHANGE
+                    } else {
+                        INSTALL_FAILED
+                    },
+                )),
+                Err(e) => {
+                    log::info!(
+                        target: LOG,
+                        "cannot swap {} in one step ({e}): replacing it",
+                        dest_dir.display()
+                    );
+                    clear_release_dir(dest_dir).and_then(|()| {
+                        fs::rename(&self.dir, dest_dir).map_err(io_err(INSTALL_FAILED))
+                    })
+                }
+            }
+        };
+        // What is left here: the slot that was swapped out, or the release
+        // when it could not be put in place.
+        if let Err(e) = clear_release_dir(&self.dir) {
+            log::warn!(target: LOG, "{}", e.message);
         }
-        crate::util::hand_tree_to_parent_owner(dest_dir).map_err(io_err("bad_archive"))
+        placed
     }
 
     fn discard(self) {
@@ -962,8 +1229,9 @@ pub fn flip_current(install_root: &Path, version: &str) -> Result<PathBuf, Updat
     Ok(release_dir)
 }
 
-/// What runs the helper: `sudo -n` (NOPASSWD on appliances). Unit tests run
-/// a stand-in helper script with `sh` instead, so no test ever runs sudo.
+/// What runs the helper, to activate or restart: `sudo -n` (NOPASSWD on
+/// appliances). Unit tests run a stand-in helper script with `sh` instead,
+/// so no test ever runs sudo.
 #[cfg(not(test))]
 const HELPER_RUNNER: &[&str] = &["sudo", "-n"];
 #[cfg(test)]
@@ -1102,14 +1370,14 @@ pub fn rollback(
 }
 
 /// argv for restarting both services (helper preferred, else systemctl).
+/// The helper runs as `sudo -n <helper> restart` (see `HELPER_RUNNER`).
 pub fn restart_commands(helper: Option<&Path>) -> Vec<Vec<String>> {
     match helper.filter(|h| h.is_file()) {
-        Some(h) => vec![vec![
-            "sudo".into(),
-            "-n".into(),
-            h.display().to_string(),
-            "restart".into(),
-        ]],
+        Some(h) => vec![HELPER_RUNNER
+            .iter()
+            .map(|a| a.to_string())
+            .chain([h.display().to_string(), "restart".into()])
+            .collect()],
         None => ["vesyl-print-agent", "vesyl-print-display"]
             .iter()
             .map(|u| {
@@ -1127,13 +1395,23 @@ pub fn restart_commands(helper: Option<&Path>) -> Vec<Vec<String>> {
 #[cfg(test)]
 thread_local! {
     /// While a test sets this, restarts asked for on its thread are counted
-    /// here instead of run (see `tests::restarts_during`).
+    /// here instead of run (see [`restarts_during`]).
     static RESTARTS_SEEN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Count the restarts `f` asks for (on this thread) instead of running them.
+#[cfg(test)]
+pub(crate) fn restarts_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    RESTARTS_SEEN.with(|n| n.set(Some(0)));
+    let out = f();
+    (out, RESTARTS_SEEN.with(|n| n.take()).unwrap_or(0))
 }
 
 /// Restart display + agent. Best-effort and non-blocking: when the agent
 /// restarts *itself*, systemd SIGTERMs this process while the helper is still
 /// running, so launch it in its own process group and never wait on it.
+/// Like every other command the agent runs, it starts with no signal
+/// blocked (see [`crate::printers::unblocked_signals`]).
 pub fn restart_services(helper: Option<&Path>) {
     use std::os::unix::process::CommandExt;
     #[cfg(test)]
@@ -1144,13 +1422,13 @@ pub fn restart_services(helper: Option<&Path>) {
         return;
     }
     for argv in restart_commands(helper) {
-        let spawned = Command::new(&argv[0])
-            .args(&argv[1..])
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        let spawned = crate::printers::unblocked_signals(&mut cmd).spawn();
         match spawned {
             // Reap in the background so it doesn't linger as a zombie.
             Ok(mut child) => {
@@ -1158,6 +1436,19 @@ pub fn restart_services(helper: Option<&Path>) {
             }
             Err(e) => log::warn!(target: LOG, "restart {:?} failed: {e}", argv.last()),
         }
+    }
+}
+
+/// After `version` was activated (an install, or a gate's rollback): restart
+/// the services into it as `env.restart` says, unless `stop` is set. That
+/// restart would replace the `systemctl stop` in progress and bring the
+/// agent back; instead its next start runs `version`. The display keeps
+/// the code it runs until it restarts, too.
+fn restart_unless_stopping(env: &UpdateEnv, stop: &AtomicBool, version: &str) {
+    if stop.load(Ordering::SeqCst) {
+        log::info!(target: LOG, "stopping — not restarting into {version}: the next start runs it");
+    } else if env.restart {
+        restart_services(env.apply_helper.as_deref());
     }
 }
 
@@ -1198,12 +1489,16 @@ impl UpdateEnv {
 
 /// Full path: verify manifest → download → extract → flip current.
 ///
-/// Does **not** run the post-update health gate or restart services.
+/// Does **not** run the post-update health gate or restart services. Once
+/// `stop` is set it gives up ([`STOPPED`]) at the next step that comes
+/// before the activation: a read of the download, the extract, putting the
+/// slot in place. The downloaded artifact is removed however it ends.
 pub fn apply_release(
     manifest: &ReleaseManifest,
     env: &UpdateEnv,
     public_key_pem: Option<&str>,
     require_signature: bool,
+    stop: &AtomicBool,
 ) -> Result<PathBuf, UpdateError> {
     check_manifest(manifest, env, public_key_pem, require_signature)?;
 
@@ -1212,11 +1507,16 @@ pub fn apply_release(
     let tarball = update_dir.join(format!("vesyl-print-{}.tar.gz", manifest.version));
 
     log::info!(target: LOG, "downloading {}", manifest.artifact_url);
-    http_download_to_file(&manifest.artifact_url, &tarball, &manifest.artifact_sha256)?;
+    http_download_to_file(
+        &manifest.artifact_url,
+        &tarball,
+        &manifest.artifact_sha256,
+        stop,
+    )?;
 
-    let release_dir = install_release(manifest, env, &tarball)?;
+    let installed = install_release(manifest, env, &tarball, stop);
     let _ = fs::remove_file(&tarball);
-    Ok(release_dir)
+    installed
 }
 
 /// [`apply_release`] for an artifact already on disk (`update apply
@@ -1245,7 +1545,8 @@ pub fn apply_local_release(
             "bad_checksum",
         ));
     }
-    install_release(manifest, env, tarball)
+    // The CLI has no stop to honor: a signal ends it outright.
+    install_release(manifest, env, tarball, &AtomicBool::new(false))
 }
 
 /// What every install checks before it touches anything: that this agent
@@ -1267,38 +1568,60 @@ fn check_manifest(
     verify_manifest(manifest, public_key_pem, require_signature)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// While a test sets this, [`install_release`] on its thread sets its
+    /// `stop` once the release is unpacked: the agent is stopped while the
+    /// release is checked (see `tests::stopping_once_unpacked`).
+    static STOP_ONCE_UNPACKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Install the verified `tarball` as the slot for `manifest.version`, then
 /// [`activate`] it. The archive is unpacked into a staging dir beside the
-/// slot and must hold a runnable slot ([`slot_is_runnable`]) before its
-/// `VERSION` is written and it replaces the slot: a bad archive leaves an
-/// installed slot of the same version as it was.
+/// slot, where it must be the release the manifest names and hold a
+/// runnable slot ([`slot_is_runnable`]); its `VERSION` is written there.
+/// Only then does it replace the slot, in one step ([`Staged::put_in_place`]):
+/// a bad archive, or a `stop` before that, leaves an installed slot of the
+/// same version as it was, `current` included.
 fn install_release(
     manifest: &ReleaseManifest,
     env: &UpdateEnv,
     tarball: &Path,
+    stop: &AtomicBool,
 ) -> Result<PathBuf, UpdateError> {
     let root = &env.install_root;
     let release_dir = root.join("releases").join(&manifest.version);
-    log::info!(target: LOG, "extracting to {}", release_dir.display());
+    unless_stopping(stop, "before the extract")?;
+    log::info!(target: LOG, "extracting beside {}", release_dir.display());
     let staged = Staged::unpack(tarball, &release_dir)?;
+    #[cfg(test)]
+    if STOP_ONCE_UNPACKED.with(|s| s.get()) {
+        stop.store(true, Ordering::SeqCst);
+    }
     let checked = (|| {
-        if !slot_is_runnable(&staged.tree) {
+        staged.check_version(&manifest.version)?;
+        if !slot_is_runnable(&staged.dir) {
             return Err(UpdateError::new(
                 "archive missing an executable vesyl-print binary",
                 "bad_archive",
             ));
         }
-        write_version_file(&staged.tree, &manifest.version).map_err(io_err("bad_archive"))?;
-        // A slot of this version from an earlier install. If the agent cannot
-        // delete it (root unpacked it), it is moved aside: failing here would
-        // download the artifact again on every heartbeat, and never install.
-        clear_release_dir(&release_dir)
+        write_version_file(&staged.dir, &manifest.version).map_err(io_err(INSTALL_FAILED))?;
+        staged.hand_over()?;
+        unless_stopping(stop, "before the activation")
     })();
     if let Err(e) = checked {
         staged.discard();
         return Err(e);
     }
-    staged.put_in_place(&release_dir)?;
+    // A slot of this version from an earlier install is swapped out, the
+    // one `current` points at too (a reinstall, or a repair). If the agent
+    // cannot delete it after (root unpacked it), it is moved aside: failing
+    // the install would download the artifact again on every attempt.
+    let active = current_release_dir(root)
+        .is_some_and(|cur| fs::canonicalize(&release_dir).is_ok_and(|dir| dir == cur));
+    sync_filesystem(&staged.dir);
+    staged.put_in_place(&release_dir, active)?;
 
     activate(root, &manifest.version, env.apply_helper.as_deref())?;
     log::info!(target: LOG, "activated version {}", manifest.version);
@@ -1370,6 +1693,7 @@ pub fn mark_pending_health(
     st.health_deadline_at = Some(utc_now_plus(gate_seconds.max(15)));
     st.health_attempts = 0;
     st.last_error = None;
+    st.clear_failures();
     st.last_checked_at = Some(utc_now());
     // Compared with process start times, so to the microsecond: cut to the
     // second, a gate armed just after a process started could look older.
@@ -1411,10 +1735,10 @@ impl Slot {
 /// Fast checks on the active release dir (no network).
 pub fn local_slot_healthy(env: &UpdateEnv, expected_version: Option<&str>) -> Result<(), String> {
     let cur = current_release_dir(&env.install_root).ok_or("current symlink missing or broken")?;
-    // Whether it can run was checked when `current` was pointed here (the
-    // helper, else `slot_is_runnable`); here, that it is still in place.
-    if !cur.join(SLOT_BINARY).is_file() {
-        return Err("current slot missing the vesyl-print binary".into());
+    // Checked when `current` was pointed here (the helper, else
+    // `slot_is_runnable`); here, that the units can still exec it.
+    if !slot_is_runnable(&cur) {
+        return Err("current slot has no executable vesyl-print binary".into());
     }
     if let Some(expected) = expected_version.filter(|e| !e.is_empty()) {
         let slot = Slot::at(&cur);
@@ -1440,14 +1764,31 @@ fn deadline_passed(deadline_iso: Option<&str>, now_iso: &str) -> bool {
     deadline_iso.is_some_and(|d| !d.is_empty() && now_iso >= d)
 }
 
+/// True when `st` records a gate that judged its version and failed it
+/// with nothing to roll back to (`health failed: …`, see
+/// [`close_failed_gate`]).
+fn failed_by_its_gate(st: &UpdateStatus) -> bool {
+    st.is(STATUS_FAILED)
+        && st
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(HEALTH_FAILED))
+}
+
 /// If OTA activated successfully but status was marked failed (e.g. SIGTERM
 /// during self-restart), promote back to `pending_health` so the gate runs.
+///
+/// Never a gate that has judged its version already and failed it with
+/// nothing to roll back to (`health failed: …`): promoted, it would arm
+/// again on every cycle, pausing jobs each time for the same verdict. Such
+/// a failure clears once its version runs healthy (see
+/// `clear_failed_gate_once_healthy`).
 pub fn recover_false_update_failure(
     mut st: UpdateStatus,
     cfg: &Config,
     env: &UpdateEnv,
 ) -> UpdateStatus {
-    if !st.is(STATUS_FAILED) {
+    if !st.is(STATUS_FAILED) || failed_by_its_gate(&st) {
         return st;
     }
     let target = st
@@ -1546,6 +1887,14 @@ fn started_before_gate(
 /// A gate whose `current` was switched to another version by hand (`update
 /// rollback`, or `update apply` without --restart) is closed as
 /// `rolled_back` at once, with nothing flipped or restarted again.
+///
+/// Once `stop` is set, a rollback still flips `current`, but the services
+/// are not restarted: that restart would replace the `systemctl stop` in
+/// progress. The next start runs the slot rolled back to.
+///
+/// A gate that failed with nothing to roll back to is not judged again,
+/// but cleared once its version runs healthy (see
+/// `clear_failed_gate_once_healthy`).
 pub fn process_pending_health(
     st: UpdateStatus,
     cfg: &Config,
@@ -1553,6 +1902,7 @@ pub fn process_pending_health(
     whoami: WhoamiResult,
     whoami_error: Option<&str>,
     now_iso: Option<&str>,
+    stop: &AtomicBool,
 ) -> UpdateStatus {
     judge_pending_health(
         st,
@@ -1562,10 +1912,12 @@ pub fn process_pending_health(
         whoami_error,
         now_iso,
         process_started_at(),
+        stop,
     )
 }
 
 /// [`process_pending_health`] for a process started at `started_at`.
+#[allow(clippy::too_many_arguments)] // process_pending_health's, and the start time tests pick
 fn judge_pending_health(
     st: UpdateStatus,
     cfg: &Config,
@@ -1574,17 +1926,19 @@ fn judge_pending_health(
     whoami_error: Option<&str>,
     now_iso: Option<&str>,
     started_at: Option<DateTime<Utc>>,
+    stop: &AtomicBool,
 ) -> UpdateStatus {
-    let mut st = if st.is(STATUS_FAILED) {
+    let st = if st.is(STATUS_FAILED) {
         recover_false_update_failure(st, cfg, env)
     } else {
         st
     };
+    let now = now_iso.map(String::from).unwrap_or_else(utc_now);
+    let mut st = clear_failed_gate_once_healthy(st, env, whoami, &now);
     if !st.is(STATUS_PENDING_HEALTH) {
         return st;
     }
 
-    let now = now_iso.map(String::from).unwrap_or_else(utc_now);
     let expected = st
         .target_version
         .clone()
@@ -1641,7 +1995,7 @@ fn judge_pending_health(
         // `restart_missed_here`).
         let armed_at = st.armed_at.clone();
         let why = format!("{RESTART_MISSED} (still running {})", env.running_version);
-        let mut st = close_failed_gate(st, env, &expected, &why);
+        let mut st = close_failed_gate(st, env, &expected, &why, stop);
         st.armed_at = armed_at;
         return st;
     }
@@ -1692,17 +2046,25 @@ fn judge_pending_health(
     }
 
     // Deadline or hard local failure → rollback if we can.
-    close_failed_gate(st, env, &expected, &format!("{HEALTH_FAILED}: {reason}"))
+    close_failed_gate(
+        st,
+        env,
+        &expected,
+        &format!("{HEALTH_FAILED}: {reason}"),
+        stop,
+    )
 }
 
 /// Close a gate for `expected` that did not pass: roll back to
-/// `previous_version` and restart the services, else mark it failed. `why`
-/// leads `last_error`, which [`failed_health_gate`] reads.
+/// `previous_version` and restart the services (unless `stop` is set), else
+/// mark it failed. `why` leads `last_error`, which [`failed_health_gate`]
+/// reads.
 fn close_failed_gate(
     mut st: UpdateStatus,
     env: &UpdateEnv,
     expected: &str,
     why: &str,
+    stop: &AtomicBool,
 ) -> UpdateStatus {
     st.armed_at = None;
     if let Some(prev) = st
@@ -1719,9 +2081,7 @@ fn close_failed_gate(
                 st.previous_version = None;
                 st.health_deadline_at = None;
                 st.last_error = Some(format!("{why}; rolled back to {rolled}"));
-                if env.restart {
-                    restart_services(env.apply_helper.as_deref());
-                }
+                restart_unless_stopping(env, stop, &rolled);
                 st
             }
             Err(e) => {
@@ -1737,6 +2097,48 @@ fn close_failed_gate(
     st.health_deadline_at = None;
     st.last_error = Some(format!("{why} (no previous slot to roll back to)"));
     log::error!(target: LOG, "{}", st.last_error.as_deref().unwrap_or_default());
+    st
+}
+
+/// A gate that failed its version with nothing to roll back to (`health
+/// failed: …`) is never armed again ([`recover_false_update_failure`]), but
+/// once that version runs healthy here after all (its slot checks out and
+/// whoami does not fail: the network is back, say), its failure is over:
+/// `idle` at once, as a gate that passes leaves it, never through
+/// `pending_health`, so jobs do not pause for it. While whoami fails it
+/// stays failed. Any other status is returned as it is.
+fn clear_failed_gate_once_healthy(
+    mut st: UpdateStatus,
+    env: &UpdateEnv,
+    whoami: WhoamiResult,
+    now: &str,
+) -> UpdateStatus {
+    let target = st
+        .target_version
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !failed_by_its_gate(&st)
+        || whoami == WhoamiResult::Error
+        || target.is_empty()
+        || !same_version(&env.running_version, &target)
+        || local_slot_healthy(env, Some(&target)).is_err()
+    {
+        return st;
+    }
+    log::info!(
+        target: LOG,
+        "{target} runs healthy after its failed health gate ({}) — clearing the failure",
+        st.last_error.as_deref().unwrap_or_default()
+    );
+    st.status = STATUS_IDLE.into();
+    st.current_version = env.running_version.clone();
+    st.previous_version = None;
+    st.health_deadline_at = None;
+    st.armed_at = None;
+    st.last_error = None;
+    st.last_checked_at = Some(now.into());
     st
 }
 
@@ -1780,14 +2182,68 @@ pub fn arm_health_gate(
     Ok(st)
 }
 
+/// Record that `update rollback` switched `current` from `left` to `to`:
+/// `rolled_back`, with `left` as the target, so the agent does not install
+/// `left` again while the server still asks for it (see
+/// [`failed_health_gate`]), only once it asks for another version or an
+/// operator applies one. A health gate still open is closed with it.
+/// Writes `status_path` and returns the status.
+pub fn record_manual_rollback(
+    status_path: &Path,
+    left: &str,
+    to: &str,
+) -> std::io::Result<UpdateStatus> {
+    let mut st = read_update_status(status_path).unwrap_or_default();
+    st.status = STATUS_ROLLED_BACK.into();
+    st.current_version = to.into();
+    st.target_version = Some(left.into());
+    st.previous_version = None;
+    st.health_deadline_at = None;
+    st.health_attempts = 0;
+    st.armed_at = None;
+    st.last_error = Some(format!("{MANUAL_ROLLBACK} from {left} to {to}"));
+    st.clear_failures();
+    st.last_checked_at = Some(utc_now());
+    write_update_status(status_path, &st)?;
+    Ok(st)
+}
+
+/// True for the record [`record_manual_rollback`] writes.
+fn manual_rollback(st: &UpdateStatus) -> bool {
+    st.is(STATUS_ROLLED_BACK)
+        && st
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(MANUAL_ROLLBACK))
+}
+
 /// True when this status records that its target failed the health gate on
-/// this node: rolled back (by the gate, or by hand while it was open), or
-/// failed with no way to roll back. A rollback because the restart into the
-/// target never happened is not one: that version never ran.
+/// this node: rolled back (by the gate, or by hand, while the gate was open
+/// or after), or failed with no way to roll back. A rollback because the
+/// restart into the target never happened is not one: that version never
+/// ran.
 fn failed_health_gate(st: &UpdateStatus) -> bool {
     let err = st.last_error.as_deref().unwrap_or_default();
-    (st.is(STATUS_ROLLED_BACK) && !err.starts_with(RESTART_MISSED))
-        || (st.is(STATUS_FAILED) && err.starts_with(HEALTH_FAILED))
+    (st.is(STATUS_ROLLED_BACK) && !err.starts_with(RESTART_MISSED)) || failed_by_its_gate(st)
+}
+
+/// True when this status records an install of its target that failed in a
+/// way another try would only repeat ([`fails_for_good`]): a release this
+/// node cannot install.
+fn failed_for_good(st: &UpdateStatus) -> bool {
+    st.is(STATUS_FAILED) && st.last_error_code.as_deref().is_some_and(fails_for_good)
+}
+
+/// True while the backoff after a failed install of the status's target
+/// lasts (`retry_at`). A `retry_at` further off than the longest backoff
+/// came from a clock that was ahead: it has passed.
+fn retry_pending(st: &UpdateStatus, now: DateTime<Utc>) -> bool {
+    st.is(STATUS_FAILED)
+        && st
+            .retry_at
+            .as_deref()
+            .and_then(parse_utc)
+            .is_some_and(|at| at > now && at - now <= chrono::Duration::seconds(RETRY_MAX_SECONDS))
 }
 
 /// True when `st` records a restart into its target that never came while
@@ -1811,25 +2267,48 @@ fn restart_missed_here(
 
 /// The status to start a heartbeat update from: `status` as the caller read
 /// it earlier in its cycle, unless `status_path` now holds a `pending_health`
-/// it does not have. That is a gate armed meanwhile by another process
-/// (`update apply … --restart`); the caller writes the result back, so its
-/// stale copy would disarm the gate the restarted agent needs.
+/// or a manual rollback it does not have. That is a gate armed meanwhile by
+/// another process (`update apply … --restart`), or an `update rollback`
+/// away from a version; the caller writes the result back, so its stale
+/// copy would disarm the gate the restarted agent needs, or install the
+/// version rolled back from again.
 fn current_status(status: Option<UpdateStatus>, status_path: Option<&Path>) -> UpdateStatus {
-    let Some(armed) = status_path
+    let Some(written) = status_path
         .and_then(read_update_status)
-        .filter(|on_disk| on_disk.is(STATUS_PENDING_HEALTH))
+        .filter(|on_disk| on_disk.is(STATUS_PENDING_HEALTH) || manual_rollback(on_disk))
     else {
         return status.unwrap_or_default();
     };
-    if status.as_ref() != Some(&armed) {
+    if status.as_ref() != Some(&written) {
         log::info!(
             target: LOG,
-            "update status changed on disk: pending_health for {} (was {})",
-            armed.target_version.as_deref().unwrap_or("?"),
+            "update status changed on disk: {} for {} (was {})",
+            written.status,
+            written.target_version.as_deref().unwrap_or("?"),
             status.as_ref().map_or("none", |s| s.status.as_str())
         );
     }
-    armed
+    written
+}
+
+/// Refuse a manifest for a version other than `desired`, the one asked for:
+/// installed, it would leave the node off `desired`, to fetch it again on
+/// every heartbeat (and `update apply --version` would install what was not
+/// asked for, whatever its source). Only a leading `v` may differ.
+pub fn check_manifest_version(
+    manifest: &ReleaseManifest,
+    desired: &str,
+) -> Result<(), UpdateError> {
+    if normalize_version(&manifest.version) == normalize_version(desired) {
+        return Ok(());
+    }
+    Err(UpdateError::new(
+        format!(
+            "manifest is for version {}, not {desired}",
+            manifest.version
+        ),
+        VERSION_MISMATCH,
+    ))
 }
 
 /// Inspect a heartbeat response and optionally apply an update.
@@ -1837,11 +2316,18 @@ fn current_status(status: Option<UpdateStatus>, status_path: Option<&Path>) -> U
 /// After a successful activate, status becomes `pending_health` (not idle);
 /// the new process must call [`process_pending_health`] after restart. When
 /// `jobs_busy`, download/install is deferred so slots never flip mid-print.
-/// A version that already failed its health gate here is not re-applied for
-/// the same desired version (see below), nor is one the services never
+/// A version that already failed here for good (its health gate, a manual
+/// rollback away from it, a release this node cannot install) is not
+/// re-applied for the same desired version, nor is one the services never
 /// restarted into by the process that stayed (see `restart_missed_here`).
-/// With `status_path`, a gate armed there since `status` was read wins over
-/// `status` (see `current_status`).
+/// After any other failure the same version is tried again only once its
+/// backoff has passed (`retry_at`). With `status_path`, a gate armed (or a
+/// rollback recorded) there since `status` was read wins over `status` (see
+/// `current_status`).
+///
+/// Once `stop` is set, an update not yet activated gives up and is tried
+/// again on the next start; one activated already stays `pending_health`
+/// without the restart, and the next start runs the new slot and its gate.
 pub fn maybe_update_from_heartbeat(
     hb: &JsonObject,
     cfg: &Config,
@@ -1849,6 +2335,7 @@ pub fn maybe_update_from_heartbeat(
     status: Option<UpdateStatus>,
     status_path: Option<&Path>,
     jobs_busy: bool,
+    stop: &AtomicBool,
 ) -> UpdateStatus {
     let mut st = current_status(status, status_path);
     st.current_version = env.running_version.clone();
@@ -1864,11 +2351,14 @@ pub fn maybe_update_from_heartbeat(
         return st;
     }
 
+    // As release tags write it, `v1.2.3` is 1.2.3: compared as given, it
+    // would never equal the version installed, and be installed again.
     let desired = hb
         .get("desired_agent_version")
         .filter(|v| truthy(v))
         .or_else(|| hb.get("desired_version").filter(|v| truthy(v)))
-        .map(|v| py_str(v).trim().to_string());
+        .map(|v| normalize_version(&py_str(v)).to_string())
+        .filter(|v| !v.is_empty());
     // Channel is local-only (not sent by wms-api); kept for status display.
     st.channel = Some(status_channel(cfg));
     let sticky = |st: &UpdateStatus| st.is(STATUS_FAILED) || st.is(STATUS_ROLLED_BACK);
@@ -1892,19 +2382,24 @@ pub fn maybe_update_from_heartbeat(
 
     // Re-applying a version that failed its health gate here would loop
     // download → activate → restart → gate → rollback for as long as the
-    // server asks for it. Hold until the desired version changes; a manual
-    // `vesyl-print update apply` (which starts from a fresh status) still works.
-    let held = failed_health_gate(&st);
+    // server asks for it, and one that cannot be installed (a Python-era
+    // release without the binary, a bad signature) would be downloaded
+    // again on every heartbeat. Hold until the desired version changes; a
+    // manual `vesyl-print update apply` (which starts from a fresh status)
+    // still works.
+    let held = failed_health_gate(&st) || failed_for_good(&st);
     let missed_here = restart_missed_here(&st, process_started_at);
+    let backing_off = retry_pending(&st, Utc::now());
     let same_target = prev_target
         .as_deref()
         .is_some_and(|t| same_version(t, &desired));
     if held && same_target {
         log::info!(
             target: LOG,
-            "not re-applying {desired}: it failed its health gate on this node ({}); \
+            "not re-applying {desired} ({} on this node: {}); \
              waiting for a different desired version or a manual update",
-            st.status
+            st.status,
+            st.last_error.as_deref().unwrap_or("?")
         );
         return st;
     }
@@ -1916,14 +2411,33 @@ pub fn maybe_update_from_heartbeat(
         );
         return st;
     }
+    // A failure that may pass (the network, the disk) is retried, but not
+    // on every heartbeat: each try may download the whole artifact again.
+    if backing_off && same_target {
+        log::info!(
+            target: LOG,
+            "not retrying {desired} before {} ({} failed attempt(s), last: {})",
+            st.retry_at.as_deref().unwrap_or("?"),
+            st.attempts,
+            st.last_error.as_deref().unwrap_or("?")
+        );
+        return st;
+    }
     // A heartbeat that defers `desired` keeps a status that blocks a retry
     // about the version it blocks. Recording `desired` in it would block
     // `desired`, a version this node has not tried, once updates resume.
     let defer = |mut st: UpdateStatus| {
-        if held || missed_here {
+        if held || missed_here || backing_off {
             st.target_version = prev_target.clone();
         }
         st
+    };
+    // Failed installs of `desired` in a row so far: the backoff grows with
+    // them. Another version starts again from none.
+    let attempts = if same_target && st.is(STATUS_FAILED) {
+        st.attempts
+    } else {
+        0
     };
 
     if !cfg.auto_update_enabled {
@@ -1965,9 +2479,12 @@ pub fn maybe_update_from_heartbeat(
             default_manifest_url(&cfg.releases_base_url, &desired)
         }
         None => {
+            // A setting to fix, checked again on each heartbeat (nothing is
+            // fetched): no failed attempt, neither held nor waited on.
             st.status = STATUS_FAILED.into();
             st.last_error =
                 Some("desired version set but no update_url or releases_base_url".into());
+            st.clear_failures();
             log::warn!(target: LOG, "{}", st.last_error.as_deref().unwrap_or_default());
             return st;
         }
@@ -1986,6 +2503,10 @@ pub fn maybe_update_from_heartbeat(
 
     let result = (|| -> Result<(), UpdateError> {
         st.status = STATUS_DOWNLOADING.into();
+        // A new attempt: what the last one left is no longer the news.
+        st.last_error = None;
+        st.clear_failures();
+        st.attempts = attempts;
         // The slot to roll back to, on disk before anything can flip
         // `current`: an install cut off after the flip (power loss) comes
         // back as a gate (see `recover_false_update_failure`), and that
@@ -1997,9 +2518,7 @@ pub fn maybe_update_from_heartbeat(
         let pem = manifest_public_key(cfg)?;
         log::info!(target: LOG, "applying update {desired} from {manifest_url}");
         let manifest = fetch_manifest(&manifest_url)?;
-        if !same_version(&manifest.version, &desired) {
-            log::info!(target: LOG, "manifest version {} (desired {desired})", manifest.version);
-        }
+        check_manifest_version(&manifest, &desired)?;
         let prev = previous
             .clone()
             .filter(|p| !same_version(p, &manifest.version));
@@ -2008,7 +2527,13 @@ pub fn maybe_update_from_heartbeat(
         // Persist installing so a crash mid-apply is visible.
         persist(&st);
 
-        apply_release(&manifest, env, pem.as_deref(), cfg.update_require_signature)?;
+        apply_release(
+            &manifest,
+            env,
+            pem.as_deref(),
+            cfg.update_require_signature,
+            stop,
+        )?;
         let channel = st.channel.clone();
         mark_pending_health(
             &mut st,
@@ -2026,9 +2551,7 @@ pub fn maybe_update_from_heartbeat(
         );
         // Activate already succeeded. Restart may SIGTERM this process; never
         // overwrite pending_health with failed because of that.
-        if env.restart {
-            restart_services(env.apply_helper.as_deref());
-        }
+        restart_unless_stopping(env, stop, &manifest.version);
         Ok(())
     })();
 
@@ -2051,15 +2574,31 @@ pub fn maybe_update_from_heartbeat(
                 // As after a clean activation: the gate is for the new
                 // version, which runs only once the services restart. This
                 // process would otherwise wait out the gate, then roll back.
-                if env.restart {
-                    restart_services(env.apply_helper.as_deref());
-                }
+                restart_unless_stopping(env, stop, &t);
                 return st;
             }
         }
+        if e.code == STOPPED {
+            // Nothing was activated: neither a failure nor a hold, and no
+            // gate to roll back to. The next start tries again, afresh.
+            log::info!(target: LOG, "update to {desired} stopped before activation: tried again on the next start");
+            st.status = STATUS_IDLE.into();
+            st.previous_version = None;
+            st.last_error = Some(e.message);
+            st.clear_failures();
+            return st;
+        }
         st.status = STATUS_FAILED.into();
         st.last_error = Some(e.message.clone());
-        log::error!(target: LOG, "update failed: {}", e.message);
+        st.last_error_code = Some(e.code.into());
+        st.attempts = attempts + 1;
+        if fails_for_good(e.code) {
+            log::error!(target: LOG, "update failed: {} — not retried until the desired version changes", e.message);
+        } else {
+            let wait = retry_delay_seconds(st.attempts);
+            st.retry_at = Some(utc_now_plus(wait));
+            log::error!(target: LOG, "update failed: {} — retrying in {wait}s", e.message);
+        }
     }
     st
 }
@@ -2106,6 +2645,13 @@ pub fn read_update_status(path: &Path) -> Option<UpdateStatus> {
             .and_then(py_int)
             .unwrap_or(0),
         armed_at: s("armed_at"),
+        last_error_code: s("last_error_code"),
+        attempts: data
+            .get("attempts")
+            .filter(|v| truthy(v))
+            .and_then(py_int)
+            .unwrap_or(0),
+        retry_at: s("retry_at"),
     })
 }
 
@@ -2119,6 +2665,9 @@ mod tests {
     fn obj(v: Value) -> JsonObject {
         v.as_object().unwrap().clone()
     }
+
+    /// The stop of an agent that is not stopping.
+    static NO_STOP: AtomicBool = AtomicBool::new(false);
 
     /// Tiny fake release dir tarred as `vesyl-print-<ver>/…`.
     fn build_release(root: &Path, version: &str) -> PathBuf {
@@ -2406,6 +2955,7 @@ mod tests {
             None,
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_IDLE);
         assert!(st.target_version.is_none());
@@ -2421,6 +2971,7 @@ mod tests {
             None,
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_IDLE);
         assert_eq!(st.target_version.as_deref(), Some("0.4.0"));
@@ -2440,6 +2991,7 @@ mod tests {
             None,
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.target_version.as_deref(), Some("9.9.9"));
         assert_eq!(st.status, STATUS_IDLE);
@@ -2452,8 +3004,15 @@ mod tests {
         let hb = obj(
             json!({"desired_agent_version": "9.9.9", "update_url": "http://127.0.0.1:9/m.json"}),
         );
-        let st =
-            maybe_update_from_heartbeat(&hb, &cfg(td.path()), &env(td.path()), None, None, true);
+        let st = maybe_update_from_heartbeat(
+            &hb,
+            &cfg(td.path()),
+            &env(td.path()),
+            None,
+            None,
+            true,
+            &NO_STOP,
+        );
         assert_eq!(st.status, STATUS_IDLE);
         assert_eq!(st.target_version.as_deref(), Some("9.9.9"));
     }
@@ -2468,6 +3027,7 @@ mod tests {
             Some(pending(utc_now_plus(60))),
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_PENDING_HEALTH);
         assert_eq!(st.target_version.as_deref(), Some("0.4.0"));
@@ -2485,7 +3045,7 @@ mod tests {
             "artifact_sha256": sha,
         })))
         .unwrap();
-        apply_release(&m, &env(&root), None, false).unwrap();
+        apply_release(&m, &env(&root), None, false, &NO_STOP).unwrap();
         assert_eq!(current_name(&root), "0.5.0");
         assert!(root.join("releases/0.5.0/vesyl-print").is_file());
         assert!(!root.join("update/vesyl-print-0.5.0.tar.gz").exists());
@@ -2516,7 +3076,15 @@ mod tests {
             "desired_agent_version": "0.5.0",
             "update_url": url::Url::from_file_path(&manifest).unwrap().to_string(),
         }));
-        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, Some(&status_path), false);
+        let st = maybe_update_from_heartbeat(
+            &hb,
+            &c,
+            &env(&root),
+            None,
+            Some(&status_path),
+            false,
+            &NO_STOP,
+        );
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         assert_eq!(st.previous_version.as_deref(), Some("0.4.0"));
         assert_eq!(current_name(&root), "0.5.0");
@@ -2547,7 +3115,15 @@ mod tests {
             "update_url": url::Url::from_file_path(&manifest).unwrap().to_string(),
         }));
         // Default config requires signatures and the bundled key exists → unsigned manifest fails.
-        let st = maybe_update_from_heartbeat(&hb, &cfg(td.path()), &env(&root), None, None, false);
+        let st = maybe_update_from_heartbeat(
+            &hb,
+            &cfg(td.path()),
+            &env(&root),
+            None,
+            None,
+            false,
+            &NO_STOP,
+        );
         assert_eq!(st.status, STATUS_FAILED);
         assert_eq!(st.last_error.as_deref(), Some("manifest missing signature"));
         assert_eq!(current_name(&root), "0.4.0");
@@ -2561,10 +3137,11 @@ mod tests {
         let sha = hex(&Sha256::digest(b"hello-ota"));
         let url = url::Url::from_file_path(&src).unwrap().to_string();
         let dest = td.path().join("out.bin");
-        http_download_to_file(&url, &dest, &sha).unwrap();
+        http_download_to_file(&url, &dest, &sha, &NO_STOP).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"hello-ota");
         let err =
-            http_download_to_file(&url, &td.path().join("bad.bin"), &"0".repeat(64)).unwrap_err();
+            http_download_to_file(&url, &td.path().join("bad.bin"), &"0".repeat(64), &NO_STOP)
+                .unwrap_err();
         assert_eq!(err.code, "bad_checksum");
         assert!(!td.path().join("bad.bin.part").exists());
     }
@@ -2587,14 +3164,14 @@ mod tests {
 
         fs::write(&part, b"stale").unwrap();
         crate::util::set_mode(&part, 0o444).unwrap();
-        http_download_to_file(&url, &dest, &sha).unwrap();
+        http_download_to_file(&url, &dest, &sha, &NO_STOP).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"hello-ota");
         assert!(fs::symlink_metadata(&part).is_err());
 
         let victim = td.path().join("victim");
         fs::write(&victim, b"keep").unwrap();
         std::os::unix::fs::symlink(&victim, &part).unwrap();
-        http_download_to_file(&url, &dest, &sha).unwrap();
+        http_download_to_file(&url, &dest, &sha, &NO_STOP).unwrap();
         assert_eq!(fs::read(&victim).unwrap(), b"keep");
         assert_eq!(fs::read(&dest).unwrap(), b"hello-ota");
         assert!(fs::symlink_metadata(&part).is_err());
@@ -2621,7 +3198,7 @@ mod tests {
         std::os::unix::fs::chown(&update, Some(1000), Some(1000)).unwrap();
         fs::write(update.join("a.tar.gz.part"), b"stale").unwrap();
         let dest = update.join("a.tar.gz");
-        http_download_to_file(&url, &dest, &hex(&Sha256::digest(b"hello-ota"))).unwrap();
+        http_download_to_file(&url, &dest, &hex(&Sha256::digest(b"hello-ota")), &NO_STOP).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"hello-ota");
         let meta = fs::symlink_metadata(&dest).unwrap();
         assert_eq!((meta.uid(), meta.gid()), (1000, 1000));
@@ -2638,6 +3215,7 @@ mod tests {
             WhoamiResult::Ok,
             None,
             None,
+            &NO_STOP,
         );
         assert_eq!(out.status, STATUS_IDLE);
         assert!(out.previous_version.is_none());
@@ -2656,6 +3234,7 @@ mod tests {
             WhoamiResult::Error,
             Some("connection refused"),
             None,
+            &NO_STOP,
         );
         assert_eq!(out.status, STATUS_PENDING_HEALTH);
         assert_eq!(out.health_attempts, 1);
@@ -2674,6 +3253,7 @@ mod tests {
             WhoamiResult::Error,
             Some("timeout"),
             None,
+            &NO_STOP,
         );
         assert_eq!(out.status, STATUS_ROLLED_BACK);
         assert_eq!(current_name(&root), "0.3.0");
@@ -2693,6 +3273,7 @@ mod tests {
             WhoamiResult::Ok,
             None,
             None,
+            &NO_STOP,
         );
         assert_eq!(out.status, STATUS_ROLLED_BACK);
         assert_eq!(current_name(&root), "0.3.0");
@@ -2703,8 +3284,14 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let root = two_slots(td.path());
         assert!(local_slot_healthy(&env(&root), Some("0.4.0")).is_ok());
-        // The units exec <slot>/vesyl-print: the binary only under bin/ fails.
+        // The units exec <slot>/vesyl-print: one that lost its execute bit
+        // cannot start the agent, ...
         let cur = fs::canonicalize(root.join("current")).unwrap();
+        crate::util::set_mode(&cur.join("vesyl-print"), 0o644).unwrap();
+        let err = local_slot_healthy(&env(&root), Some("0.4.0")).unwrap_err();
+        assert_eq!(err, "current slot has no executable vesyl-print binary");
+        crate::util::set_mode(&cur.join("vesyl-print"), 0o755).unwrap();
+        // ... nor can the binary only under bin/.
         fs::create_dir(cur.join("bin")).unwrap();
         fs::rename(cur.join("vesyl-print"), cur.join("bin/vesyl-print")).unwrap();
         let err = local_slot_healthy(&env(&root), Some("0.4.0")).unwrap_err();
@@ -2737,7 +3324,7 @@ mod tests {
         })))
         .unwrap();
         let root = td.path().join("install");
-        let err = apply_release(&m, &env(&root), None, false).unwrap_err();
+        let err = apply_release(&m, &env(&root), None, false, &NO_STOP).unwrap_err();
         assert_eq!(err.code, "bad_archive");
         assert!(!root.join("releases/0.9.0").exists());
     }
@@ -2807,7 +3394,7 @@ mod tests {
             let tarball = tarball_with(td.path(), version, files);
             let m = manifest_for(&tarball, version);
             for err in [
-                apply_release(&m, &env(&root), None, false).unwrap_err(),
+                apply_release(&m, &env(&root), None, false, &NO_STOP).unwrap_err(),
                 apply_local_release(&m, &env(&root), &tarball, None, false).unwrap_err(),
             ] {
                 assert_eq!(err.code, "bad_archive", "{version}: {err}");
@@ -2836,8 +3423,14 @@ mod tests {
         let slot = root.join("releases/0.4.0");
         let binary = fs::read(slot.join("vesyl-print")).unwrap();
         let bad = tarball_with(td.path(), "0.4.0", &[("README", false)]);
-        let err =
-            apply_release(&manifest_for(&bad, "0.4.0"), &env(&root), None, false).unwrap_err();
+        let err = apply_release(
+            &manifest_for(&bad, "0.4.0"),
+            &env(&root),
+            None,
+            false,
+            &NO_STOP,
+        )
+        .unwrap_err();
         assert_eq!(err.code, "bad_archive");
         assert_eq!(fs::read(slot.join("vesyl-print")).unwrap(), binary);
         assert!(slot_is_runnable(&slot));
@@ -2906,11 +3499,23 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let root = two_slots(td.path());
         // A 0.5.0 archive whose VERSION still says 0.4.9, and one without.
-        let stale = build_release(&td.path().join("stale"), "0.4.9");
+        let stale = td.path().join("stale.tar.gz");
+        evil_tarball(&stale, |tar| {
+            for (path, mode, data) in [
+                ("vesyl-print", 0o755, &b"\x7fELF"[..]),
+                ("VERSION", 0o644, b"0.4.9\n"),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(mode);
+                tar.append_data(&mut h, format!("vesyl-print-0.5.0/{path}"), data)
+                    .unwrap();
+            }
+        });
         let bare = tarball_with(td.path(), "0.5.1", &[("vesyl-print", true)]);
         for (tarball, version) in [(stale, "0.5.0"), (bare, "0.5.1")] {
             let m = manifest_for(&tarball, version);
-            let online = apply_release(&m, &env(&root), None, false).unwrap();
+            let online = apply_release(&m, &env(&root), None, false, &NO_STOP).unwrap();
             let written = fs::read_to_string(online.join("VERSION")).ok();
             assert_eq!(written, Some(format!("{version}\n")), "apply_release");
             let local = apply_local_release(&m, &env(&root), &tarball, None, false).unwrap();
@@ -2986,7 +3591,7 @@ mod tests {
             ..env(&root)
         };
         for err in [
-            apply_release(&m, &refused, None, false).unwrap_err(),
+            apply_release(&m, &refused, None, false, &NO_STOP).unwrap_err(),
             apply_local_release(&m, &refused, &tarball, None, false).unwrap_err(),
         ] {
             assert_eq!(err.code, "activate_failed");
@@ -3036,6 +3641,7 @@ mod tests {
                 WhoamiResult::Error,
                 Some("timeout"),
                 None,
+                &NO_STOP,
             )
         });
         assert_eq!(out.status, STATUS_FAILED);
@@ -3117,6 +3723,7 @@ mod tests {
             WhoamiResult::Skipped,
             None,
             None,
+            &NO_STOP,
         );
         assert_eq!(out.status, STATUS_IDLE);
     }
@@ -3155,6 +3762,7 @@ mod tests {
             WhoamiResult::Ok,
             None,
             None,
+            &NO_STOP,
         );
         assert_eq!(out.status, STATUS_IDLE);
         assert!(out.last_error.is_none());
@@ -3168,14 +3776,68 @@ mod tests {
         fs::write(&helper, "#!/bin/sh\n").unwrap();
         let cmds = restart_commands(Some(&helper));
         assert_eq!(cmds.len(), 1);
-        assert_eq!(
-            &cmds[0][..3],
-            &["sudo", "-n", &helper.display().to_string()]
-        );
+        // `sudo -n`, except in tests (see HELPER_RUNNER).
+        let (runner, rest) = cmds[0].split_at(HELPER_RUNNER.len());
+        assert_eq!(runner, HELPER_RUNNER);
+        assert_eq!(rest, [helper.display().to_string(), "restart".into()]);
         let fallback = restart_commands(None);
         assert_eq!(
             fallback[0],
             ["systemctl", "restart", "--no-block", "vesyl-print-agent"]
+        );
+    }
+
+    /// The agent blocks SIGINT and SIGTERM in every thread, and std passes
+    /// the spawning thread's mask on to a child. The restart helper must
+    /// still start with nothing blocked, as every other command the agent
+    /// runs does, or it would ignore the SIGTERM a stop sends the unit.
+    #[test]
+    fn restart_helper_starts_with_no_signal_blocked() {
+        let td = tempfile::tempdir().unwrap();
+        // Reports its own mask: `sh` reads /proc/self/status itself.
+        let report = td.path().join("sigblk");
+        let helper = td.path().join("apply-update");
+        fs::write(
+            &helper,
+            format!(
+                "while read -r key value; do\n\
+                 \x20 if [ \"$key\" = SigBlk: ]; then echo \"$value\" > '{0}.tmp' && mv '{0}.tmp' '{0}'; fi\n\
+                 done < /proc/self/status\n",
+                report.display()
+            ),
+        )
+        .unwrap();
+        let stop_bits = (1u64 << (libc::SIGINT - 1)) | (1 << (libc::SIGTERM - 1));
+        // On a thread of its own: the blocked signals stay with it.
+        let blocking = helper.clone();
+        std::thread::spawn(move || {
+            let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            // SAFETY: the set is initialized before it is changed or used.
+            let rc = unsafe {
+                libc::sigemptyset(set.as_mut_ptr());
+                libc::sigaddset(set.as_mut_ptr(), libc::SIGINT);
+                libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM);
+                libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut())
+            };
+            assert_eq!(rc, 0);
+            restart_services(Some(&blocking));
+        })
+        .join()
+        .unwrap();
+        // The helper runs detached: wait for its report.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !report.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the restart helper never ran"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mask = u64::from_str_radix(fs::read_to_string(&report).unwrap().trim(), 16).unwrap();
+        assert_eq!(
+            mask & stop_bits,
+            0,
+            "the restart helper started with {mask:#x} blocked"
         );
     }
 
@@ -3266,6 +3928,7 @@ mod tests {
                 Some(rolled.clone()),
                 None,
                 false,
+                &NO_STOP,
             );
             assert_eq!(st.status, STATUS_ROLLED_BACK);
             assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
@@ -3282,6 +3945,7 @@ mod tests {
             Some(rolled),
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         assert_eq!(st.previous_version.as_deref(), Some("0.4.0"));
@@ -3301,6 +3965,7 @@ mod tests {
             WhoamiResult::Error,
             Some("timeout"),
             None,
+            &NO_STOP,
         );
         assert_eq!(out.status, STATUS_ROLLED_BACK);
         assert_eq!(current_name(&root), "0.3.0");
@@ -3316,6 +3981,7 @@ mod tests {
             Some(out),
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_ROLLED_BACK);
         assert_eq!(current_name(&root), "0.3.0");
@@ -3336,7 +4002,8 @@ mod tests {
         };
         // Gate failed with nothing to roll back to: hold.
         let held = failed("health failed: timeout (no previous slot to roll back to)");
-        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), Some(held), None, false);
+        let st =
+            maybe_update_from_heartbeat(&hb, &c, &env(&root), Some(held), None, false, &NO_STOP);
         assert_eq!(st.status, STATUS_FAILED);
         assert_eq!(current_name(&root), "0.4.0");
         // A download error is transient: retried.
@@ -3347,6 +4014,7 @@ mod tests {
             Some(failed("network error: Connection refused")),
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         assert_eq!(current_name(&root), "0.5.0");
@@ -3377,6 +4045,7 @@ mod tests {
                 read_update_status(&path),
                 Some(&path),
                 true,
+                &NO_STOP,
             );
             write_update_status(&path, &st).unwrap();
             assert_eq!(st.status, STATUS_FAILED, "{stale}");
@@ -3398,6 +4067,7 @@ mod tests {
             read_update_status(&path),
             Some(&path),
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         assert_eq!(current_name(&root), "0.5.0");
@@ -3419,7 +4089,7 @@ mod tests {
         };
         assert!(c.update_require_signature);
         let hb = desire(td.path(), "0.5.0");
-        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, None, false);
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, None, false, &NO_STOP);
         assert_eq!(st.status, STATUS_FAILED);
         assert!(
             st.last_error
@@ -3436,7 +4106,7 @@ mod tests {
             update_require_signature: false,
             ..c
         };
-        let st = maybe_update_from_heartbeat(&hb, &lab, &env(&root), None, None, false);
+        let st = maybe_update_from_heartbeat(&hb, &lab, &env(&root), None, None, false, &NO_STOP);
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
     }
 
@@ -3502,7 +4172,7 @@ mod tests {
         };
         // Unsigned → refused.
         let hb = desire(td.path(), "0.5.0");
-        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, None, false);
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, None, false, &NO_STOP);
         assert_eq!(st.last_error.as_deref(), Some("manifest missing signature"));
         // Signed with the configured key → installed.
         let manifest_path = url::Url::parse(hb["update_url"].as_str().unwrap())
@@ -3520,7 +4190,7 @@ mod tests {
             .encode(key.sign(&m.canonical_bytes()).to_bytes());
         m.raw.insert("signature".into(), sig.into());
         fs::write(&manifest_path, Value::Object(m.raw).to_string()).unwrap();
-        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, None, false);
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, None, false, &NO_STOP);
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         assert_eq!(current_name(&root), "0.5.0");
     }
@@ -3600,13 +4270,6 @@ mod tests {
         arm_health_gate(c, &path, "0.4.0", Some("0.3.0".into())).unwrap()
     }
 
-    /// Count the restarts `f` asks for (on this thread) instead of running them.
-    fn restarts_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
-        RESTARTS_SEEN.with(|n| n.set(Some(0)));
-        let out = f();
-        (out, RESTARTS_SEEN.with(|n| n.take()).unwrap_or(0))
-    }
-
     #[test]
     fn process_start_time_is_in_the_recent_past() {
         let started = process_started_at().expect("/proc/self/stat");
@@ -3637,7 +4300,16 @@ mod tests {
         let c = cfg(td.path());
         let gate = armed_gate(td.path(), &c);
         let judge = |env: &UpdateEnv, whoami: WhoamiResult, at: Option<DateTime<Utc>>| {
-            judge_pending_health(gate.clone(), &c, env, whoami, Some("timeout"), None, at)
+            judge_pending_health(
+                gate.clone(),
+                &c,
+                env,
+                whoami,
+                Some("timeout"),
+                None,
+                at,
+                &NO_STOP,
+            )
         };
         let old = slot_agent(&root, "0.3.0");
         for whoami in [WhoamiResult::Ok, WhoamiResult::Error] {
@@ -3670,6 +4342,7 @@ mod tests {
             None,
             None,
             started(1),
+            &NO_STOP,
         );
         assert_eq!(out, legacy);
         let mislabeled = slot_agent(&root, "0.4.1");
@@ -3681,6 +4354,7 @@ mod tests {
             None,
             None,
             started(-60),
+            &NO_STOP,
         );
         assert_eq!(out.status, STATUS_ROLLED_BACK);
         assert_eq!(current_name(&root), "0.3.0");
@@ -3712,13 +4386,21 @@ mod tests {
 
         // This test process started before the gate, as that agent did.
         for whoami in [WhoamiResult::Ok, WhoamiResult::Error] {
-            let out = process_pending_health(gate.clone(), &c, &old, whoami, Some("timeout"), None);
+            let out = process_pending_health(
+                gate.clone(),
+                &c,
+                &old,
+                whoami,
+                Some("timeout"),
+                None,
+                &NO_STOP,
+            );
             assert_eq!(out, gate, "{whoami:?}");
             assert_eq!(current_name(&root), "0.4.0");
         }
         // The restarted agent passes the gate.
         let new = slot_agent(&root, "0.4.0");
-        let out = process_pending_health(gate, &c, &new, WhoamiResult::Ok, None, None);
+        let out = process_pending_health(gate, &c, &new, WhoamiResult::Ok, None, None, &NO_STOP);
         assert_eq!(out.status, STATUS_IDLE);
         assert_eq!(current_name(&root), "0.4.0");
     }
@@ -3751,6 +4433,7 @@ mod tests {
                 None,
                 Some(&late),
                 started(-60),
+                &NO_STOP,
             )
         });
         assert_eq!(out.status, STATUS_ROLLED_BACK);
@@ -3772,7 +4455,8 @@ mod tests {
         // restart never came: it does not retry.
         let hb = desire(td.path(), "0.4.0");
         let agent = slot_agent(&root, "0.3.0");
-        let st = maybe_update_from_heartbeat(&hb, &c, &agent, Some(out.clone()), None, false);
+        let st =
+            maybe_update_from_heartbeat(&hb, &c, &agent, Some(out.clone()), None, false, &NO_STOP);
         assert_eq!(st.status, STATUS_ROLLED_BACK);
         assert_eq!(current_name(&root), "0.3.0");
         // An agent started since (the restart after the rollback worked):
@@ -3782,7 +4466,15 @@ mod tests {
             armed_at: Some(since.to_rfc3339_opts(SecondsFormat::Micros, false)),
             ..out
         };
-        let st = maybe_update_from_heartbeat(&hb, &c, &agent, Some(restarted_view), None, false);
+        let st = maybe_update_from_heartbeat(
+            &hb,
+            &c,
+            &agent,
+            Some(restarted_view),
+            None,
+            false,
+            &NO_STOP,
+        );
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         assert_eq!(st.previous_version.as_deref(), Some("0.3.0"));
         assert_eq!(current_name(&root), "0.4.0");
@@ -3824,6 +4516,7 @@ mod tests {
                     Some("timeout"),
                     None,
                     started_at,
+                    &NO_STOP,
                 )
             });
             let ctx = format!("{who} started {started_at:?}");
@@ -3843,7 +4536,7 @@ mod tests {
         }
 
         let fresh = slot_agent(&root, "0.3.0");
-        let out = process_pending_health(gate, &c, &fresh, WhoamiResult::Ok, None, None);
+        let out = process_pending_health(gate, &c, &fresh, WhoamiResult::Ok, None, None, &NO_STOP);
         assert_eq!(out.status, STATUS_ROLLED_BACK);
         let st = maybe_update_from_heartbeat(
             &desire(td.path(), "0.4.0"),
@@ -3852,6 +4545,7 @@ mod tests {
             Some(out),
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_ROLLED_BACK);
         assert_eq!(current_name(&root), "0.3.0");
@@ -3870,7 +4564,7 @@ mod tests {
         let m = manifest_for(&tarball, "0.5.0");
         apply_local_release(&m, &env(&root), &tarball, None, false).unwrap();
         let old = slot_agent(&root, "0.3.0");
-        let out = process_pending_health(gate, &c, &old, WhoamiResult::Ok, None, None);
+        let out = process_pending_health(gate, &c, &old, WhoamiResult::Ok, None, None, &NO_STOP);
         assert_eq!(out.status, STATUS_ROLLED_BACK);
         assert_eq!(
             out.last_error.as_deref(),
@@ -3938,8 +4632,9 @@ mod tests {
             restart: true,
             ..slot_agent(&root, "0.4.0")
         };
-        let (st, restarts) =
-            restarts_during(|| maybe_update_from_heartbeat(&hb, &c, &agent, None, None, false));
+        let (st, restarts) = restarts_during(|| {
+            maybe_update_from_heartbeat(&hb, &c, &agent, None, None, false, &NO_STOP)
+        });
         helper.join().unwrap();
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
@@ -3993,14 +4688,22 @@ mod tests {
                     Some(blocked.clone()),
                     None,
                     jobs_busy,
+                    &NO_STOP,
                 );
                 assert_eq!(deferred.status, STATUS_ROLLED_BACK, "{how}");
                 assert_eq!(deferred.target_version.as_deref(), Some("0.5.0"), "{how}");
                 assert_eq!(deferred.last_error, blocked.last_error, "{how}");
                 assert_eq!(current_name(&root), "0.4.0", "{how}");
 
-                let st =
-                    maybe_update_from_heartbeat(&fix, &c, &env(&root), Some(deferred), None, false);
+                let st = maybe_update_from_heartbeat(
+                    &fix,
+                    &c,
+                    &env(&root),
+                    Some(deferred),
+                    None,
+                    false,
+                    &NO_STOP,
+                );
                 assert_eq!(
                     st.status, STATUS_PENDING_HEALTH,
                     "{how}: {:?}",
@@ -4021,8 +4724,17 @@ mod tests {
             Some(rolled.clone()),
             None,
             false,
+            &NO_STOP,
         );
-        let st = maybe_update_from_heartbeat(&again, &c, &env(&root), Some(deferred), None, false);
+        let st = maybe_update_from_heartbeat(
+            &again,
+            &c,
+            &env(&root),
+            Some(deferred),
+            None,
+            false,
+            &NO_STOP,
+        );
         assert_eq!(st.status, STATUS_ROLLED_BACK);
         assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
         assert_eq!(current_name(&root), "0.4.0");
@@ -4044,7 +4756,8 @@ mod tests {
             "desired_agent_version": "0.5.0",
             "update_url": url(&td.path().join("missing.json")),
         }));
-        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, Some(&path), false);
+        let st =
+            maybe_update_from_heartbeat(&hb, &c, &env(&root), None, Some(&path), false, &NO_STOP);
         assert_eq!(st.status, STATUS_FAILED);
         let on_disk = read_update_status(&path).unwrap();
         assert_eq!(on_disk.status, STATUS_DOWNLOADING);
@@ -4062,7 +4775,8 @@ mod tests {
         )
         .unwrap();
         let hb = obj(json!({"desired_agent_version": "0.5.0", "update_url": url(&manifest)}));
-        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, Some(&path), false);
+        let st =
+            maybe_update_from_heartbeat(&hb, &c, &env(&root), None, Some(&path), false, &NO_STOP);
         assert_eq!(st.status, STATUS_FAILED);
         let on_disk = read_update_status(&path).unwrap();
         assert_eq!(on_disk.status, STATUS_INSTALLING);
@@ -4088,6 +4802,7 @@ mod tests {
             WhoamiResult::Error,
             Some("HTTP 503"),
             None,
+            &NO_STOP,
         );
         assert_eq!(gate.status, STATUS_PENDING_HEALTH);
         assert_eq!(gate.previous_version.as_deref(), Some("0.4.0"));
@@ -4100,6 +4815,7 @@ mod tests {
             WhoamiResult::Error,
             Some("HTTP 503"),
             Some(&late),
+            &NO_STOP,
         );
         assert_eq!(out.status, STATUS_ROLLED_BACK, "{:?}", out.last_error);
         assert_eq!(current_name(&root), "0.4.0");
@@ -4136,16 +4852,20 @@ mod tests {
             None,
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         assert_eq!(current_name(&root), "0.5.0");
         assert!(releases.join("0.5.0/vesyl-print").is_file());
         assert!(!releases.join("0.5.0/locked").exists());
         assert!(!releases.join("0.5.0.staging").exists());
+        assert!(!releases.join(".0.5.0.unpack").exists());
         assert_eq!(list_releases(&root), ["0.3.0", "0.4.0", "0.5.0"]);
+        // The staging dir left behind, then the slot the install swapped
+        // out (at the staging dir's name).
         let aside = [
-            releases.join(".0.5.0.stale-1"),
             releases.join(".0.5.0.staging.stale-1"),
+            releases.join(".0.5.0.staging.stale-2"),
         ];
         if !as_root {
             for a in &aside {
@@ -4162,6 +4882,7 @@ mod tests {
             None,
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         for a in &aside {
@@ -4222,9 +4943,10 @@ mod tests {
         assert_eq!(current_name(&root), "0.5.0");
         let owner = |p: &Path| fs::symlink_metadata(p).unwrap().uid();
         assert_eq!(owner(&releases.join("0.5.0/vesyl-print")), 1000);
+        // The staging dir left behind, then the slot swapped out.
         let aside = [
-            releases.join(".0.5.0.stale-1"),
             releases.join(".0.5.0.staging.stale-1"),
+            releases.join(".0.5.0.staging.stale-2"),
         ];
         for a in &aside {
             assert_eq!(owner(a), 0, "{}", a.display());
@@ -4237,6 +4959,7 @@ mod tests {
             None,
             None,
             false,
+            &NO_STOP,
         );
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         for a in &aside {
@@ -4253,8 +4976,15 @@ mod tests {
         let manifest = url::Url::from_file_path(td.join("m-0.5.0.json")).unwrap();
         let hb = obj(json!({"desired_agent_version": "0.5.0", "update_url": manifest.to_string()}));
         let root = td.join("opt");
-        let st =
-            maybe_update_from_heartbeat(&hb, &unsigned_ok(&td), &env(&root), None, None, false);
+        let st = maybe_update_from_heartbeat(
+            &hb,
+            &unsigned_ok(&td),
+            &env(&root),
+            None,
+            None,
+            false,
+            &NO_STOP,
+        );
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
     }
 
@@ -4290,8 +5020,15 @@ mod tests {
         // No desired version, and one that would otherwise be installed.
         for hb in [obj(json!({"ok": true})), desire(td.path(), "0.5.0")] {
             for st in &stale {
-                let out =
-                    maybe_update_from_heartbeat(&hb, &c, &old, st.clone(), Some(&path), false);
+                let out = maybe_update_from_heartbeat(
+                    &hb,
+                    &c,
+                    &old,
+                    st.clone(),
+                    Some(&path),
+                    false,
+                    &NO_STOP,
+                );
                 assert_eq!(out.status, STATUS_PENDING_HEALTH, "{st:?}");
                 assert_eq!(out.target_version.as_deref(), Some("0.4.0"), "{st:?}");
                 assert_eq!(out.previous_version.as_deref(), Some("0.3.0"), "{st:?}");
@@ -4310,13 +5047,27 @@ mod tests {
             ..Default::default()
         };
         let hb = desire(td.path(), "0.5.0");
-        let out =
-            maybe_update_from_heartbeat(&hb, &c, &env(&root), Some(rolled), Some(&path), false);
+        let out = maybe_update_from_heartbeat(
+            &hb,
+            &c,
+            &env(&root),
+            Some(rolled),
+            Some(&path),
+            false,
+            &NO_STOP,
+        );
         assert_eq!(out.status, STATUS_ROLLED_BACK);
         // Without a status path (the CLI's own `update apply`) nothing is re-read.
         arm_health_gate(&c, &path, "0.4.0", Some("0.3.0".into())).unwrap();
-        let out =
-            maybe_update_from_heartbeat(&obj(json!({"ok": true})), &c, &old, None, None, false);
+        let out = maybe_update_from_heartbeat(
+            &obj(json!({"ok": true})),
+            &c,
+            &old,
+            None,
+            None,
+            false,
+            &NO_STOP,
+        );
         assert_eq!(out.status, STATUS_IDLE);
     }
 
@@ -4336,7 +5087,8 @@ mod tests {
         let srv =
             http_stub::serve(move |_, s| respond(s, 200, &[("Content-Encoding", "gzip")], &served));
         let dest = td.path().join("a.tar.gz");
-        http_download_to_file(&format!("{}/a.tar.gz", srv.base_url), &dest, &sha).unwrap();
+        http_download_to_file(&format!("{}/a.tar.gz", srv.base_url), &dest, &sha, &NO_STOP)
+            .unwrap();
         assert_eq!(fs::read(&dest).unwrap(), wire);
         assert_eq!(
             srv.requests()[0].header("Accept-Encoding"),
@@ -4355,17 +5107,29 @@ mod tests {
         });
         let sha = hex(&Sha256::digest(b"hello-ota"));
         let dest = td.path().join("a.tar.gz");
-        http_download_to_file(&format!("{}/download/a.tar.gz", srv.base_url), &dest, &sha).unwrap();
+        http_download_to_file(
+            &format!("{}/download/a.tar.gz", srv.base_url),
+            &dest,
+            &sha,
+            &NO_STOP,
+        )
+        .unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"hello-ota");
 
         let err =
-            http_download_to_file(&format!("{}/missing", srv.base_url), &dest, &sha).unwrap_err();
+            http_download_to_file(&format!("{}/missing", srv.base_url), &dest, &sha, &NO_STOP)
+                .unwrap_err();
         assert_eq!(
             (err.code, err.message.as_str()),
             ("download_failed", "HTTP 404 downloading artifact")
         );
-        let err = http_download_to_file(&format!("{}/nolocation", srv.base_url), &dest, &sha)
-            .unwrap_err();
+        let err = http_download_to_file(
+            &format!("{}/nolocation", srv.base_url),
+            &dest,
+            &sha,
+            &NO_STOP,
+        )
+        .unwrap_err();
         assert_eq!(err.code, "download_failed");
         assert!(!td.path().join("a.tar.gz.part").exists());
     }
@@ -4447,5 +5211,1288 @@ mod tests {
         // Per read, at most 120 s for a manifest and 300 s for an artifact.
         assert_eq!(Timeouts::MANIFEST.idle, Duration::from_secs(120));
         assert_eq!(Timeouts::ARTIFACT.idle, Duration::from_secs(300));
+    }
+
+    // --- swapping a slot in, release versions -----------------------------------
+
+    use std::sync::Arc;
+
+    /// Each entry under `dir` by relative path: its mode, and a file's bytes.
+    /// Equal before and after: the tree was left as it was.
+    fn tree(dir: &Path) -> std::collections::BTreeMap<PathBuf, (u32, Option<Vec<u8>>)> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let bytes = if meta.is_dir() {
+                stack.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                None
+            } else {
+                Some(fs::read(&path).unwrap())
+            };
+            let rel = path.strip_prefix(dir).unwrap().to_path_buf();
+            out.insert(rel, (meta.permissions().mode(), bytes));
+        }
+        out
+    }
+
+    /// The names in `dir`, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A new directory `name` in `td`.
+    fn subdir(td: &Path, name: &str) -> PathBuf {
+        let dir = td.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Run `f` as on a filesystem without RENAME_EXCHANGE.
+    fn without_exchange<T>(f: impl FnOnce() -> T) -> T {
+        EXCHANGE_UNSUPPORTED.with(|u| u.set(true));
+        let out = f();
+        EXCHANGE_UNSUPPORTED.with(|u| u.set(false));
+        out
+    }
+
+    /// Reinstalling the version `current` points at (a repair, a re-apply,
+    /// a heartbeat after `current` was switched without a restart) puts the
+    /// new slot in place in one step. An artifact that turns out corrupt,
+    /// or to lack the binary, leaves the slot exactly as it was and
+    /// `current` working, however it arrives; a good one replaces the
+    /// slot's files.
+    #[test]
+    fn reinstalling_the_active_slot_keeps_current_working() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let slot = root.join("releases/0.4.0");
+        let canonical = fs::canonicalize(&slot).unwrap();
+        let before = tree(&slot);
+        // An artifact its checksum matches that is no tarball (a bad
+        // upload), and one without the binary.
+        let corrupt = subdir(td.path(), "corrupt").join("vesyl-print-0.4.0.tar.gz");
+        fs::write(&corrupt, b"definitely not gzip").unwrap();
+        let bare = tarball_with(&subdir(td.path(), "bare"), "0.4.0", &[("README", false)]);
+        for (tarball, why) in [
+            (&corrupt, "extract failed: "),
+            (&bare, "archive missing an executable vesyl-print binary"),
+        ] {
+            let m = manifest_for(tarball, "0.4.0");
+            for (how, err) in [
+                (
+                    "online",
+                    apply_release(&m, &env(&root), None, false, &NO_STOP).unwrap_err(),
+                ),
+                (
+                    "--file",
+                    apply_local_release(&m, &env(&root), tarball, None, false).unwrap_err(),
+                ),
+            ] {
+                let ctx = format!("{how} {}", tarball.display());
+                assert_eq!(err.code, "bad_archive", "{ctx}: {err}");
+                assert!(err.message.starts_with(why), "{ctx}: {err}");
+                assert_eq!(tree(&slot), before, "{ctx}: the slot changed");
+                assert_eq!(current_release_dir(&root), Some(canonical.clone()), "{ctx}");
+                assert!(
+                    local_slot_healthy(&env(&root), Some("0.4.0")).is_ok(),
+                    "{ctx}"
+                );
+                assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"], "{ctx}");
+            }
+        }
+        assert_eq!(names(&root.join("update")), Vec::<String>::new());
+
+        // A good one is swapped in, online or from a file.
+        for (how, marker) in [("online", "online-marker"), ("--file", "file-marker")] {
+            let good = tarball_with(
+                &subdir(td.path(), marker),
+                "0.4.0",
+                &[("vesyl-print", true), (marker, false)],
+            );
+            let m = manifest_for(&good, "0.4.0");
+            let installed = match how {
+                "online" => apply_release(&m, &env(&root), None, false, &NO_STOP),
+                _ => apply_local_release(&m, &env(&root), &good, None, false),
+            };
+            assert_eq!(installed.unwrap(), slot, "{how}");
+            assert!(slot.join(marker).is_file(), "{how}");
+            assert!(!slot.join("main.py").exists(), "{how}: old files stayed");
+            assert_eq!(fs::read_to_string(slot.join("VERSION")).unwrap(), "0.4.0\n");
+            assert_eq!(current_name(&root), "0.4.0");
+            assert!(
+                local_slot_healthy(&env(&root), Some("0.4.0")).is_ok(),
+                "{how}"
+            );
+            assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"], "{how}");
+        }
+    }
+
+    /// The heartbeat's way to the same: the agent still runs 0.3.0, `current`
+    /// was switched to 0.4.0 without a restart, and the server asks for
+    /// 0.4.0. A corrupt artifact leaves the slot as it was; a good one is
+    /// swapped in.
+    #[test]
+    fn a_heartbeat_reinstall_of_the_active_slot_keeps_current_working() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let slot = root.join("releases/0.4.0");
+        let before = tree(&slot);
+        let agent = slot_agent(&root, "0.3.0");
+        let asking_for = |tarball: &Path| {
+            let manifest = tarball.with_extension("json");
+            let m = manifest_for(tarball, "0.4.0");
+            fs::write(&manifest, Value::Object(m.raw).to_string()).unwrap();
+            let url = url::Url::from_file_path(&manifest).unwrap();
+            obj(json!({"desired_agent_version": "0.4.0", "update_url": url.as_str()}))
+        };
+
+        let corrupt = subdir(td.path(), "corrupt").join("vesyl-print-0.4.0.tar.gz");
+        fs::write(&corrupt, b"definitely not gzip").unwrap();
+        let st = maybe_update_from_heartbeat(
+            &asking_for(&corrupt),
+            &c,
+            &agent,
+            None,
+            None,
+            false,
+            &NO_STOP,
+        );
+        assert_eq!(st.status, STATUS_FAILED);
+        assert_eq!(st.last_error_code.as_deref(), Some("bad_archive"));
+        assert_eq!(tree(&slot), before);
+        assert_eq!(current_name(&root), "0.4.0");
+        assert!(local_slot_healthy(&env(&root), Some("0.4.0")).is_ok());
+
+        let good = tarball_with(
+            &subdir(td.path(), "good"),
+            "0.4.0",
+            &[("vesyl-print", true), ("marker", false)],
+        );
+        let st = maybe_update_from_heartbeat(
+            &asking_for(&good),
+            &c,
+            &agent,
+            None,
+            None,
+            false,
+            &NO_STOP,
+        );
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert!(slot.join("marker").is_file());
+        assert_eq!(current_name(&root), "0.4.0");
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"]);
+    }
+
+    /// While the slot `current` points at is replaced, `current` leads to a
+    /// runnable slot at every moment: a unit (re)started then finds its
+    /// binary. (The slot used to be removed before its replacement was
+    /// moved in.)
+    #[test]
+    fn current_never_dangles_while_its_slot_is_replaced() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let tarball = build_release(&td.path().join("again"), "0.4.0");
+        let m = manifest_for(&tarball, "0.4.0");
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (binary, done) = (root.join("current/vesyl-print"), done.clone());
+            std::thread::spawn(move || {
+                let mut looks = 0u64;
+                while !done.load(Ordering::SeqCst) {
+                    if !binary.is_file() {
+                        return Err(looks);
+                    }
+                    looks += 1;
+                }
+                Ok(looks)
+            })
+        };
+        for _ in 0..30 {
+            apply_local_release(&m, &env(&root), &tarball, None, false).unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        let looks = watcher.join().unwrap();
+        assert!(
+            looks.is_ok(),
+            "current/vesyl-print missing after {looks:?} looks"
+        );
+    }
+
+    /// On a filesystem without RENAME_EXCHANGE, the slot `current` points
+    /// at is left as it is and its reinstall refused for good (a retry
+    /// would only download it again); any other slot of the version is
+    /// replaced as before, cleared first.
+    #[test]
+    fn without_exchange_the_active_slot_is_never_replaced() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let slot = root.join("releases/0.4.0");
+        let before = tree(&slot);
+        let tarball = build_release(&td.path().join("again"), "0.4.0");
+        let m = manifest_for(&tarball, "0.4.0");
+        let err = without_exchange(|| apply_local_release(&m, &env(&root), &tarball, None, false))
+            .unwrap_err();
+        assert_eq!(err.code, NO_EXCHANGE, "{err}");
+        assert!(
+            err.message
+                .ends_with("`current` points at it, so it was left as it is"),
+            "{err}"
+        );
+        assert!(fails_for_good(err.code));
+        assert_eq!(tree(&slot), before);
+        assert_eq!(current_name(&root), "0.4.0");
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"]);
+
+        // 0.3.0 is not where `current` points: replaced.
+        let older = tarball_with(
+            &subdir(td.path(), "older"),
+            "0.3.0",
+            &[("vesyl-print", true), ("marker", false)],
+        );
+        let m = manifest_for(&older, "0.3.0");
+        without_exchange(|| apply_local_release(&m, &env(&root), &older, None, false)).unwrap();
+        assert!(root.join("releases/0.3.0/marker").is_file());
+        assert_eq!(current_name(&root), "0.3.0");
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"]);
+    }
+
+    const SWAP_TD: &str = "VESYL_TEST_SWAP_TD";
+
+    /// Every path under `dir` whose owner (lstat) is not `uid`.
+    fn not_owned_by(dir: &Path, uid: u32) -> Vec<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        let mut wrong = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.uid() != uid {
+                wrong.push(path.clone());
+            }
+            if meta.is_dir() {
+                stack.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            }
+        }
+        wrong
+    }
+
+    /// Root (`sudo vesyl-print update apply --file` of the version that
+    /// runs) swaps the slot in and leaves `releases/` the service user's:
+    /// the new slot is that user's, the one swapped out deleted. That user
+    /// (the agent) then reinstalls the slot, made root's here as an older
+    /// root run left it, without write access to it: the swap moves
+    /// neither slot out of `releases/`, and the old one is set aside for
+    /// root to delete. Needs root (or a user namespace):
+    /// `unshare --map-root-user --map-auto <test binary> --include-ignored`.
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown and switch users"]
+    fn root_reinstall_of_the_active_slot_is_swapped_in() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::process::CommandExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        // As setup.sh leaves it: the install tree is the service user's.
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        crate::util::hand_tree_to_parent_owner(&root).unwrap();
+        let releases = root.join("releases");
+        let slot = releases.join("0.4.0");
+
+        let by_root = tarball_with(
+            &subdir(td.path(), "root-run"),
+            "0.4.0",
+            &[("vesyl-print", true), ("by-root", false)],
+        );
+        let m = manifest_for(&by_root, "0.4.0");
+        apply_local_release(&m, &env(&root), &by_root, None, false).unwrap();
+        assert!(slot.join("by-root").is_file());
+        assert_eq!(current_name(&root), "0.4.0");
+        assert_eq!(not_owned_by(&releases, 1000), Vec::<PathBuf>::new());
+        assert_eq!(names(&releases), ["0.3.0", "0.4.0"]);
+
+        // An older root run left the slot root's.
+        for path in [slot.clone(), slot.join("vesyl-print"), slot.join("by-root")] {
+            std::os::unix::fs::lchown(&path, Some(0), Some(0)).unwrap();
+        }
+        let by_agent = tarball_with(
+            &subdir(td.path(), "agent-run"),
+            "0.4.0",
+            &[("vesyl-print", true), ("by-agent", false)],
+        );
+        let m = manifest_for(&by_agent, "0.4.0");
+        fs::write(
+            td.path().join("agent-run.json"),
+            Value::Object(m.raw.clone()).to_string(),
+        )
+        .unwrap();
+        // Through /proc: the service user may not search the directories the
+        // test binary sits in.
+        let out = std::process::Command::new("/proc/self/exe")
+            .args([
+                "--exact",
+                "update::tests::service_user_reinstall_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SWAP_TD, td.path())
+            .uid(1000)
+            .gid(1000)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(current_name(&root), "0.4.0");
+        assert!(slot.join("by-agent").is_file());
+        assert_eq!(not_owned_by(&slot, 1000), Vec::<PathBuf>::new());
+        let aside = releases.join(".0.4.0.staging.stale-1");
+        assert!(aside.join("by-root").is_file());
+        assert_eq!(fs::symlink_metadata(&aside).unwrap().uid(), 0);
+
+        // Root's next install deletes it.
+        apply_local_release(&m, &env(&root), &by_agent, None, false).unwrap();
+        assert_eq!(names(&releases), ["0.3.0", "0.4.0"]);
+        assert_eq!(not_owned_by(&releases, 1000), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    #[ignore = "child process of root_reinstall_of_the_active_slot_is_swapped_in"]
+    fn service_user_reinstall_child() {
+        let Some(td) = std::env::var_os(SWAP_TD).map(PathBuf::from) else {
+            return;
+        };
+        let raw = fs::read_to_string(td.join("agent-run.json")).unwrap();
+        let m = ReleaseManifest::from_dict(&obj(serde_json::from_str(&raw).unwrap())).unwrap();
+        let root = td.join("opt");
+        let dir = apply_release(&m, &env(&root), None, false, &NO_STOP).unwrap();
+        assert_eq!(dir, root.join("releases/0.4.0"));
+    }
+
+    #[test]
+    fn a_leading_v_is_not_part_of_the_version() {
+        for (raw, version) in [
+            ("0.5.0", "0.5.0"),
+            (" v0.5.0\n", "0.5.0"),
+            ("v1.2.3-rc.1", "1.2.3-rc.1"),
+            ("vv1.0.0", "v1.0.0"),
+            ("latest", "latest"),
+        ] {
+            assert_eq!(normalize_version(raw), version, "{raw:?}");
+        }
+    }
+
+    /// The manifest fetched for a desired version must be that version's (a
+    /// leading `v` aside), and so must the archive it points at: anything
+    /// else is refused before it is installed.
+    #[test]
+    fn a_release_of_another_version_is_refused() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        // The server asks for 0.5.0, but its update_url is 0.5.1's manifest.
+        let wrong = obj(json!({
+            "desired_agent_version": "0.5.0",
+            "update_url": local_manifest(td.path(), "0.5.1"),
+        }));
+        let st = maybe_update_from_heartbeat(&wrong, &c, &env(&root), None, None, false, &NO_STOP);
+        assert_eq!(st.status, STATUS_FAILED);
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("manifest is for version 0.5.1, not 0.5.0")
+        );
+        assert_eq!(st.last_error_code.as_deref(), Some(VERSION_MISMATCH));
+        assert!(!root.join("update").exists(), "downloaded");
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"]);
+        assert_eq!(current_name(&root), "0.4.0");
+
+        // `v0.5.0` is 0.5.0.
+        let tagged = obj(json!({
+            "desired_agent_version": "v0.5.0",
+            "update_url": local_manifest(td.path(), "0.5.0"),
+        }));
+        let st = maybe_update_from_heartbeat(&tagged, &c, &env(&root), None, None, false, &NO_STOP);
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
+        assert_eq!(current_name(&root), "0.5.0");
+        // Running it, there is nothing to do (nothing fetched: the manifest
+        // is gone), as for `v1.2.3` on a node that runs 1.2.3, which would
+        // never equal 1.2.3 if compared as given.
+        let gone = url::Url::from_file_path(td.path().join("gone.json")).unwrap();
+        for (running, asked) in [("0.5.0", "v0.5.0"), ("1.2.3", "v1.2.3")] {
+            let hb = obj(json!({"desired_agent_version": asked, "update_url": gone.as_str()}));
+            let node = UpdateEnv {
+                running_version: running.into(),
+                ..env(&root)
+            };
+            let st = maybe_update_from_heartbeat(&hb, &c, &node, None, None, false, &NO_STOP);
+            assert_eq!(st.status, STATUS_IDLE, "{asked}: {:?}", st.last_error);
+            assert_eq!(st.target_version.as_deref(), Some(running), "{asked}");
+        }
+
+        // The right manifest for the artifact of another release.
+        let other = build_release(&td.path().join("other"), "0.4.9");
+        let m = manifest_for(&other, "0.5.2");
+        for err in [
+            apply_release(&m, &env(&root), None, false, &NO_STOP).unwrap_err(),
+            apply_local_release(&m, &env(&root), &other, None, false).unwrap_err(),
+        ] {
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                (
+                    VERSION_MISMATCH,
+                    "archive holds vesyl-print-0.4.9, not version 0.5.2"
+                )
+            );
+        }
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0", "0.5.0"]);
+        assert_eq!(current_name(&root), "0.5.0");
+    }
+
+    // --- holds and backoff ---------------------------------------------------------
+
+    /// What a test release server answers for a path, given its base URL.
+    type Answer = Box<dyn Fn(&str) -> (u16, Vec<u8>) + Send + Sync>;
+
+    /// Paths and what is answered for each.
+    type Routes = Vec<(String, Answer)>;
+
+    /// Serve `routes`; anything else is a 404.
+    fn serve_routes(routes: Routes) -> http_stub::Stub {
+        http_stub::serve(move |req, s| {
+            let base = format!("http://127.0.0.1:{}", req.port());
+            match routes.iter().find(|(path, _)| *path == req.path) {
+                Some((_, answer)) => {
+                    let (status, body) = answer(&base);
+                    respond(s, status, &[], &body);
+                }
+                None => respond(s, 404, &[], b""),
+            }
+        })
+    }
+
+    /// The routes of a release named `name`: `/<name>.json`, its manifest
+    /// for `version` (with `extra` merged in), and `/<name>.tar.gz`,
+    /// `artifact`, served with `status`.
+    fn release_routes(
+        name: &str,
+        version: &str,
+        artifact: Vec<u8>,
+        status: u16,
+        extra: Value,
+    ) -> Routes {
+        let link = format!("/{name}.tar.gz");
+        let (version, sha, href) = (
+            version.to_string(),
+            hex(&Sha256::digest(&artifact)),
+            link.clone(),
+        );
+        let manifest: Answer = Box::new(move |base| {
+            let mut m = json!({
+                "version": version,
+                "artifact_url": format!("{base}{href}"),
+                "artifact_sha256": sha,
+            });
+            if let (Value::Object(m), Value::Object(extra)) = (&mut m, extra.clone()) {
+                m.extend(extra);
+            }
+            (200, m.to_string().into_bytes())
+        });
+        let served: Answer = Box::new(move |_| (status, artifact.clone()));
+        vec![(format!("/{name}.json"), manifest), (link, served)]
+    }
+
+    /// A heartbeat asking for `version`, its manifest `/<name>.json` on `srv`.
+    fn asking(srv: &http_stub::Stub, name: &str, version: &str) -> JsonObject {
+        obj(json!({
+            "desired_agent_version": version,
+            "update_url": format!("{}/{name}.json", srv.base_url),
+        }))
+    }
+
+    /// A desired version that cannot be installed (a Python-era release
+    /// without the binary, a manifest or signature that does not check
+    /// out, …) is not fetched again on every heartbeat: like a version that
+    /// failed its health gate, it is held, and shown as failed, until the
+    /// desired version changes or an operator applies it.
+    #[test]
+    fn a_release_that_cannot_be_installed_is_held() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let lab = unsigned_ok(td.path());
+        let signed = cfg(td.path());
+        let python = fs::read(tarball_with(
+            &subdir(td.path(), "py"),
+            "0.5.0",
+            &[("agent.py", false), ("main.py", false)],
+        ))
+        .unwrap();
+        let good = fs::read(build_release(&td.path().join("good"), "0.5.0")).unwrap();
+        let other = fs::read(build_release(&td.path().join("other"), "0.4.9")).unwrap();
+        let portal: Answer = Box::new(|_| (200, b"<html>sign in</html>".to_vec()));
+        let release = |artifact: &[u8], version: &str, extra: Value| {
+            release_routes("r", version, artifact.to_vec(), 200, extra)
+        };
+        /// A release asked for as 0.5.0 that this node cannot install.
+        struct Unfit<'a> {
+            what: &'a str,
+            routes: Routes,
+            config: &'a Config,
+            code: &'a str,
+            /// How its `last_error` starts.
+            error: &'a str,
+            /// Requests to the server on each try.
+            per_try: usize,
+        }
+        let cases = [
+            Unfit {
+                what: "no binary",
+                routes: release(&python, "0.5.0", json!({})),
+                config: &lab,
+                code: "bad_archive",
+                error: "archive missing an executable vesyl-print binary",
+                per_try: 2,
+            },
+            Unfit {
+                what: "no tarball",
+                routes: release(b"not gzip", "0.5.0", json!({})),
+                config: &lab,
+                code: "bad_archive",
+                error: "extract failed: ",
+                per_try: 2,
+            },
+            Unfit {
+                what: "checksum",
+                routes: release(&good, "0.5.0", json!({"artifact_sha256": "0".repeat(64)})),
+                config: &lab,
+                code: "bad_checksum",
+                error: "artifact sha256 mismatch",
+                per_try: 2,
+            },
+            Unfit {
+                what: "unsigned",
+                routes: release(&good, "0.5.0", json!({})),
+                config: &signed,
+                code: "bad_signature",
+                error: "manifest missing signature",
+                per_try: 1,
+            },
+            Unfit {
+                what: "too old",
+                routes: release(&good, "0.5.0", json!({"min_agent_version": "99.0.0"})),
+                config: &lab,
+                code: "too_old",
+                error: "current 0.4.0 < min_agent_version 99.0.0",
+                per_try: 1,
+            },
+            Unfit {
+                what: "another version's manifest",
+                routes: release(&good, "0.5.1", json!({})),
+                config: &lab,
+                code: VERSION_MISMATCH,
+                error: "manifest is for version 0.5.1, not 0.5.0",
+                per_try: 1,
+            },
+            Unfit {
+                what: "another version's archive",
+                routes: release(&other, "0.5.0", json!({})),
+                config: &lab,
+                code: VERSION_MISMATCH,
+                error: "archive holds vesyl-print-0.4.9, not version 0.5.0",
+                per_try: 2,
+            },
+            Unfit {
+                what: "no manifest",
+                routes: vec![("/r.json".into(), portal)],
+                config: &lab,
+                code: "bad_manifest",
+                error: "manifest is not valid JSON",
+                per_try: 1,
+            },
+        ];
+        let mut held = UpdateStatus::default();
+        for Unfit {
+            what,
+            routes,
+            config,
+            code,
+            error,
+            per_try,
+        } in cases
+        {
+            let srv = serve_routes(routes);
+            let hb = asking(&srv, "r", "0.5.0");
+            let heartbeat = |st: Option<UpdateStatus>| {
+                maybe_update_from_heartbeat(&hb, config, &env(&root), st, None, false, &NO_STOP)
+            };
+            let failed = heartbeat(None);
+            assert_eq!(failed.status, STATUS_FAILED, "{what}");
+            assert_eq!(failed.last_error_code.as_deref(), Some(code), "{what}");
+            let message = failed.last_error.clone().unwrap();
+            assert!(message.starts_with(error), "{what}: {message}");
+            assert_eq!(
+                (failed.attempts, failed.retry_at.as_deref()),
+                (1, None),
+                "{what}"
+            );
+            assert_eq!(srv.requests().len(), per_try, "{what}");
+            // Held, and shown as failed; nothing fetched again.
+            held = failed.clone();
+            for _ in 0..3 {
+                held = heartbeat(Some(held));
+                assert_eq!(held.status, STATUS_FAILED, "{what}");
+                assert_eq!(held.last_error, failed.last_error, "{what}");
+                assert_eq!(held.target_version.as_deref(), Some("0.5.0"), "{what}");
+            }
+            assert_eq!(srv.requests().len(), per_try, "{what}: fetched again");
+            // An operator's apply starts from a fresh status.
+            heartbeat(None);
+            assert_eq!(
+                srv.requests().len(),
+                2 * per_try,
+                "{what}: manual apply held"
+            );
+            assert_eq!(current_name(&root), "0.4.0", "{what}");
+            assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"], "{what}");
+        }
+
+        // Another desired version is tried, and installed.
+        let fixed = fs::read(build_release(&td.path().join("fixed"), "0.5.1")).unwrap();
+        let srv = serve_routes(release_routes("fixed", "0.5.1", fixed, 200, json!({})));
+        let hb = asking(&srv, "fixed", "0.5.1");
+        let st =
+            maybe_update_from_heartbeat(&hb, &lab, &env(&root), Some(held), None, false, &NO_STOP);
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(
+            (st.last_error_code, st.attempts, st.retry_at),
+            (None, 0, None)
+        );
+        assert_eq!(current_name(&root), "0.5.1");
+    }
+
+    /// A failure that may pass (the network, an HTTP error, a full disk) is
+    /// retried, but not on every heartbeat: after a minute, then 2, 4, …,
+    /// at most an hour apart, kept in `update_status.json` across restarts.
+    /// Another desired version, or success, starts afresh.
+    #[test]
+    fn a_failure_that_may_pass_is_retried_after_a_backoff() {
+        assert_eq!(
+            [1, 2, 3, 4, 5, 6, 7, 8, 100].map(retry_delay_seconds),
+            [60, 120, 240, 480, 960, 1920, 3600, 3600, 3600]
+        );
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let path = td.path().join("update_status.json");
+        let server = |version: &str, status: u16| {
+            let tarball = build_release(&td.path().join(version), version);
+            serve_routes(release_routes(
+                "r",
+                version,
+                fs::read(tarball).unwrap(),
+                status,
+                json!({}),
+            ))
+        };
+        let heartbeat = |srv: &http_stub::Stub, version: &str, st: Option<UpdateStatus>| {
+            let hb = asking(srv, "r", version);
+            let st =
+                maybe_update_from_heartbeat(&hb, &c, &env(&root), st, Some(&path), false, &NO_STOP);
+            write_update_status(&path, &st).unwrap();
+            st
+        };
+        let wait = |st: &UpdateStatus| {
+            (parse_utc(st.retry_at.as_deref().unwrap()).unwrap() - Utc::now()).num_seconds()
+        };
+
+        let down = server("0.5.0", 503);
+        let st = heartbeat(&down, "0.5.0", None);
+        assert_eq!(st.status, STATUS_FAILED);
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("HTTP 503 downloading artifact")
+        );
+        assert_eq!(st.last_error_code.as_deref(), Some("download_failed"));
+        assert_eq!(st.attempts, 1);
+        assert!((50..=60).contains(&wait(&st)), "{:?}", st.retry_at);
+        assert_eq!(down.requests().len(), 2);
+        // Not before retry_at, read back from disk (a restart) too.
+        let st = heartbeat(&down, "0.5.0", read_update_status(&path));
+        assert_eq!((st.status.as_str(), st.attempts), (STATUS_FAILED, 1));
+        assert_eq!(down.requests().len(), 2, "retried before retry_at");
+        // Once it has passed: tried again, then twice as long to wait.
+        let passed = UpdateStatus {
+            retry_at: Some(utc_now_plus(-1)),
+            ..st
+        };
+        let st = heartbeat(&down, "0.5.0", Some(passed));
+        assert_eq!(down.requests().len(), 4);
+        assert_eq!(st.attempts, 2);
+        assert!((110..=120).contains(&wait(&st)), "{:?}", st.retry_at);
+        // A retry_at further off than the longest wait came from a clock
+        // that ran ahead: it has passed.
+        let ahead = UpdateStatus {
+            retry_at: Some(utc_now_plus(2 * RETRY_MAX_SECONDS)),
+            ..st
+        };
+        let st = heartbeat(&down, "0.5.0", Some(ahead));
+        assert_eq!(down.requests().len(), 6);
+        assert_eq!(st.attempts, 3);
+
+        // Another desired version is tried at once, from its first attempt.
+        let also_down = server("0.5.1", 503);
+        let st = heartbeat(&also_down, "0.5.1", Some(st));
+        assert_eq!(also_down.requests().len(), 2);
+        assert_eq!(
+            (st.target_version.as_deref(), st.attempts),
+            (Some("0.5.1"), 1)
+        );
+        assert!((50..=60).contains(&wait(&st)), "{:?}", st.retry_at);
+        // Success clears it all.
+        let up = server("0.5.2", 200);
+        let st = heartbeat(&up, "0.5.2", Some(st));
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(
+            (st.last_error_code, st.attempts, st.retry_at),
+            (None, 0, None)
+        );
+        assert_eq!(current_name(&root), "0.5.2");
+    }
+
+    /// `update_status.json` as earlier releases write it, without the
+    /// fields for holds and the backoff, still loads; and a status that
+    /// needs none of them is written as they write it, so a release rolled
+    /// back to reads the file as before.
+    #[test]
+    fn status_files_of_earlier_releases_still_load() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("update_status.json");
+        fs::write(
+            &path,
+            r#"{"status": "failed", "current_version": "0.4.0", "target_version": "0.5.0",
+                "last_error": "network error: Connection refused", "channel": "stable",
+                "last_checked_at": "2026-10-08T12:00:00+00:00", "previous_version": "0.4.0",
+                "health_deadline_at": null, "health_attempts": 0}"#,
+        )
+        .unwrap();
+        let st = read_update_status(&path).unwrap();
+        assert_eq!(
+            (
+                st.last_error_code.as_deref(),
+                st.attempts,
+                st.retry_at.as_deref()
+            ),
+            (None, 0, None)
+        );
+        // Neither held nor waiting: retried (see only_health_gate_failures_block_a_retry).
+        assert!(!failed_for_good(&st) && !retry_pending(&st, Utc::now()));
+
+        let keys = |p: &Path| -> Vec<String> {
+            let raw: Value = serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap();
+            raw.as_object().unwrap().keys().cloned().collect()
+        };
+        let earlier = [
+            "channel",
+            "current_version",
+            "health_attempts",
+            "health_deadline_at",
+            "last_checked_at",
+            "last_error",
+            "previous_version",
+            "status",
+            "target_version",
+        ];
+        write_update_status(&path, &st).unwrap();
+        assert_eq!(keys(&path), earlier);
+        let backing_off = UpdateStatus {
+            last_error_code: Some("download_failed".into()),
+            attempts: 2,
+            retry_at: Some(utc_now_plus(120)),
+            ..st
+        };
+        write_update_status(&path, &backing_off).unwrap();
+        assert_eq!(read_update_status(&path).unwrap(), backing_off);
+        let mut now = earlier.to_vec();
+        now.extend(["attempts", "last_error_code", "retry_at"]);
+        now.sort();
+        assert_eq!(keys(&path), now);
+    }
+
+    /// A gate that failed its version and could not roll back (`health
+    /// failed: …`) has given its verdict: it is not promoted back into a
+    /// gate, which would pause jobs again on every cycle. An install cut
+    /// off after its activation still is (see `recover_false_failed_then_health_ok`
+    /// and `interrupted_install_can_still_roll_back`). Once the version it
+    /// failed runs healthy after all (whoami answers again), the failure is
+    /// cleared at once, never through `pending_health`: jobs never pause.
+    #[test]
+    fn a_failed_gate_is_not_armed_again() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = cfg(td.path());
+        let expired = || pending("2000-01-01T00:00:00+00:00".into());
+        let judge_in = |agent: &UpdateEnv, st: UpdateStatus, whoami: WhoamiResult| {
+            process_pending_health(st, &c, agent, whoami, Some("timeout"), None, &NO_STOP)
+        };
+        let judge = |st: UpdateStatus, whoami: WhoamiResult| judge_in(&env(&root), st, whoami);
+        let no_previous = judge(
+            UpdateStatus {
+                previous_version: None,
+                ..expired()
+            },
+            WhoamiResult::Error,
+        );
+        assert_eq!(
+            no_previous.last_error.as_deref(),
+            Some("health failed: timeout (no previous slot to roll back to)")
+        );
+        // The slot to roll back to cannot run.
+        crate::util::set_mode(&root.join("releases/0.3.0/vesyl-print"), 0o644).unwrap();
+        let no_rollback = judge(expired(), WhoamiResult::Error);
+        assert!(
+            no_rollback
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("; rollback error: "),
+            "{:?}",
+            no_rollback.last_error
+        );
+        // The agent runs 0.4.0 from a healthy slot: each later cycle used to
+        // promote these back to pending_health.
+        for failed in [no_previous.clone(), no_rollback] {
+            let ctx = failed.last_error.clone().unwrap();
+            assert_eq!(failed.status, STATUS_FAILED, "{ctx}");
+            assert!(!should_pause_jobs(Some(&failed)), "{ctx}");
+            let again = recover_false_update_failure(failed.clone(), &c, &env(&root));
+            assert_eq!(again, failed, "{ctx}");
+            // Cycle after cycle while whoami fails: failed, as it was.
+            let mut st = failed.clone();
+            for _ in 0..3 {
+                st = judge(st, WhoamiResult::Error);
+                assert_eq!(st, failed, "{ctx}");
+            }
+            // Whoami answers (paired or not): 0.4.0 runs healthy here after
+            // all, and its failure is over.
+            for whoami in [
+                WhoamiResult::Ok,
+                WhoamiResult::Unauthorized,
+                WhoamiResult::Skipped,
+            ] {
+                let healed = judge(failed.clone(), whoami);
+                assert_eq!(healed.status, STATUS_IDLE, "{ctx}: {whoami:?}");
+                assert_eq!(
+                    (
+                        healed.current_version.as_str(),
+                        healed.target_version.as_deref()
+                    ),
+                    ("0.4.0", Some("0.4.0")),
+                    "{ctx}: {whoami:?}"
+                );
+                assert_eq!(
+                    (
+                        healed.last_error.as_deref(),
+                        healed.previous_version.as_deref(),
+                        healed.health_deadline_at.as_deref(),
+                        healed.armed_at.as_deref()
+                    ),
+                    (None, None, None, None),
+                    "{ctx}: {whoami:?}"
+                );
+                assert!(!should_pause_jobs(Some(&healed)), "{ctx}: {whoami:?}");
+                // The heartbeat that follows asks for the version it runs.
+                let hb = obj(json!({"desired_agent_version": "0.4.0"}));
+                let after = maybe_update_from_heartbeat(
+                    &hb,
+                    &c,
+                    &env(&root),
+                    Some(healed),
+                    None,
+                    false,
+                    &NO_STOP,
+                );
+                assert_eq!(after.status, STATUS_IDLE, "{ctx}: {whoami:?}");
+            }
+            assert_eq!(current_name(&root), "0.4.0", "{ctx}");
+        }
+
+        // Not while the version it failed does not run here (another agent),
+        // nor while its slot cannot run.
+        let other = slot_agent(&root, "0.3.0");
+        assert_eq!(
+            judge_in(&other, no_previous.clone(), WhoamiResult::Ok),
+            no_previous
+        );
+        crate::util::set_mode(&root.join("releases/0.4.0/vesyl-print"), 0o644).unwrap();
+        assert_eq!(judge(no_previous.clone(), WhoamiResult::Ok), no_previous);
+    }
+
+    /// `update rollback` from 0.4.0 to 0.3.0 is recorded: the agent does not
+    /// install 0.4.0 again while the server still asks for it, only another
+    /// version; an open gate is closed with it, and the record wins over a
+    /// status an agent read before it was written.
+    #[test]
+    fn a_manual_rollback_holds_the_version_left() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let path = td.path().join("update_status.json");
+        let gate = armed_gate(td.path(), &c);
+        assert_eq!(rollback(&root, None, None).unwrap(), "0.3.0");
+        let st = record_manual_rollback(&path, "0.4.0", "0.3.0").unwrap();
+        assert_eq!(read_update_status(&path).unwrap(), st);
+        assert_eq!(st.status, STATUS_ROLLED_BACK);
+        assert_eq!(st.target_version.as_deref(), Some("0.4.0"));
+        assert_eq!(st.current_version, "0.3.0");
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("manual rollback from 0.4.0 to 0.3.0")
+        );
+        assert_eq!(
+            (
+                st.previous_version.as_deref(),
+                st.health_deadline_at.as_deref(),
+                st.armed_at.as_deref(),
+                st.health_attempts
+            ),
+            (None, None, None, 0)
+        );
+        assert!(!should_pause_jobs(Some(&st)));
+        assert!(failed_health_gate(&st));
+
+        let agent = slot_agent(&root, "0.3.0");
+        let slot = tree(&root.join("releases/0.4.0"));
+        // As read at the start of the cycle (the gate), and as on disk.
+        for read in [Some(gate), Some(st.clone())] {
+            let out = maybe_update_from_heartbeat(
+                &desire(td.path(), "0.4.0"),
+                &c,
+                &agent,
+                read,
+                Some(&path),
+                false,
+                &NO_STOP,
+            );
+            assert_eq!(out.status, STATUS_ROLLED_BACK);
+            assert_eq!(out.last_error, st.last_error);
+            assert_eq!(current_name(&root), "0.3.0");
+            assert_eq!(tree(&root.join("releases/0.4.0")), slot, "reinstalled");
+        }
+        // Another version is installed.
+        let out = maybe_update_from_heartbeat(
+            &desire(td.path(), "0.4.1"),
+            &c,
+            &agent,
+            Some(st),
+            Some(&path),
+            false,
+            &NO_STOP,
+        );
+        assert_eq!(out.status, STATUS_PENDING_HEALTH, "{:?}", out.last_error);
+        assert_eq!(current_name(&root), "0.4.1");
+    }
+
+    // --- stopping ----------------------------------------------------------------
+
+    /// A stop that lands mid-download ends it after the read in progress,
+    /// not when systemd kills the agent 90 s on: nothing is left behind (no
+    /// `.part`, no artifact, no slot), nothing activated, and the status
+    /// lets the next start try again (neither failed nor held).
+    #[test]
+    fn a_stop_mid_download_leaves_nothing_behind() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let path = td.path().join("update_status.json");
+        let tarball = build_release(&td.path().join("0.5.0"), "0.5.0");
+        let body = fs::read(&tarball).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let first = Arc::new(AtomicBool::new(true));
+        let (stopping, served) = (stop.clone(), body.clone());
+        // The first download trickles: 40 pieces 200 ms apart, 8 s in all,
+        // and the agent is stopped once the first is out. Later ones are
+        // served whole.
+        let srv = http_stub::serve(move |_, s| {
+            if !first.swap(false, Ordering::SeqCst) {
+                return respond(s, 200, &[], &served);
+            }
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                served.len()
+            );
+            let pieces: Vec<&[u8]> = served.chunks(served.len().div_ceil(40)).collect();
+            let _ = s.write_all(pieces[0]);
+            let _ = s.flush();
+            stopping.store(true, Ordering::SeqCst);
+            for piece in &pieces[1..] {
+                std::thread::sleep(Duration::from_millis(200));
+                if s.write_all(piece).and_then(|()| s.flush()).is_err() {
+                    return;
+                }
+            }
+        });
+        let manifest = td.path().join("m.json");
+        fs::write(
+            &manifest,
+            json!({
+                "version": "0.5.0",
+                "artifact_url": format!("{}/a.tar.gz", srv.base_url),
+                "artifact_sha256": sha256_file(&tarball).unwrap(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let hb = obj(json!({
+            "desired_agent_version": "0.5.0",
+            "update_url": url::Url::from_file_path(&manifest).unwrap().to_string(),
+        }));
+        let started = std::time::Instant::now();
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, Some(&path), false, &stop);
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+        assert_eq!(st.status, STATUS_IDLE, "{:?}", st.last_error);
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("update stopped while downloading: the agent is stopping")
+        );
+        assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
+        assert_eq!(
+            (
+                st.last_error_code.as_deref(),
+                st.attempts,
+                st.retry_at.as_deref()
+            ),
+            (None, 0, None)
+        );
+        assert_eq!(st.previous_version, None);
+        assert!(!should_pause_jobs(Some(&st)));
+        assert_eq!(names(&root.join("update")), Vec::<String>::new());
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"]);
+        assert_eq!(current_name(&root), "0.4.0");
+
+        // The next start tries again.
+        let st = maybe_update_from_heartbeat(
+            &hb,
+            &c,
+            &env(&root),
+            Some(st),
+            Some(&path),
+            false,
+            &NO_STOP,
+        );
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(current_name(&root), "0.5.0");
+    }
+
+    /// Run `f` with a stop of its own, which the agent gets once the release
+    /// is unpacked: while it is checked, before it is put in place.
+    fn stopping_once_unpacked<T>(f: impl FnOnce(&AtomicBool) -> T) -> T {
+        let stop = AtomicBool::new(false);
+        STOP_ONCE_UNPACKED.with(|s| s.set(true));
+        let out = f(&stop);
+        STOP_ONCE_UNPACKED.with(|s| s.set(false));
+        assert!(stop.load(Ordering::SeqCst), "nothing was unpacked");
+        out
+    }
+
+    /// A stop that lands once the release is unpacked, while it is checked,
+    /// is honored before the release is put in place: nothing is installed
+    /// or left behind (no slot, staging dir or download), and a reinstall of
+    /// the slot `current` points at leaves that slot as it was. Through the
+    /// heartbeat, the status lets the next start try again: neither failed
+    /// nor backing off, the failed attempts before it forgotten.
+    #[test]
+    fn a_stop_before_the_activation_installs_nothing() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let slot = root.join("releases/0.4.0");
+        let before = tree(&slot);
+        let stopped = "update stopped before the activation: the agent is stopping";
+        let assert_stopped = |installed: Result<PathBuf, UpdateError>| {
+            let err = installed.unwrap_err();
+            assert_eq!((err.code, err.message.as_str()), (STOPPED, stopped));
+        };
+
+        // A reinstall of the version `current` points at, downloaded and not.
+        let again = build_release(&td.path().join("again"), "0.4.0");
+        let m = manifest_for(&again, "0.4.0");
+        assert_stopped(stopping_once_unpacked(|stop| {
+            apply_release(&m, &env(&root), None, false, stop)
+        }));
+        assert_stopped(stopping_once_unpacked(|stop| {
+            install_release(&m, &env(&root), &again, stop)
+        }));
+        assert_eq!(tree(&slot), before, "the active slot changed");
+        assert_eq!(current_name(&root), "0.4.0");
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"]);
+        assert_eq!(names(&root.join("update")), Vec::<String>::new());
+
+        // A new version, asked for by the heartbeat after two failed tries.
+        let c = unsigned_ok(td.path());
+        let hb = desire(td.path(), "0.5.0");
+        let retrying = UpdateStatus {
+            status: STATUS_FAILED.into(),
+            target_version: Some("0.5.0".into()),
+            last_error: Some("HTTP 503 downloading artifact".into()),
+            last_error_code: Some("download_failed".into()),
+            attempts: 2,
+            retry_at: Some(utc_now_plus(-1)),
+            ..Default::default()
+        };
+        let st = stopping_once_unpacked(|stop| {
+            maybe_update_from_heartbeat(&hb, &c, &env(&root), Some(retrying), None, false, stop)
+        });
+        assert_eq!(st.status, STATUS_IDLE, "{:?}", st.last_error);
+        assert_eq!(st.last_error.as_deref(), Some(stopped));
+        assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
+        assert_eq!(
+            (
+                st.last_error_code.as_deref(),
+                st.attempts,
+                st.retry_at.as_deref()
+            ),
+            (None, 0, None)
+        );
+        assert_eq!(st.previous_version, None);
+        assert!(!should_pause_jobs(Some(&st)));
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"]);
+        assert_eq!(names(&root.join("update")), Vec::<String>::new());
+        assert_eq!(current_name(&root), "0.4.0");
+
+        // The next start installs it.
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), Some(st), None, false, &NO_STOP);
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(current_name(&root), "0.5.0");
+    }
+
+    /// A stop that comes after the download (or before it is checked) is
+    /// honored before anything is unpacked.
+    #[test]
+    fn a_stop_before_the_extract_installs_nothing() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let tarball = build_release(&td.path().join("0.5.0"), "0.5.0");
+        let m = manifest_for(&tarball, "0.5.0");
+        let err = install_release(&m, &env(&root), &tarball, &AtomicBool::new(true)).unwrap_err();
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (
+                STOPPED,
+                "update stopped before the extract: the agent is stopping"
+            )
+        );
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"]);
+        assert_eq!(current_name(&root), "0.4.0");
+    }
+
+    /// A stop that lands once the new slot is activated leaves
+    /// `pending_health` without the restart, which would replace the
+    /// `systemctl stop` and bring the agent back: the next start runs the
+    /// new slot and its gate.
+    #[test]
+    fn a_stop_after_the_activation_restarts_nothing() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        // An activate helper that holds the update until the test has
+        // stopped the agent: the stop lands while the activation runs.
+        let dir = subdir(td.path(), "helper");
+        let (arrived, go) = (dir.join("arrived"), dir.join("go"));
+        let helper = dir.join("apply-update");
+        fs::write(
+            &helper,
+            format!(
+                "touch '{}'\ni=0\n\
+                 while [ ! -e '{}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done\n",
+                arrived.display(),
+                go.display()
+            ),
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let (stop, arrived, go) = (stop.clone(), arrived.clone(), go.clone());
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !arrived.exists() {
+                    assert!(std::time::Instant::now() < deadline, "never activated");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                stop.store(true, Ordering::SeqCst);
+                fs::write(go, b"").unwrap();
+            })
+        };
+        let agent = UpdateEnv {
+            restart: true,
+            apply_helper: Some(helper),
+            ..env(&root)
+        };
+        let hb = desire(td.path(), "0.5.0");
+        let (st, restarts) = restarts_during(|| {
+            maybe_update_from_heartbeat(&hb, &c, &agent, None, None, false, &stop)
+        });
+        stopper.join().unwrap();
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
+        assert_eq!(st.previous_version.as_deref(), Some("0.4.0"));
+        assert!(should_pause_jobs(Some(&st)));
+        assert_eq!(restarts, 0, "restarted while stopping");
+
+        // Not stopping: the services restart into it.
+        let accepting = UpdateEnv {
+            restart: true,
+            apply_helper: Some(fake_helper(&subdir(td.path(), "accepting"), false)),
+            ..env(&root)
+        };
+        let hb = desire(td.path(), "0.5.1");
+        let (st, restarts) = restarts_during(|| {
+            maybe_update_from_heartbeat(&hb, &c, &accepting, None, None, false, &NO_STOP)
+        });
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(restarts, 1);
+    }
+
+    /// The gate's rollback while the agent stops flips `current` but
+    /// restarts nothing: the next start runs the slot rolled back to.
+    #[test]
+    fn a_gate_rollback_while_stopping_restarts_nothing() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let agent = UpdateEnv {
+            restart: true,
+            ..env(&root)
+        };
+        let stopping = AtomicBool::new(true);
+        for (stop, expected) in [(&stopping, 0), (&NO_STOP, 1)] {
+            flip_current(&root, "0.4.0").unwrap();
+            let (out, restarts) = restarts_during(|| {
+                process_pending_health(
+                    pending("2000-01-01T00:00:00+00:00".into()),
+                    &cfg(td.path()),
+                    &agent,
+                    WhoamiResult::Error,
+                    Some("timeout"),
+                    None,
+                    stop,
+                )
+            });
+            assert_eq!(out.status, STATUS_ROLLED_BACK);
+            assert_eq!(current_name(&root), "0.3.0");
+            assert_eq!(restarts, expected);
+        }
     }
 }

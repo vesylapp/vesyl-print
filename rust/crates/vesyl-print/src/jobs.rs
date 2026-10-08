@@ -1441,7 +1441,7 @@ pub fn materialize_content(
     Ok((path, true))
 }
 
-fn expand_user(p: &str) -> PathBuf {
+pub(crate) fn expand_user(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return Path::new(&home).join(rest);
