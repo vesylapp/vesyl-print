@@ -541,10 +541,15 @@ impl Agent {
     }
 
     /// True while jobs must wait: an OTA is downloading, installing or in
-    /// its health gate, or this process waits for its own restart.
+    /// its health gate, or this process waits for its own restart. The
+    /// update status counts as the next heartbeat will find it: a `failed`
+    /// one that heartbeat turns back into a health gate (an install cut off
+    /// after its flip, see [`update::recover_false_update_failure`], which
+    /// writes nothing) pauses jobs already.
     fn jobs_paused(&self) -> bool {
-        update::should_pause_jobs_from_path(&self.cfg.update_status_path())
-            || self.awaiting_own_restart()
+        let st = update::read_update_status(&self.cfg.update_status_path())
+            .map(|st| update::recover_false_update_failure(st, &self.cfg, &self.update_env));
+        update::should_pause_jobs(st.as_ref()) || self.awaiting_own_restart()
     }
 
     fn prune_processed_markers(&self) {
@@ -1028,8 +1033,10 @@ impl Agent {
         };
 
         // Jobs left queued print now, unless jobs are paused: after an OTA
-        // restart the health gate has not judged this slot yet. Then the
-        // loop drains them once the pause is over, before any new job.
+        // restart (or an install cut off after its flip, whose gate the
+        // first heartbeat reopens) the health gate has not judged this slot
+        // yet. Then the loop drains them once the pause is over, before any
+        // new job.
         let mut drain_pending = self.jobs_paused();
         if drain_pending {
             log::info!(target: LOG, "update in progress — queued jobs wait until it is done");
@@ -2262,29 +2269,69 @@ mod tests {
         prints
     }
 
+    /// The health gate an activation of the running version arms.
+    fn gate_for_this_version() -> UpdateStatus {
+        let mut pending = UpdateStatus::default();
+        update::mark_pending_health(
+            &mut pending,
+            agent_version(),
+            Some("0.0.1".into()),
+            120,
+            None,
+        );
+        pending
+    }
+
+    /// An agent an OTA just restarted into the running version: paired,
+    /// `current` on a runnable slot of that version, `status` in
+    /// update_status.json and job `q1` left queued. Its loop runs without
+    /// the cable.
+    fn agent_after_an_ota_restart(td: &Path, base_url: &str, status: &UpdateStatus) -> Agent {
+        let mut agent = test_agent(td, base_url);
+        agent.cfg.cable_enabled = false;
+        pair(&agent);
+        let ver = agent_version();
+        install_slot(&agent, ver);
+        update::flip_current(&agent.update_env.install_root, ver).unwrap();
+        update::write_update_status(&agent.cfg.update_status_path(), status).unwrap();
+        queue_png(&agent, "q1");
+        agent
+    }
+
     /// J1: after an OTA restart the health gate is open (pending_health) and
     /// jobs wait for it, but the startup drain did not: queued jobs printed
     /// before the gate had judged the new slot. They now wait for the gate,
     /// then print once, before the gate's heartbeat can start another OTA.
     #[test]
     fn queued_jobs_wait_for_the_health_gate_then_print_once() {
+        queued_job_waits_for_the_gate(&gate_for_this_version());
+    }
+
+    /// J1 after a power loss: an install cut off after its flip leaves
+    /// `installing`, which the agent's start marks failed and its first
+    /// heartbeat turns back into the health gate
+    /// (`update::recover_false_update_failure`). The startup drain went by
+    /// the `failed` on disk and printed before that gate had run.
+    #[test]
+    fn an_install_cut_off_after_its_flip_holds_queued_jobs_for_its_gate() {
+        let mut installing = UpdateStatus::with_status(update::STATUS_INSTALLING);
+        installing.target_version = Some(agent_version().into());
+        installing.previous_version = Some("0.0.1".into());
+        queued_job_waits_for_the_gate(&installing);
+    }
+
+    /// Run [`agent_after_an_ota_restart`] with `status` until `q1` prints:
+    /// it prints once, after the health gate's whoami and with jobs no
+    /// longer paused, and the gate passes.
+    fn queued_job_waits_for_the_gate(status: &UpdateStatus) {
         let td = tempfile::tempdir().unwrap();
         let srv = stub(|_, path| match path {
             "/print/v1/whoami" => (200, WHOAMI.into()),
             "/print/v1/jobs/pending" => (200, r#"{"jobs":[]}"#.into()),
             _ => (200, "{}".into()),
         });
-        let mut agent = test_agent(td.path(), &srv.base_url);
-        agent.cfg.cable_enabled = false;
-        pair(&agent);
-        let ver = agent_version();
-        install_slot(&agent, ver);
-        update::flip_current(&agent.update_env.install_root, ver).unwrap();
-        let mut pending = UpdateStatus::default();
-        update::mark_pending_health(&mut pending, ver, Some("0.0.1".into()), 120, None);
-        update::write_update_status(&agent.cfg.update_status_path(), &pending).unwrap();
+        let mut agent = agent_after_an_ota_restart(td.path(), &srv.base_url, status);
         let prints = recording_lp(&mut agent);
-        queue_png(&agent, "q1");
 
         let (stop, handle) = start_run(&agent);
         let printed = eventually(Duration::from_secs(10), || !lock(&prints).is_empty());
@@ -2305,6 +2352,68 @@ mod tests {
         assert_eq!(ust.status, update::STATUS_IDLE);
         assert!(agent.store.is_processed("q1"));
         assert!(!agent.store.has_pending_work());
+    }
+
+    /// J1: the heartbeat that closes the health gate must not start the
+    /// next OTA ahead of the drain the gate held back. While that drain is
+    /// still to run the update its reply asks for is deferred (`jobs_busy`),
+    /// as for buffered push jobs: the job prints first, and the update waits
+    /// for a later heartbeat.
+    #[test]
+    fn the_gates_heartbeat_defers_an_update_until_the_held_back_drain_ran() {
+        let td = tempfile::tempdir().unwrap();
+        // Every heartbeat reply asks for 99.0.0, its manifest on this stub.
+        let base: Arc<OnceLock<String>> = Arc::default();
+        let b = base.clone();
+        let srv = stub(move |_, path| match path {
+            "/print/v1/whoami" => (200, WHOAMI.into()),
+            "/print/v1/jobs/pending" => (200, r#"{"jobs":[]}"#.into()),
+            "/print/v1/heartbeat" => {
+                let url = format!("{}/m.json", b.get().unwrap());
+                let reply =
+                    json!({"ok": true, "desired_agent_version": "99.0.0", "update_url": url});
+                (200, reply.to_string())
+            }
+            "/m.json" => (404, "{}".into()),
+            _ => (200, "{}".into()),
+        });
+        base.set(srv.base_url.clone()).unwrap();
+        let mut agent =
+            agent_after_an_ota_restart(td.path(), &srv.base_url, &gate_for_this_version());
+        assert!(agent.cfg.auto_update_enabled);
+        // The update status when `lp` ran.
+        type AtPrint = Arc<Mutex<Vec<(Instant, Option<UpdateStatus>)>>>;
+        let at_print: AtPrint = Arc::default();
+        let (p, status) = (at_print.clone(), agent.cfg.update_status_path());
+        agent.pipeline.lp = Arc::new(move |_, _, _| {
+            lock(&p).push((Instant::now(), update::read_update_status(&status)));
+            Ok(None)
+        });
+
+        let (stop, handle) = start_run(&agent);
+        let printed = eventually(Duration::from_secs(10), || !lock(&at_print).is_empty());
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(printed, "the queued job never printed");
+        let at_print = lock(&at_print).clone();
+        assert_eq!(at_print.len(), 1, "printed once");
+        let (at, ust) = at_print[0].clone();
+        let ust = ust.expect("no update status when the job printed");
+        assert_eq!(
+            (ust.status.as_str(), ust.last_error.as_deref()),
+            (update::STATUS_IDLE, None),
+            "an update started before the drain: {ust:?}"
+        );
+        let heartbeats = srv.times("/print/v1/heartbeat");
+        assert!(
+            heartbeats.first().is_some_and(|h| *h < at),
+            "printed before the gate's heartbeat"
+        );
+        assert!(
+            srv.times("/m.json").iter().all(|m| *m > at),
+            "the update's manifest was fetched before the job printed"
+        );
     }
 
     /// J4: a health gate that rolls back restarts the services, this agent
