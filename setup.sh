@@ -12,7 +12,8 @@
 #
 # It:
 #   1. installs system packages: CUPS, poppler-utils, NetworkManager (agent);
-#      python3, Pillow, numpy, segno and DejaVu fonts (LCD display),
+#      python3, Pillow, numpy and DejaVu fonts (LCD display), and segno (the
+#      LCD's Wi-Fi QR code) where the distro has it,
 #   2. enables SPI + the mhs35 display overlay in the boot config,
 #   3. installs the mhs35 device-tree overlay if the OS doesn't have it,
 #   4. creates /etc/vesyl-print + /var/lib/vesyl-print,
@@ -28,7 +29,9 @@
 #
 # Optional env (give it to sudo, which drops the caller's environment:
 # sudo SKIP_TAILSCALE=1 ./setup.sh):
-#   INSTALL_ROOT=/opt/vesyl-print   # dual-slot root (default)
+#   INSTALL_ROOT=/opt/vesyl-print   # dual-slot root (default); absolute, components
+#                                   # of letters, digits and ._- only
+#                                   # (no . or ..); trailing slashes dropped
 #   SKIP_APP_INSTALL=1              # only deps/config/units; keep the installed release
 #   SKIP_TAILSCALE=1                # skip Tailscale install / join
 #   TAILSCALE_AUTH_KEY_FILE=...     # override path to auth key (default: keys/tailscale.key)
@@ -44,11 +47,20 @@ die() {
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$REPO_DIR/$(basename "${BASH_SOURCE[0]}")"
 
-INSTALL_ROOT="${INSTALL_ROOT:-/opt/vesyl-print}"
-INSTALL_ROOT="${INSTALL_ROOT%/}"
-# Written into the units, the CLI wrapper and the root helper.
-[[ "$INSTALL_ROOT" =~ ^/[A-Za-z0-9._/-]+$ ]] ||
-    die "INSTALL_ROOT must be an absolute path of letters, digits and ._/-: '$INSTALL_ROOT'"
+INSTALL_ROOT_GIVEN="${INSTALL_ROOT:-/opt/vesyl-print}"
+INSTALL_ROOT="$INSTALL_ROOT_GIVEN"
+# Written into the units, the CLI wrapper and both root helpers. apply-update
+# compares it, as a string, with the paths the agent builds from it (Rust
+# drops a trailing slash when it joins paths), so it must be in plain form:
+# no trailing slash, and no empty, "." or ".." component.
+while [[ "$INSTALL_ROOT" == */ ]]; do
+    INSTALL_ROOT="${INSTALL_ROOT%/}"
+done
+if [[ ! "$INSTALL_ROOT" =~ ^(/[A-Za-z0-9._-]+)+$ ||
+    "$INSTALL_ROOT/" == */./* || "$INSTALL_ROOT/" == */../* ]]; then
+    die "INSTALL_ROOT must be an absolute path whose components are letters," \
+        "digits and ._- (no '.', '..' or empty ones): '$INSTALL_ROOT_GIVEN'"
+fi
 DISPLAY_SERVICE="vesyl-print-display"
 AGENT_SERVICE="vesyl-print-agent"
 LEGACY_DISPLAY_SERVICE="printserve-display"
@@ -56,8 +68,14 @@ CLI_PATH="/usr/local/bin/vesyl-print"
 APPLY_UPDATE="/usr/local/lib/vesyl-print/apply-update"
 WIFI_SETUP="/usr/local/lib/vesyl-print/wifi-setup"
 SUDOERS_DROPIN="/etc/sudoers.d/vesyl-print"
-# Same pattern as update.rs is_version and scripts/apply-update.
+# A release version, checked as update.rs is_version (and scripts/apply-update,
+# build-release.sh) checks it: this pattern, with a last dot-component of
+# "staging" refused, since <version>.staging is the directory an interrupted
+# extract leaves beside its slot.
 VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'
+is_version() {
+    [[ "$1" =~ $VERSION_RE && "$1" != *.staging ]]
+}
 
 if [[ -f "$REPO_DIR/VERSION" ]]; then
     APP_VERSION="$(tr -d '[:space:]' <"$REPO_DIR/VERSION")"
@@ -133,7 +151,7 @@ if [[ "${SKIP_APP_INSTALL:-}" == "1" ]]; then
     [[ -x "$CURRENT_LINK/vesyl-print" ]] ||
         die "SKIP_APP_INSTALL=1 but $CURRENT_LINK/vesyl-print is missing: install a release first"
 else
-    [[ "$APP_VERSION" =~ $VERSION_RE ]] ||
+    is_version "$APP_VERSION" ||
         die "$REPO_DIR/VERSION ('$APP_VERSION') is not a release version"
     check_release_binary
 fi
@@ -178,11 +196,28 @@ echo "==> Run as user:  $RUN_USER"
 
 # --- 1. dependencies -------------------------------------------------------
 # Agent (the vesyl-print binary): CUPS, pdftoppm, nmcli. LCD (Python):
-# python3, Pillow, numpy, segno (Wi-Fi QR codes), DejaVu fonts.
-echo "==> Installing packages (CUPS, poppler-utils, NetworkManager, python3 + Pillow/numpy/segno, fonts)..."
+# python3, Pillow, numpy, DejaVu fonts. apt-get installs none of the packages
+# it is given when one of them is missing, so the optional one goes alone.
+REQUIRED_PACKAGES=(cups poppler-utils network-manager rsync
+    python3 python3-pil python3-numpy fonts-dejavu-core)
+echo "==> Installing packages (CUPS, poppler-utils, NetworkManager, python3 + Pillow/numpy, fonts)..."
 apt-get update || echo "   (apt-get update failed — continuing with cached lists)"
-apt-get install -y cups poppler-utils network-manager rsync \
-    python3 python3-pil python3-numpy python3-segno fonts-dejavu-core || true
+if ! apt-get install -y "${REQUIRED_PACKAGES[@]}"; then
+    # Offline, or the mirror blocked: a device set up before has them all.
+    missing=()
+    for pkg in "${REQUIRED_PACKAGES[@]}"; do
+        [[ "$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null)" == "installed" ]] ||
+            missing+=("$pkg")
+    done
+    ((${#missing[@]} == 0)) ||
+        die "apt-get could not install required packages: ${missing[*]} (see its errors above)"
+    echo "   (apt-get install failed — every required package is already installed, continuing)"
+fi
+# segno draws the Wi-Fi setup QR code; without it the LCD shows the network
+# name and PIN as text. Not packaged everywhere, so best effort.
+apt-get install -y python3-segno ||
+    echo "   WARNING: python3-segno not installed: the Wi-Fi setup screen shows" \
+        "text instead of a QR code" >&2
 
 # The service user must be in 'video' to write /dev/fb1, 'lpadmin' to
 # discover and add network printers to CUPS without sudo, and 'input' to
@@ -408,13 +443,19 @@ else
     echo "   current → $(readlink -f "$CURRENT_LINK" 2>/dev/null || readlink "$CURRENT_LINK")"
 
     # Slots without the binary (Python-era releases) cannot run under these
-    # units. Remove them so `vesyl-print update rollback` never picks one.
+    # units. Remove them so `vesyl-print update rollback` never picks one,
+    # and the <version>.staging dirs an interrupted update leaves behind.
     for slot in "$INSTALL_ROOT"/releases/*; do
-        if [[ ! -d "$slot" || -L "$slot" || "$slot" == "$RELEASE_DIR" ]] ||
-            [[ ! "${slot##*/}" =~ $VERSION_RE ]] || [[ -x "$slot/vesyl-print" ]]; then
+        name="${slot##*/}"
+        if [[ ! -d "$slot" || -L "$slot" || "$slot" == "$RELEASE_DIR" ]]; then
+            continue
+        elif [[ "$name" == *.staging ]] && is_version "${name%.staging}"; then
+            echo "   removing $name: left by an interrupted update"
+        elif is_version "$name" && [[ ! -x "$slot/vesyl-print" ]]; then
+            echo "   removing release $name: no vesyl-print binary"
+        else
             continue
         fi
-        echo "   removing release ${slot##*/}: no vesyl-print binary"
         rm -rf -- "$slot"
     done
 fi

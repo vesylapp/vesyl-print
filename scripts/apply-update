@@ -13,10 +13,11 @@
 # activate accepts only <install_root>/releases/<version> and
 # <install_root>/current, rollback only <install_root> and <version>, and the
 # only thing ever written is the symlink <install_root>/current ->
-# releases/<version> (through <install_root>/current.new). <version> must match
-# the release version pattern (so it is never "." or ".." and has no "/"), and
-# its slot must be a real directory (not a symlink) holding the executable
-# vesyl-print binary that the systemd units and the CLI wrapper run.
+# releases/<version> (through <install_root>/current.new). <version> must be a
+# release version (so it is never "." or "..", has no "/", and is never an
+# interrupted extract's <version>.staging dir), and its slot must be a real
+# directory (not a symlink) holding the executable vesyl-print binary that the
+# systemd units and the CLI wrapper run.
 set -euo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 LC_ALL=C
@@ -25,7 +26,10 @@ export PATH LC_ALL
 # Fixed, never taken from the caller. setup.sh rewrites this line when it
 # installs the helper for a non-default INSTALL_ROOT.
 INSTALL_ROOT=/opt/vesyl-print
-# Same pattern as update.rs is_version.
+# A release version, checked as update.rs is_version checks it: this
+# pattern, with a last dot-component of "staging" refused (activate_version),
+# since <version>.staging is the directory an interrupted extract leaves
+# beside its slot.
 VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'
 # What the units exec. A slot without it (for example a Python-era release)
 # would leave the agent unable to start, so it is never activated.
@@ -49,7 +53,8 @@ fi
 # Point $INSTALL_ROOT/current at releases/<version>, atomically.
 activate_version() {
   local version="$1"
-  [[ "$version" =~ $VERSION_RE ]] || die "invalid release version: $version"
+  [[ "$version" =~ $VERSION_RE && "$version" != *.staging ]] ||
+    die "invalid release version: $version"
   local releases="$INSTALL_ROOT/releases"
   local release_dir="$releases/$version"
   [[ -d "$releases" && ! -L "$releases" ]] || die "not a directory: $releases"

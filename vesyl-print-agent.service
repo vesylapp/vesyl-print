@@ -12,6 +12,15 @@ WorkingDirectory=/opt/vesyl-print/current
 ExecStart=/opt/vesyl-print/current/vesyl-print agent
 Restart=on-failure
 RestartSec=5
+# A child the kernel kills for memory (pdftoppm or gs rendering a PDF) fails
+# its print job, and the agent carries on: the default, stop, would stop and
+# restart the whole agent. If the agent itself is killed, Restart= applies.
+OOMPolicy=continue
+# The agent and its renderers get at most half the RAM (about 450 MB on a
+# 1 GB Pi, 1.9 GB on a 4 GB one): a runaway render is killed here instead of
+# pushing the LCD and the rest of the system into the kernel's OOM killer.
+# Both need the kernel's memory cgroup controller; without it they do nothing.
+MemoryMax=50%
 # Do not put secrets in Environment= lines.
 Environment=VESYL_PRINT_INSTALL_ROOT=/opt/vesyl-print
 

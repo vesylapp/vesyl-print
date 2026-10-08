@@ -1,8 +1,12 @@
 //! `setup.sh`: the root helpers are installed with INSTALL_ROOT written in,
-//! a non-default install root provisions and activates through the installed
-//! `apply-update`, the services run as SUDO_USER or else the tree's owner
-//! (never root), and re-provisioning from an extracted release without a
-//! Tailscale key skips Tailscale and removes only that tree.
+//! in plain form (so OTA activations match it), a non-default install root
+//! provisions and activates through the installed `apply-update`, the
+//! services run as SUDO_USER or else the tree's owner (never root), a missing
+//! optional package never blocks the required ones, and re-provisioning from
+//! an extracted release without a Tailscale key skips Tailscale and removes
+//! only that tree. setup.sh and `apply-update` take exactly the release
+//! versions update.rs `is_version` takes, and the agent unit outlives a
+//! renderer killed for memory.
 //!
 //! The unprivileged tests run setup.sh's preflight, which checks the release
 //! tree before it asks for sudo, with a `sudo` stub that records the hand-off.
@@ -10,16 +14,20 @@
 //! the service account's uid, as `unshare --map-root-user --map-auto` does)
 //! run all of setup.sh in a chroot inside a private mount namespace: the
 //! host's /usr is mounted read-only, everything setup.sh writes lands in a
-//! temp dir, and apt-get, systemctl, usermod, visudo, update-initramfs,
-//! tailscale, curl and sudo are stubs that log their calls.
+//! temp dir, and apt-get, dpkg-query, systemctl, usermod, visudo,
+//! update-initramfs, tailscale, curl and sudo are stubs that log their calls.
 
 mod common;
 
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use common::{have_tools, path_str, repo_root, run, sh_quote, which, write, write_exe, Run};
+use common::{
+    have_tools, output, path_str, repo_root, run, sh_quote, which, write, write_exe, Run,
+};
+use vesyl_print::update::is_version;
 
 const VERSION: &str = "0.9.1";
 /// A non-default install root.
@@ -157,6 +165,10 @@ impl Preflight {
     }
 
     fn run(&self) -> Run {
+        self.run_with_root(CUSTOM_ROOT)
+    }
+
+    fn run_with_root(&self, install_root: &str) -> Run {
         let path = format!(
             "{}:{}",
             path_str(&self.stubs),
@@ -167,7 +179,7 @@ impl Preflight {
             &[],
             &[
                 ("PATH".into(), path),
-                ("INSTALL_ROOT".into(), CUSTOM_ROOT.into()),
+                ("INSTALL_ROOT".into(), install_root.into()),
             ],
         )
     }
@@ -239,6 +251,217 @@ fn preflight_refuses_an_apply_update_without_its_install_root_line() {
     p.assert_refused(&p.run(), "scripts/apply-update");
 }
 
+/// The installed apply-update compares its install root, as a string, with
+/// the paths the agent builds from the units' VESYL_PRINT_INSTALL_ROOT
+/// (`Path::join` drops a trailing slash): with `INSTALL_ROOT=/srv/vp/`
+/// written into both, every OTA activation was refused. setup.sh hands on
+/// only a plain absolute path.
+#[test]
+fn preflight_normalizes_the_install_root_or_refuses_it() {
+    let Some(p) = Preflight::new() else { return };
+    let setup = path_str(&p.tree.join("setup.sh")).to_string();
+    let reset = || {
+        let _ = fs::remove_file(&p.sudo_log);
+    };
+    for (given, used) in [
+        ("/srv/vesyl-print/", CUSTOM_ROOT),
+        ("/srv/vesyl-print//", CUSTOM_ROOT),
+        ("/srv/vesyl-print///", CUSTOM_ROOT),
+        // Dots within a name are fine.
+        ("/srv/vesyl-print.v2", "/srv/vesyl-print.v2"),
+        ("/srv/..x/.vp/", "/srv/..x/.vp"),
+    ] {
+        reset();
+        let r = p.run_with_root(given);
+        assert_eq!(r.code, Some(97), "{given}: {}", r.log());
+        assert_eq!(
+            p.sudo_calls(),
+            format!("-- env INSTALL_ROOT={used} bash {setup}\n"),
+            "{given}"
+        );
+    }
+    for given in [
+        "/srv//vesyl-print",
+        "/srv/./vesyl-print",
+        "/srv/vesyl-print/.",
+        "/srv/vesyl-print/..",
+        "/opt/vesyl-print/../etc",
+        "/",
+        "//",
+        "srv/vesyl-print",
+        "/srv/vesyl print",
+        "/srv/vesyl-print\n",
+    ] {
+        reset();
+        let r = p.run_with_root(given);
+        assert_eq!(r.code, Some(1), "{given:?}: {}", r.log());
+        assert!(
+            r.stderr.contains(&format!(
+                "INSTALL_ROOT must be an absolute path whose components are letters, \
+                 digits and ._- (no '.', '..' or empty ones): '{given}'"
+            )),
+            "{given:?}: {}",
+            r.log()
+        );
+        assert_eq!(p.sudo_calls(), "", "{given:?}");
+    }
+}
+
+/// A renderer (pdftoppm, gs) the kernel kills for memory fails its print
+/// job without stopping the agent, and the agent's cgroup is bounded, so a
+/// runaway render cannot take the LCD and the rest of the system into the
+/// kernel's OOM killer. systemd-analyze, where installed, accepts the unit.
+#[test]
+fn agent_unit_survives_a_renderer_killed_for_memory() {
+    let unit = read(&repo_root().join("vesyl-print-agent.service"));
+    let service: Vec<&str> = unit
+        .lines()
+        .skip_while(|l| *l != "[Service]")
+        .take_while(|l| *l != "[Install]")
+        .collect();
+    for line in ["OOMPolicy=continue", "MemoryMax=50%", "Restart=on-failure"] {
+        assert!(service.contains(&line), "{line} not in [Service]\n{unit}");
+    }
+
+    let Some(analyze) = which("systemd-analyze") else {
+        eprintln!("not verifying the unit: no systemd-analyze");
+        return;
+    };
+    // As installed, but runnable here: an existing binary, no service user.
+    let td = tempfile::tempdir().unwrap();
+    let copy = td.path().join("vesyl-print-agent.service");
+    let exec = which("true").expect("true");
+    write(
+        &copy,
+        unit.replace("/opt/vesyl-print/current/vesyl-print", path_str(&exec))
+            .replace(
+                "WorkingDirectory=/opt/vesyl-print/current",
+                "WorkingDirectory=/",
+            )
+            .replace("\nUser=vesyl\n", "\n"),
+    );
+    let out = output(
+        Command::new(analyze)
+            .args(["verify", "--man=no"])
+            .arg(&copy),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let about_unit: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("vesyl-print-agent.service"))
+        .collect();
+    assert!(about_unit.is_empty(), "{stderr}");
+}
+
+/// Version names the scripts must judge as update.rs `is_version` does
+/// (ASCII: the helpers run in the C locale).
+const VERSION_CANDIDATES: &[&str] = &[
+    "0.9.1",
+    "10.20.30",
+    "0.9.1-rc.1",
+    "0.9.1.lab",
+    "0.9.1-staging",
+    "0.9.1.staging",
+    "0.9.1-rc.staging",
+    "0.9.1-rc.1.staging",
+    "0.9.1.staging.2",
+    "0.9.1..",
+    "0.9.1.",
+    "0.9.1-",
+    "0.9",
+    "0.9.1+build.5",
+    "0.9.1/x",
+    "../0.9.1",
+    "a.b.c",
+    "",
+];
+
+/// setup.sh installs a release only under a name the agent counts as a
+/// release: never `X.Y.Z.staging`, an interrupted extract's directory.
+#[test]
+fn preflight_version_check_matches_update_rs_is_version() {
+    let Some(p) = Preflight::new() else { return };
+    for &v in VERSION_CANDIDATES {
+        write(&p.tree.join("VERSION"), format!("{v}\n"));
+        write_exe(
+            &p.tree.join("vesyl-print"),
+            &format!("#!/bin/sh\necho \"vesyl-print {v}\"\n"),
+        );
+        let r = p.run();
+        let refused = r.code == Some(1)
+            && r.stderr
+                .contains(&format!("VERSION ('{v}') is not a release version"));
+        let handed_to_sudo = r.code == Some(97);
+        assert!(refused != handed_to_sudo, "{v:?}: {}", r.log());
+        assert_eq!(refused, !is_version(v), "{v:?}: {}", r.log());
+    }
+}
+
+/// apply-update (run unprivileged: its install root is a temp dir and the
+/// root check is dropped) activates only a version update.rs `is_version`
+/// accepts. A `<version>.staging` dir never becomes `current`, even one
+/// holding a runnable tree.
+#[test]
+fn apply_update_takes_only_what_update_rs_is_version_takes() {
+    if !cfg!(target_os = "linux") || !have_tools(&["bash"]) {
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let base = td.path().canonicalize().unwrap();
+    let root = base.join("opt/vesyl-print");
+    fs::create_dir_all(root.join("releases")).unwrap();
+    let helper = base.join("apply-update");
+    write_exe(&helper, &read(&repo_root().join("scripts/apply-update")));
+    edit(
+        &helper,
+        "\nINSTALL_ROOT=/opt/vesyl-print\n",
+        &format!("\nINSTALL_ROOT={}\n", sh_quote(&root)),
+    );
+    edit(&helper, "[[ $EUID -ne 0 ]]", "false");
+    let path = std::env::var("PATH").unwrap_or_default();
+    let helper_run = |args: &[&str]| run(&helper, args, &[("PATH".into(), path.clone())]);
+    let current = root.join("current");
+
+    // No slots: a version gets as far as looking for its slot.
+    for &v in VERSION_CANDIDATES {
+        let release = root.join("releases").join(v);
+        for args in [
+            ["activate", path_str(&release), path_str(&current)],
+            ["rollback", path_str(&root), v],
+        ] {
+            let r = helper_run(&args);
+            assert_eq!(r.code, Some(1), "{args:?}: {}", r.log());
+            let refused = r
+                .stderr
+                .contains(&format!("invalid release version: {v}\n"));
+            assert_eq!(refused, !is_version(v), "{args:?}: {}", r.log());
+        }
+    }
+
+    let staging = root.join("releases/0.9.1.staging");
+    write_exe(&staging.join("vesyl-print"), "#!/bin/sh\n");
+    for args in [
+        ["activate", path_str(&staging), path_str(&current)],
+        ["rollback", path_str(&root), "0.9.1.staging"],
+    ] {
+        let r = helper_run(&args);
+        assert_eq!(r.code, Some(1), "{args:?}: {}", r.log());
+        assert!(
+            r.stderr.contains("invalid release version: 0.9.1.staging"),
+            "{}",
+            r.log()
+        );
+        assert!(fs::symlink_metadata(&current).is_err(), "{args:?}");
+    }
+    write_exe(&root.join("releases/0.9.1/vesyl-print"), "#!/bin/sh\n");
+    let r = helper_run(&["rollback", path_str(&root), "0.9.1"]);
+    assert!(r.ok(), "{}", r.log());
+    assert_eq!(
+        fs::read_link(&current).unwrap(),
+        Path::new("releases/0.9.1")
+    );
+}
+
 // --- the whole of setup.sh, as root, in a sandbox -------------------------
 
 /// A chroot for setup.sh: the host's /usr (read-only) and library dirs, its
@@ -257,7 +480,29 @@ struct Sandbox {
 
 /// The stubs, as `(name, what they do after logging the call)`.
 const STUBS: &[(&str, &str)] = &[
-    ("apt-get", "exit 0"),
+    // With $APT_OFFLINE set every call fails. `install` records the packages
+    // in /dpkg.installed, unless one of them is in $APT_MISSING (not
+    // packaged here): then, like apt-get, it installs none of them.
+    (
+        "apt-get",
+        "[ -z \"$APT_OFFLINE\" ] || { echo 'E: Failed to fetch' >&2; exit 100; }\n\
+         [ \"$1\" = install ] || exit 0\n\
+         shift\n\
+         for p; do\n  \
+           case \" $APT_MISSING \" in *\" $p \"*)\n    \
+             echo \"E: Unable to locate package $p\" >&2; exit 100 ;;\n  \
+           esac\n\
+         done\n\
+         for p; do case \"$p\" in -*) ;; *) echo \"$p\" >> /dpkg.installed ;; esac; done",
+    ),
+    // `dpkg-query -W -f=… PKG`: "installed" for what is in /dpkg.installed.
+    (
+        "dpkg-query",
+        "for p; do :; done\n\
+         grep -qx -- \"$p\" /dpkg.installed 2>/dev/null ||\n  \
+           { echo \"dpkg-query: no packages found matching $p\" >&2; exit 1; }\n\
+         printf installed",
+    ),
     ("usermod", "exit 0"),
     ("visudo", "exit 0"),
     ("systemctl", "exit 0"),
@@ -611,6 +856,11 @@ fn root_reprovisions_a_joined_device_from_an_extracted_release() {
         "#!/bin/sh\necho \"vesyl-print 0.4.1\"\n",
     );
     symlink("releases/0.4.1", install.join("current")).unwrap();
+    // What an update killed while it unpacked leaves beside its slot.
+    write_exe(
+        &install.join("releases/0.4.2.staging/vesyl-print-0.4.2/vesyl-print"),
+        "#!/bin/sh\necho \"vesyl-print 0.4.2\"\n",
+    );
     write(
         &sb.at("/etc/systemd/system/vesyl-print-agent.service"),
         "[Service]\nExecStart=/usr/bin/python3 /opt/vesyl-print/current/agent.py\n",
@@ -645,6 +895,15 @@ fn root_reprovisions_a_joined_device_from_an_extracted_release() {
         r.log()
     );
     assert!(sb.at(&src).join("setup.sh").is_file());
+    // A slot that cannot run goes, and so does an interrupted update's
+    // leftover (never a release: update.rs and apply-update refuse the name).
+    for out in [
+        "   removing release 0.3.17: no vesyl-print binary\n",
+        "   removing 0.4.2.staging: left by an interrupted update\n",
+    ] {
+        assert!(r.stdout.contains(out), "{out}\n{}", r.log());
+    }
+    assert!(!install.join("releases/0.4.2.staging").exists());
 
     // Run again: idempotent, and this time the source tree goes.
     let r = sb.setup(&src, &[]);
@@ -825,4 +1084,179 @@ fn root_refuses_a_helper_without_its_install_root_line_before_any_change() {
     assert!(!sb.usr_local.join("lib/vesyl-print").exists());
     assert!(!sb.usr_local.join("bin/vesyl-print").exists());
     assert!(sb.at(&src).join("setup.sh").is_file());
+}
+
+#[test]
+#[ignore = "needs root (or a user namespace mapping uid 1000) to chroot and chown"]
+fn root_install_root_with_trailing_slashes_takes_ota_activations() {
+    let Some(mut sb) = Sandbox::new() else { return };
+    let src = format!("/root/vesyl-print-{VERSION}");
+    release_tree(&sb.at(&src));
+
+    let r = sb.setup(&src, &[("INSTALL_ROOT", "/srv/vesyl-print//")]);
+    assert!(r.ok(), "{}", r.log());
+    assert!(
+        r.stdout.contains(&format!(
+            "==> Install root: {CUSTOM_ROOT} (version {VERSION})\n"
+        )),
+        "{}",
+        r.log()
+    );
+    let apply = read(&sb.usr_local.join("lib/vesyl-print/apply-update"));
+    assert!(
+        apply
+            .lines()
+            .any(|l| l == format!("INSTALL_ROOT={CUSTOM_ROOT}")),
+        "{apply}"
+    );
+    let unit = read(&sb.at("/etc/systemd/system/vesyl-print-agent.service"));
+    let agent_root = unit
+        .lines()
+        .find_map(|l| l.strip_prefix("Environment=VESYL_PRINT_INSTALL_ROOT="))
+        .unwrap_or_else(|| panic!("no VESYL_PRINT_INSTALL_ROOT\n{unit}"));
+    assert_eq!(agent_root, CUSTOM_ROOT);
+
+    // An OTA activation, with the paths the agent joins onto its install
+    // root (update.rs: <root>/releases/<version> and <root>/current).
+    let root = Path::new(agent_root);
+    let release = root.join("releases").join("0.9.2");
+    write_exe(
+        &sb.at(path_str(&release)).join("vesyl-print"),
+        "#!/bin/sh\necho \"vesyl-print 0.9.2\"\n",
+    );
+    let helper = "/usr/local/lib/vesyl-print/apply-update";
+    let current = root.join("current");
+    let r = sb.exec(
+        &[],
+        &[helper, "activate", path_str(&release), path_str(&current)],
+    );
+    assert!(r.ok(), "{}", r.log());
+    assert_eq!(
+        fs::read_link(sb.at(path_str(&current))).unwrap(),
+        Path::new("releases/0.9.2")
+    );
+    // The installed helper never activates an interrupted extract's dir.
+    let staging = root.join("releases").join("0.9.3.staging");
+    write_exe(
+        &sb.at(path_str(&staging)).join("vesyl-print"),
+        "#!/bin/sh\necho \"vesyl-print 0.9.3\"\n",
+    );
+    let r = sb.exec(
+        &[],
+        &[helper, "activate", path_str(&staging), path_str(&current)],
+    );
+    assert_eq!(r.code, Some(1), "{}", r.log());
+    assert!(
+        r.stderr.contains("invalid release version: 0.9.3.staging"),
+        "{}",
+        r.log()
+    );
+    assert_eq!(
+        fs::read_link(sb.at(path_str(&current))).unwrap(),
+        Path::new("releases/0.9.2")
+    );
+}
+
+/// What setup.sh installs in one apt-get call; python3-segno goes alone.
+const REQUIRED_PACKAGES: &[&str] = &[
+    "cups",
+    "poppler-utils",
+    "network-manager",
+    "rsync",
+    "python3",
+    "python3-pil",
+    "python3-numpy",
+    "fonts-dejavu-core",
+];
+
+/// The packages the apt-get stub installed.
+fn installed_packages(sb: &Sandbox) -> Vec<String> {
+    fs::read_to_string(sb.at("/dpkg.installed"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+#[ignore = "needs root (or a user namespace mapping uid 1000) to chroot and chown"]
+fn root_a_distro_without_segno_still_gets_the_required_packages() {
+    let Some(mut sb) = Sandbox::new() else { return };
+    let src = format!("/root/vesyl-print-{VERSION}");
+    release_tree(&sb.at(&src));
+
+    let r = sb.setup(&src, &[("APT_MISSING", "python3-segno")]);
+    assert!(r.ok(), "{}", r.log());
+    assert!(
+        r.stderr.contains(
+            "WARNING: python3-segno not installed: the Wi-Fi setup screen shows text \
+             instead of a QR code"
+        ),
+        "{}",
+        r.log()
+    );
+    let installed = installed_packages(&sb);
+    for pkg in REQUIRED_PACKAGES {
+        assert!(installed.iter().any(|p| p == pkg), "{pkg}: {installed:?}");
+    }
+    assert!(!installed.iter().any(|p| p == "python3-segno"));
+    // lpadmin, which the usermod adds the service user to, comes with cups.
+    let calls = sb.calls();
+    let install = calls
+        .lines()
+        .position(|l| l.starts_with("apt-get install -y cups "))
+        .unwrap_or_else(|| panic!("{calls}"));
+    let usermod = calls
+        .lines()
+        .position(|l| l.starts_with("usermod "))
+        .unwrap_or_else(|| panic!("{calls}"));
+    assert!(install < usermod, "{calls}");
+}
+
+#[test]
+#[ignore = "needs root (or a user namespace mapping uid 1000) to chroot and chown"]
+fn root_a_missing_required_package_stops_setup_before_anything_else() {
+    let Some(mut sb) = Sandbox::new() else { return };
+    let src = format!("/root/vesyl-print-{VERSION}");
+    release_tree(&sb.at(&src));
+
+    // A fresh device whose apt cannot install cups: no package is
+    // installed, so usermod would fail on the missing lpadmin group.
+    let r = sb.setup(&src, &[("APT_MISSING", "cups")]);
+    assert_eq!(r.code, Some(1), "{}", r.log());
+    assert!(
+        r.stderr.contains(&format!(
+            "!! apt-get could not install required packages: {} (see its errors above)",
+            REQUIRED_PACKAGES.join(" ")
+        )),
+        "{}",
+        r.log()
+    );
+    let calls = sb.calls();
+    assert!(!called(&calls, "usermod"), "{calls}");
+    assert!(!sb.at("/etc/vesyl-print").exists());
+    assert!(!sb.usr_local.join("lib/vesyl-print").exists());
+    assert!(!sb.at("/opt/vesyl-print").exists());
+}
+
+#[test]
+#[ignore = "needs root (or a user namespace mapping uid 1000) to chroot and chown"]
+fn root_offline_reprovision_carries_on_with_the_installed_packages() {
+    let Some(mut sb) = Sandbox::new() else { return };
+    let src = format!("/root/vesyl-print-{VERSION}");
+    release_tree(&sb.at(&src));
+    // Provisioned before (segno too), now with no route to the mirror.
+    let mut before = REQUIRED_PACKAGES.join("\n");
+    before.push_str("\npython3-segno\n");
+    write(&sb.at("/dpkg.installed"), before);
+
+    let r = sb.setup(&src, &[("APT_OFFLINE", "1")]);
+    assert!(r.ok(), "{}", r.log());
+    for out in [
+        "   (apt-get update failed — continuing with cached lists)\n",
+        "   (apt-get install failed — every required package is already installed, continuing)\n",
+        "==> Done.\n",
+    ] {
+        assert!(r.stdout.contains(out), "{out}\n{}", r.log());
+    }
 }
