@@ -59,6 +59,11 @@ pub type Cable = Option<Arc<dyn CableChannel>>;
 /// Printer inventory source (CUPS in production; `None` when unavailable).
 pub type InventoryFn = Arc<dyn Fn() -> Option<Vec<Value>> + Send + Sync>;
 
+/// Printer setup: adds a CUPS queue for every printer it can find and
+/// returns the display names of all configured printers
+/// ([`printers::ensure_printers`] in production).
+pub type ProvisionFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 fn obj(v: Value) -> JsonObject {
     match v {
         Value::Object(m) => m,
@@ -174,6 +179,9 @@ fn report_rejected(pipeline: &Pipeline, job: &PrintJob, err: &JobError) {
 struct InventoryCache {
     state: Mutex<InventoryState>,
     updated: Condvar,
+    /// Set to have the refresher start its next pass now rather than at its
+    /// next tick (printer setup added queues).
+    refresh_now: AtomicBool,
 }
 
 #[derive(Default)]
@@ -230,6 +238,12 @@ impl InventoryCache {
         self.updated.notify_all();
     }
 
+    /// Ask the refresher for a pass now. Without a refresher this does
+    /// nothing: inline queries are always current.
+    fn request_refresh(&self) {
+        self.refresh_now.store(true, Ordering::SeqCst);
+    }
+
     /// The refresher stopped: callers query inline again.
     fn end(&self, generation: u64) {
         let mut st = lock(&self.state);
@@ -254,7 +268,10 @@ struct Shared {
     /// When the CUPS wait tick last sent each heartbeat: one schedule per
     /// agent however many jobs wait.
     wait_tick: Mutex<TickTimes>,
-    /// Starts the inventory refresher thread (injectable for tests).
+    /// True while a printer setup pass runs, so two never overlap.
+    printer_setup: AtomicBool,
+    /// Starts the inventory refresher and printer setup threads (injectable
+    /// for tests).
     spawn: SpawnFn,
 }
 
@@ -263,6 +280,7 @@ impl Default for Shared {
         Shared {
             inventory: InventoryCache::default(),
             wait_tick: Mutex::default(),
+            printer_setup: AtomicBool::new(false),
             spawn: Arc::new(jobs::spawn_thread),
         }
     }
@@ -312,6 +330,9 @@ pub struct Agent {
     /// Printer inventory source. Inside [`Agent::run`] it runs on a background
     /// thread and heartbeats send the latest snapshot.
     pub inventory: InventoryFn,
+    /// Printer setup (adds CUPS queues for new USB and network printers).
+    /// [`Agent::run`] runs it once per start, on a background thread.
+    pub provision_printers: ProvisionFn,
     pub update_env: UpdateEnv,
     /// Base job pipeline (lp, fetch, CUPS wait, raw probe). Cloud hooks and
     /// `wait_cups` are filled in per job; every clone shares its async CUPS
@@ -329,6 +350,7 @@ impl Agent {
             client,
             store,
             inventory: Arc::new(|| Some(printers::inventory_payload())),
+            provision_printers: Arc::new(printers::ensure_printers),
             update_env,
             pipeline: Pipeline::default(),
             shared: Arc::default(),
@@ -356,7 +378,8 @@ impl Agent {
     }
 
     /// Start the inventory refresher: first pass right away, then every 15 s
-    /// until `stop`. Returns its generation (to end it). If the thread cannot
+    /// (or sooner, when [`InventoryCache::request_refresh`] asks) until
+    /// `stop`. Returns its generation (to end it). If the thread cannot
     /// start, heartbeats fall back to querying inline.
     fn start_inventory_refresher(&self, stop: &Arc<AtomicBool>) -> u64 {
         let generation = self.shared.inventory.begin();
@@ -365,12 +388,17 @@ impl Agent {
         let body = Box::new(move || {
             let cache = &shared.inventory;
             while !stop.load(Ordering::SeqCst) && cache.is_current(generation) {
+                // This pass answers every refresh asked for until now.
+                cache.refresh_now.store(false, Ordering::SeqCst);
                 let inventory = contained("printer inventory", || source());
                 if let Some(Some(printers)) = &inventory {
                     write_printers_snapshot(&printers_path, printers);
                 }
                 cache.publish(generation, inventory);
-                sleep_until(Instant::now() + INVENTORY_REFRESH_EVERY, &stop);
+                sleep_until_any(
+                    Instant::now() + INVENTORY_REFRESH_EVERY,
+                    &[&stop, &cache.refresh_now],
+                );
             }
             cache.end(generation);
         });
@@ -379,6 +407,44 @@ impl Agent {
             self.shared.inventory.end(generation);
         }
         generation
+    }
+
+    /// Start printer setup ([`Agent::provision_printers`]) on a background
+    /// thread: it browses USB and the network and scans the LAN, which takes
+    /// many seconds, so it never runs on the agent loop. Two passes never
+    /// overlap: while one is still running (from an earlier [`Agent::run`]),
+    /// none is started. When a pass ends, the inventory refresher is asked
+    /// for a fresh pass, so new queues reach the cloud and the LCD without
+    /// waiting for its next tick. Returns whether a pass was started.
+    fn start_printer_setup(&self) -> bool {
+        if self.shared.printer_setup.swap(true, Ordering::SeqCst) {
+            log::info!(target: LOG, "printer setup is still running from an earlier start — not starting another");
+            return false;
+        }
+        let (shared, provision) = (self.shared.clone(), self.provision_printers.clone());
+        let body = Box::new(move || {
+            log::info!(target: LOG, "printer setup: looking for USB and network printers");
+            let started = Instant::now();
+            // A panic is logged by `contained`; the agent carries on without it.
+            if let Some(names) = contained("printer setup", || provision()) {
+                log::info!(
+                    target: LOG,
+                    "printer setup finished in {:.1}s: {}",
+                    started.elapsed().as_secs_f64(),
+                    printer_setup_summary(&names)
+                );
+            }
+            shared.printer_setup.store(false, Ordering::SeqCst);
+            shared.inventory.request_refresh();
+        });
+        match (self.shared.spawn)("vesyl-print-printer-setup", body) {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!(target: LOG, "printer setup failed to start ({e}) — new printers get no CUPS queue until the agent restarts");
+                self.shared.printer_setup.store(false, Ordering::SeqCst);
+                false
+            }
+        }
     }
 
     /// Only [`Agent::run_once`] downloads and installs updates, synchronously.
@@ -812,6 +878,8 @@ impl Agent {
         self.recover_interrupted_update();
         // CUPS inventory runs off this loop from here on.
         let inventory_refresher = self.start_inventory_refresher(&stop);
+        // So does printer setup (new CUPS queues), once per start.
+        self.start_printer_setup();
 
         // --- ActionCable session (push) ------------------------------------
         let push_jobs: Arc<Mutex<VecDeque<JsonObject>>> = Arc::default();
@@ -1172,9 +1240,23 @@ fn write_printers_snapshot(path: &std::path::Path, printers: &[Value]) {
     }
 }
 
+/// The printer setup result for the log.
+fn printer_setup_summary(names: &[String]) -> String {
+    if names.is_empty() {
+        "no printer queues".into()
+    } else {
+        format!("{} printer queue(s): {}", names.len(), names.join(", "))
+    }
+}
+
 /// Sleep until `deadline`, waking early if `stop` is set.
 fn sleep_until(deadline: Instant, stop: &AtomicBool) {
-    while !stop.load(Ordering::SeqCst) {
+    sleep_until_any(deadline, &[stop]);
+}
+
+/// Sleep until `deadline`, waking early once any of `flags` is set.
+fn sleep_until_any(deadline: Instant, flags: &[&AtomicBool]) {
+    while !flags.iter().any(|f| f.load(Ordering::SeqCst)) {
         let now = Instant::now();
         if now >= deadline {
             return;
@@ -1223,6 +1305,8 @@ mod tests {
             client: CloudClient::new(base_url),
             store: JobStore::from_config(&cfg),
             inventory: Arc::new(|| Some(Vec::new())),
+            // Never real CUPS (lpinfo, lpadmin, a LAN scan) from a test.
+            provision_printers: Arc::new(Vec::new),
             update_env: UpdateEnv {
                 install_root: td.join("install"),
                 apply_helper: None,
@@ -2197,8 +2281,6 @@ mod tests {
         assert_eq!(inventory_calls.load(Ordering::SeqCst), 2);
     }
 
-    /// The OS refusing the refresher thread must not panic: heartbeats fall
-    /// back to querying the inventory inline.
     #[test]
     fn inventory_snapshot_is_published_for_the_display() {
         let td = tempfile::tempdir().unwrap();
@@ -2230,6 +2312,8 @@ mod tests {
         );
     }
 
+    /// The OS refusing the refresher thread must not panic: heartbeats fall
+    /// back to querying the inventory inline.
     #[test]
     fn inventory_refresher_spawn_failure_falls_back_inline() {
         let td = tempfile::tempdir().unwrap();
@@ -2260,5 +2344,206 @@ mod tests {
         let b = agent.job_pipeline(Some("tok"), None);
         assert!(Arc::ptr_eq(&a.cups_watcher, &b.cups_watcher));
         assert!(Arc::ptr_eq(&a.cups_watcher, &agent.pipeline.cups_watcher));
+    }
+
+    // --- printer setup (formerly the LCD display's job) ---------------------
+
+    /// Poll `cond` until it holds or `within` passes; returns whether it held.
+    fn eventually(within: Duration, cond: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while !cond() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// A gate printer setup waits at until the test opens it.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        opened: Condvar,
+    }
+
+    impl Gate {
+        fn pass(&self) {
+            let open = lock(&self.open);
+            let _ = self
+                .opened
+                .wait_timeout_while(open, Duration::from_secs(20), |open| !*open);
+        }
+
+        fn open(&self) {
+            *lock(&self.open) = true;
+            self.opened.notify_all();
+        }
+    }
+
+    /// Printer setup held at `gate`: counts its runs and records the thread
+    /// each ran on.
+    fn gated_setup(gate: &Arc<Gate>) -> (ProvisionFn, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let threads: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (gate, r, t) = (gate.clone(), runs.clone(), threads.clone());
+        let setup: ProvisionFn = Arc::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+            lock(&t).push(thread::current().name().unwrap_or_default().to_string());
+            gate.pass();
+            vec!["Zebra ZD421".to_string()]
+        });
+        (setup, runs, threads)
+    }
+
+    /// Start `agent.run` on a thread; returns its stop flag and handle.
+    fn start_run(agent: &Agent) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (a, s) = (agent.clone(), stop.clone());
+        (stop, thread::spawn(move || a.run(s)))
+    }
+
+    /// Printer setup runs on its own thread, once per start: the loop goes on
+    /// heartbeating and pulling (and stops promptly) while it is still
+    /// running, a start during that run does not begin a second one, and a
+    /// start after it finished runs it again.
+    #[test]
+    fn printer_setup_runs_once_per_start_off_the_agent_loop() {
+        let td = tempfile::tempdir().unwrap();
+        let srv = stub(|_, path| match path {
+            "/print/v1/whoami" => (200, WHOAMI.into()),
+            "/print/v1/jobs/pending" => (200, r#"{"jobs":[]}"#.into()),
+            _ => (200, "{}".into()),
+        });
+        let mut agent = test_agent(td.path(), &srv.base_url);
+        agent.cfg.cable_enabled = false;
+        agent.cfg.pull_interval_seconds = 1;
+        pair(&agent);
+        let gate = Arc::new(Gate::default());
+        let (setup, runs, threads) = gated_setup(&gate);
+        agent.provision_printers = setup;
+
+        let (stop, handle) = start_run(&agent);
+        assert!(eventually(Duration::from_secs(5), || runs
+            .load(Ordering::SeqCst)
+            == 1));
+        // Setup is held; the loop still heartbeats and pulls, every second.
+        assert!(
+            eventually(Duration::from_secs(5), || srv
+                .count("/print/v1/jobs/pending")
+                >= 2),
+            "the agent loop waited for printer setup"
+        );
+        assert!(srv.count("/print/v1/heartbeat") >= 1);
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "one pass per start");
+        assert_eq!(*lock(&threads), ["vesyl-print-printer-setup"]);
+        let t = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+
+        // Started again while that pass is still running: no second pass.
+        let (stop, handle) = start_run(&agent);
+        let pulls = srv.count("/print/v1/jobs/pending");
+        assert!(eventually(Duration::from_secs(5), || srv
+            .count("/print/v1/jobs/pending")
+            > pulls));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "two passes overlapped");
+
+        // Once it has finished, the next start runs it again.
+        gate.open();
+        assert!(eventually(Duration::from_secs(5), || !agent
+            .shared
+            .printer_setup
+            .load(Ordering::SeqCst)));
+        let (stop, handle) = start_run(&agent);
+        assert!(eventually(Duration::from_secs(5), || runs
+            .load(Ordering::SeqCst)
+            == 2));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// Queues printer setup adds reach the inventory (heartbeats, the LCD's
+    /// printers.json) as soon as it finishes, not at the next 15 s tick.
+    #[test]
+    fn printer_setup_refreshes_the_inventory_when_done() {
+        let td = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(td.path(), "http://127.0.0.1:9");
+        let passes = Arc::new(AtomicUsize::new(0));
+        let p = passes.clone();
+        agent.inventory = Arc::new(move || {
+            p.fetch_add(1, Ordering::SeqCst);
+            Some(Vec::new())
+        });
+        let gate = Arc::new(Gate::default());
+        let (setup, runs, _) = gated_setup(&gate);
+        agent.provision_printers = setup;
+        let stop = Arc::new(AtomicBool::new(false));
+        let generation = agent.start_inventory_refresher(&stop);
+        assert!(agent.start_printer_setup());
+
+        assert!(eventually(Duration::from_secs(5), || passes
+            .load(Ordering::SeqCst)
+            == 1
+            && runs.load(Ordering::SeqCst) == 1));
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(passes.load(Ordering::SeqCst), 1, "next pass is 15 s out");
+        gate.open();
+        assert!(
+            eventually(Duration::from_secs(2), || passes.load(Ordering::SeqCst)
+                == 2),
+            "no inventory pass after printer setup"
+        );
+        stop.store(true, Ordering::SeqCst);
+        agent.shared.inventory.end(generation);
+    }
+
+    /// A printer setup that panics, or whose thread the OS refuses, is
+    /// logged; the agent carries on and a later start tries again.
+    #[test]
+    fn printer_setup_failures_are_contained() {
+        let td = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(td.path(), "http://127.0.0.1:9");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = runs.clone();
+        agent.provision_printers = Arc::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+            panic!("lpinfo exploded");
+        });
+        for expected in [1, 2] {
+            run_for(&agent, Duration::from_millis(200));
+            assert!(eventually(Duration::from_secs(5), || {
+                runs.load(Ordering::SeqCst) == expected
+                    && !agent.shared.printer_setup.load(Ordering::SeqCst)
+            }));
+        }
+        // The loop itself kept going: status.json was written.
+        assert_eq!(
+            statusio::read_status(&agent.cfg.status_path())
+                .unwrap()
+                .pairing,
+            PairingState::Unpaired
+        );
+
+        agent.shared = Arc::new(Shared {
+            spawn: Arc::new(|_, _| Err(std::io::Error::from_raw_os_error(libc::EAGAIN))),
+            ..Shared::default()
+        });
+        assert!(!agent.start_printer_setup());
+        assert!(!agent.shared.printer_setup.load(Ordering::SeqCst));
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn printer_setup_summary_for_the_log() {
+        assert_eq!(printer_setup_summary(&[]), "no printer queues");
+        assert_eq!(
+            printer_setup_summary(&["Zebra ZD421".into(), "HL-L3280CDW".into()]),
+            "2 printer queue(s): Zebra ZD421, HL-L3280CDW"
+        );
     }
 }
