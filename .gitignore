@@ -158,6 +158,12 @@ dist/
 # Never commit OTA private keys (public PEM in keys/ is fine)
 *update_private.pem
 *_private.pem
+# Nor the factory Tailscale auth key or any other local key: in keys/ only
+# update_public.pem and README.md belong in git.
+tailscale.key
+keys/*.key
+keys/*.pem
+!keys/update_public.pem
 
 # Environments
 .env
