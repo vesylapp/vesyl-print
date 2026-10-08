@@ -1,11 +1,16 @@
 //! `vesyl-print agent` as a process: SIGTERM lets the request in flight
 //! finish but starts no update, the tools the agent runs start with no
-//! signal blocked, and the agent refuses to run as root.
+//! signal blocked and untranslated, the agent refuses to run as root, and
+//! its jobs survive stops, crashes and a health gate's restart: a stop
+//! during a CUPS wait ends it, and the job is not printed twice; a job that
+//! keeps killing the agent is retired; jobs wait for the restart a rollback
+//! asked for.
 //!
-//! The agent runs with its config and state in temp dirs, its API on a
-//! loopback stub, the cable and the job pull off, and fake CUPS tools, `ip`
-//! and restart tools first on PATH: printer setup finds no printer and no
-//! network to scan, and an update's restart would only be logged.
+//! The agent runs with its config and state in temp dirs, a German locale,
+//! its API on a loopback stub, the cable and the job pull off, and fake CUPS
+//! tools, `ip` and restart tools first on PATH: printer setup finds no
+//! printer and no network to scan, and an update's restart would only be
+//! logged.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -42,6 +47,9 @@ const STOP_BITS: u64 = (1 << (libc::SIGINT - 1)) | (1 << (libc::SIGTERM - 1));
 
 /// The heartbeat reply's `last_seen_at`.
 const LAST_SEEN: &str = "2026-10-08T12:00:00Z";
+
+const PNG_1X1_B64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 fn write_exe(path: &Path, text: &str) {
     let _guard = exec_lock();
@@ -90,14 +98,18 @@ impl Node {
         .unwrap();
         let bin = node.root.join("bin");
         fs::create_dir(&bin).unwrap();
+        fs::create_dir(node.root.join("tmp")).unwrap();
         for tool in FAKE_TOOLS {
             let script = format!(
                 "#!/bin/sh\n\
-                 # Fake {tool}: finds nothing; logs the signal mask it started with.\n\
+                 # Fake {tool}: finds nothing; logs the signal mask and the\n\
+                 # locale it started with.\n\
+                 echo \"{tool} ${{LC_ALL:-unset}} ${{LC_MESSAGES:-unset}}\" >> '{}'\n\
                  while read -r key value; do\n\
                  \x20   if [ \"$key\" = SigBlk: ]; then echo \"{tool} $value\" >> '{}'; fi\n\
                  done < /proc/$$/status\n\
                  exit 0\n",
+                node.locale_log().display(),
                 node.sigblk_log().display()
             );
             write_exe(&bin.join(tool), &script);
@@ -131,8 +143,65 @@ impl Node {
         self.root.join("sigblk.log")
     }
 
+    fn locale_log(&self) -> PathBuf {
+        self.root.join("locale.log")
+    }
+
     fn restart_log(&self) -> PathBuf {
         self.root.join("restarts.log")
+    }
+
+    /// Where the fake `lp` of [`Node::fake_lp`] logs each run.
+    fn lp_log(&self) -> PathBuf {
+        self.root.join("lp.log")
+    }
+
+    /// Replace fake `tool` with a script running `body`.
+    fn fake(&self, tool: &str, body: &str) {
+        write_exe(
+            &self.root.join("bin").join(tool),
+            &format!("#!/bin/sh\n{body}\n"),
+        );
+    }
+
+    /// A fake `lp` that logs each run, then runs `then`.
+    fn fake_lp(&self, then: &str) {
+        let log = self.lp_log();
+        self.fake(
+            "lp",
+            &format!("echo \"lp $*\" >> '{}'\n{then}", log.display()),
+        );
+    }
+
+    /// How many times the fake `lp` ran.
+    fn lp_runs(&self) -> usize {
+        fs::read_to_string(self.lp_log())
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    fn queue_path(&self, id: &str) -> PathBuf {
+        self.state_dir().join("queue").join(format!("{id}.json"))
+    }
+
+    /// Leave job `id` (a 1x1 PNG for queue Zebra) queued, as a job the
+    /// agent took before it stopped.
+    fn queue_job(&self, id: &str) {
+        let job = json!({"id": id, "cups_name": "Zebra", "content_type": "png_base64",
+                         "content": PNG_1X1_B64, "title": "Ship label"});
+        fs::create_dir_all(self.state_dir().join("queue")).unwrap();
+        fs::write(self.queue_path(id), job.to_string()).unwrap();
+    }
+
+    /// The agent's notes in job `id`'s queue record.
+    fn notes(&self, id: &str) -> Value {
+        let raw = fs::read_to_string(self.queue_path(id)).unwrap();
+        serde_json::from_str::<Value>(&raw).unwrap()["_agent"].clone()
+    }
+
+    fn processed(&self, id: &str) -> bool {
+        self.state_dir().join("processed").join(id).is_file()
     }
 
     /// Every call of a restart tool, as `tool args…`.
@@ -141,13 +210,17 @@ impl Node {
         raw.lines().map(String::from).collect()
     }
 
-    /// `vesyl-print agent` with none of this process's environment.
+    /// `vesyl-print agent` with none of this process's environment, on a
+    /// node whose locale is German (CUPS would answer in German).
     fn start_agent(&self) -> Agent {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_vesyl-print"));
         cmd.arg("agent")
             .env_clear()
             .env("PATH", self.root.join("bin"))
             .env("HOME", &self.root)
+            .env("TMPDIR", self.root.join("tmp"))
+            .env("LANG", "de_DE.UTF-8")
+            .env("LC_MESSAGES", "de_DE.UTF-8")
             .env("VESYL_PRINT_CONFIG_DIR", self.config_dir())
             .env("VESYL_PRINT_STATE_DIR", self.state_dir())
             .env("VESYL_PRINT_INSTALL_ROOT", self.install_root())
@@ -179,6 +252,17 @@ impl Node {
     fn status(&self) -> Value {
         let raw = fs::read_to_string(self.state_dir().join("status.json")).unwrap();
         serde_json::from_str(&raw).unwrap()
+    }
+
+    /// `(tool, "LC_ALL LC_MESSAGES")` for every fake tool the agent ran.
+    fn tool_locales(&self) -> Vec<(String, String)> {
+        let raw = fs::read_to_string(self.locale_log()).unwrap_or_default();
+        raw.lines()
+            .map(|line| {
+                let (tool, locale) = line.split_once(' ').unwrap();
+                (tool.to_string(), locale.to_string())
+            })
+            .collect()
     }
 
     /// `(tool, SigBlk)` for every fake tool the agent ran.
@@ -349,7 +433,7 @@ fn held_heartbeat_api_serving(served: impl FnOnce(&str) -> Served) -> Api {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { return };
-            let Some(path) = read_request(&mut stream) else {
+            let Some((path, _)) = read_request(&mut stream) else {
                 continue;
             };
             seen.lock().unwrap().push(path.clone());
@@ -413,8 +497,76 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Read one request; its path.
-fn read_request(stream: &mut TcpStream) -> Option<String> {
+/// Loopback API stub that answers at once: whoami, the heartbeat, the job
+/// pull (with the jobs in `pending`), and `{}` to anything else (job acks
+/// and statuses). Records the path and JSON body of every request.
+struct LiveApi {
+    base_url: String,
+    requests: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+impl LiveApi {
+    fn count(&self, path: &str) -> usize {
+        let requests = self.requests.lock().unwrap();
+        requests.iter().filter(|(p, _)| p == path).count()
+    }
+
+    /// The `[status, message]` of each status job `id` was reported.
+    fn statuses(&self, id: &str) -> Vec<Value> {
+        let path = format!("/print/v1/jobs/{id}/status");
+        let requests = self.requests.lock().unwrap();
+        requests
+            .iter()
+            .filter(|(p, _)| *p == path)
+            .map(|(_, body)| json!([body["status"], body["message"]]))
+            .collect()
+    }
+}
+
+fn live_api(pending: Value) -> LiveApi {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let requests: Arc<Mutex<Vec<(String, Value)>>> = Arc::default();
+    let seen = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let Some((path, body)) = read_request(&mut stream) else {
+                continue;
+            };
+            let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            seen.lock().unwrap().push((path.clone(), body));
+            let reply = match path.as_str() {
+                "/print/v1/whoami" => json!({"node_id": "node-1", "name": "Pack 1"}),
+                "/print/v1/heartbeat" => json!({"ok": true, "last_seen_at": LAST_SEEN}),
+                "/print/v1/jobs/pending" => json!({ "jobs": pending }),
+                _ => json!({}),
+            }
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    LiveApi { base_url, requests }
+}
+
+/// Wait up to `within` for `cond`; whether it held.
+fn eventually(within: Duration, cond: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    while !cond() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// Read one request: its path and body.
+fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
@@ -437,7 +589,7 @@ fn read_request(stream: &mut TcpStream) -> Option<String> {
     }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).ok()?;
-    Some(path)
+    Some((path, body))
 }
 
 fn running_as_root() -> bool {
@@ -528,6 +680,200 @@ fn sigterm_lets_the_heartbeat_in_flight_finish() {
     for (tool, mask) in &tools {
         assert_eq!(*mask, 0, "{tool} started with signals blocked: {mask:x}");
     }
+    // J6: and in the C locale, though the node's is German: CUPS translates
+    // what its tools print ("Gerät für" for lpstat's "device for"), and the
+    // agent reads English.
+    let locales = node.tool_locales();
+    assert!(!locales.is_empty());
+    for (tool, locale) in &locales {
+        assert_eq!(locale, "C.UTF-8 C.UTF-8", "{tool} ran translated");
+    }
+}
+
+/// A node with `config` (over [`Node::new`]'s), its API on `api`.
+fn node_with(api: &LiveApi, config: Value) -> Node {
+    Node::with_config(&api.base_url, config)
+}
+
+/// Wait for the agent to exit (killing it after `within`); fails the test
+/// with its log when it did not.
+fn exited(agent: Agent, within: Duration) -> (ExitStatus, String) {
+    let (status, log) = agent.finish(within);
+    let status = status.unwrap_or_else(|| panic!("still running after {within:?}\n{log}"));
+    (status, log)
+}
+
+/// J3: SIGTERM while the agent waits on CUPS for a job (synchronous wait,
+/// the printer out of paper) used to be ignored for up to 24 h: systemd
+/// SIGKILLed the agent after 90 s with the job still queued, and the next
+/// start printed the label again. The wait now ends at once, the record
+/// says CUPS has the job, and the next start finishes it from what CUPS
+/// says, without `lp`.
+#[test]
+fn a_stop_during_a_cups_wait_ends_it_and_never_prints_twice() {
+    if skip_as_root() {
+        return;
+    }
+    let api = live_api(json!([]));
+    let node = node_with(&api, json!({"wait_cups": "sync"}));
+    node.fake_lp("echo 'request id is Zebra-7 (1 file(s))'");
+    let done = node.root.join("cups-done");
+    let polls = node.root.join("lpstat.log");
+    node.fake(
+        "lpstat",
+        &format!(
+            "case \"$*\" in\n\
+             \x20 '-W not-completed')\n\
+             \x20   echo polled >> '{polls}'\n\
+             \x20   [ -e '{done}' ] || echo 'Zebra-7  ben  1024  Thu 08 Oct 2026 12:00:00' ;;\n\
+             \x20 '-W completed -l')\n\
+             \x20   [ -e '{done}' ] && printf 'Zebra-7  ben  1024  Thu 08 Oct 2026 12:00:00\\n\\tAlerts: job-completed-successfully\\n' ;;\n\
+             esac\n\
+             exit 0",
+            polls = polls.display(),
+            done = done.display()
+        ),
+    );
+    node.queue_job("job-7");
+
+    let agent = node.start_agent();
+    let waiting = eventually(Duration::from_secs(30), || polls.exists());
+    agent.signal(libc::SIGTERM);
+    let stopping = Instant::now();
+    let (status, log) = exited(agent, Duration::from_secs(30));
+    let took = stopping.elapsed();
+    assert!(waiting, "the job never waited on CUPS\n{log}");
+    assert_eq!(status.code(), Some(0), "{log}");
+    assert!(
+        took < Duration::from_secs(10),
+        "stopped after {took:?}\n{log}"
+    );
+    assert_eq!(node.lp_runs(), 1, "{log}");
+    assert!(!node.processed("job-7"), "{log}");
+    let notes = node.notes("job-7");
+    assert_eq!(notes["cups_job_id"], "Zebra-7", "{log}");
+
+    // CUPS finished it meanwhile. The next start reports it printed and
+    // never hands it to lp again.
+    fs::write(&done, "").unwrap();
+    let agent = node.start_agent();
+    let finished = eventually(Duration::from_secs(30), || node.processed("job-7"));
+    agent.signal(libc::SIGTERM);
+    let (status, log) = exited(agent, Duration::from_secs(30));
+    assert!(finished, "the job was never finished\n{log}");
+    assert_eq!(status.code(), Some(0), "{log}");
+    assert_eq!(node.lp_runs(), 1, "printed twice\n{log}");
+    assert!(!node.queue_path("job-7").exists(), "{log}");
+    assert_eq!(
+        api.statuses("job-7"),
+        [
+            json!(["printing", null]),
+            json!(["delivered", "Zebra-7"]),
+            json!(["printed", "Zebra-7"]),
+        ],
+        "{log}"
+    );
+}
+
+/// J5: a job whose printing kills the agent (here `lp` SIGKILLs it, as the
+/// kernel's OOM killer would) used to run again on every start: systemd
+/// restarts the agent 5 s later, and it died again before any other job,
+/// keeping the node offline. After three such deaths the job is retired
+/// as crash_loop and reported failed; the agent lives on.
+#[test]
+fn a_job_that_kills_the_agent_is_retired_after_three_deaths() {
+    if skip_as_root() {
+        return;
+    }
+    let api = live_api(json!([]));
+    let node = node_with(&api, json!({}));
+    node.fake_lp("kill -KILL $PPID");
+    node.queue_job("job-poison");
+    for death in 1..=3 {
+        let (status, log) = exited(node.start_agent(), Duration::from_secs(60));
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "start {death}\n{log}");
+        assert_eq!(node.lp_runs(), death, "{log}");
+        assert_eq!(node.notes("job-poison")["attempts"], death, "{log}");
+    }
+
+    let agent = node.start_agent();
+    let failed = node.state_dir().join("queue/failed/job-poison.json");
+    let retired = eventually(Duration::from_secs(30), || failed.is_file());
+    agent.signal(libc::SIGTERM);
+    let (status, log) = exited(agent, Duration::from_secs(30));
+    assert!(retired, "the job was not retired\n{log}");
+    assert_eq!(status.code(), Some(0), "{log}");
+    assert_eq!(node.lp_runs(), 3, "{log}");
+    assert!(!node.queue_path("job-poison").exists(), "{log}");
+    assert!(!node.processed("job-poison"), "{log}");
+    let reported = api.statuses("job-poison");
+    assert_eq!(
+        reported.last(),
+        Some(&json!([
+            "error",
+            "printing this job ended the agent 3 times (out of memory?) — not tried again"
+        ])),
+        "{reported:?}\n{log}"
+    );
+}
+
+/// J1 and J4: after an OTA restart, the health gate of the new slot (here
+/// broken: no `vesyl-print` in it) rolls back to the previous slot and
+/// restarts the services, this agent included. The agent printed its
+/// queued jobs before the gate (the startup drain did not wait for it),
+/// and took jobs after it until the SIGTERM came (`rolled_back` pauses
+/// nothing). It now takes none until that restart: the agent it starts,
+/// from the slot it rolled back to, prints them.
+#[test]
+fn a_rollback_that_restarts_the_agent_takes_no_job_before_the_restart() {
+    if skip_as_root() {
+        return;
+    }
+    let pending = json!([{"id": "job-new", "cups_name": "Zebra",
+                          "content_type": "png_base64", "content": PNG_1X1_B64}]);
+    let api = live_api(pending);
+    let node = node_with(
+        &api,
+        json!({"pull_jobs_enabled": true, "pull_interval_seconds": 1}),
+    );
+    node.fake_lp("echo 'request id is Zebra-9 (1 file(s))'");
+    let releases = node.install_root().join("releases");
+    fs::create_dir_all(releases.join("9.9.9")).unwrap();
+    fs::create_dir_all(releases.join("9.9.8")).unwrap();
+    write_exe(&releases.join("9.9.8/vesyl-print"), "#!/bin/sh\nexit 0\n");
+    std::os::unix::fs::symlink("releases/9.9.9", node.install_root().join("current")).unwrap();
+    let gate = json!({
+        "status": "pending_health", "current_version": "9.9.9", "target_version": "9.9.9",
+        "previous_version": "9.9.8", "health_deadline_at": "2099-01-01T00:00:00+00:00",
+        "health_attempts": 0, "last_error": null, "last_checked_at": null, "channel": "stable",
+    });
+    fs::write(
+        node.state_dir().join("update_status.json"),
+        gate.to_string(),
+    )
+    .unwrap();
+    node.queue_job("job-old");
+
+    let agent = node.start_agent();
+    let restarting = eventually(Duration::from_secs(30), || {
+        node.restarts()
+            .iter()
+            .any(|r| r.ends_with("vesyl-print-agent"))
+    });
+    // Pulls would come every second, and the queue would drain at once.
+    thread::sleep(Duration::from_secs(3));
+    agent.signal(libc::SIGTERM);
+    let (status, log) = exited(agent, Duration::from_secs(30));
+    assert!(restarting, "the gate asked for no restart\n{log}");
+    assert_eq!(status.code(), Some(0), "{log}");
+    assert_eq!(node.lp_runs(), 0, "a job printed before the restart\n{log}");
+    assert_eq!(api.count("/print/v1/jobs/pending"), 0, "{log}");
+    assert!(node.queue_path("job-old").is_file(), "{log}");
+    let current = fs::read_link(node.install_root().join("current")).unwrap();
+    assert_eq!(current, Path::new("releases/9.9.8"), "{log}");
+    let raw = fs::read_to_string(node.state_dir().join("update_status.json")).unwrap();
+    let st: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(st["status"], "rolled_back", "{log}");
 }
 
 /// A stop that lands while the heartbeat is in flight starts no update its
