@@ -1,0 +1,29 @@
+rust/crates/vesyl-print/src/jobs.rs
+  s_2883cba6969ed7::t_3fe2df9cb895de 1170-1171
+  s_2883cba6969ed7::t_5cd3ec8a728e1a 2838-2858,2860-2894
+  s_2883cba6969ed7::t_91e3d1c63873ce 990-991
+  s_2883cba6969ed7::t_a110c61a07100c 32,35
+  s_2883cba6969ed7::t_4bb8324872d1df 1100-1101,1115,1119-1120,1127-1128,1130-1169,1172-1173,1175-1176,1179,1182-1183,1193-1198,1200,1207
+  s_2883cba6969ed7::t_12f22da4e1e19c 2798-2827,2829-2834,2836-2837
+  s_2883cba6969ed7::t_2a98e52c7caeeb 2828,2835,2859
+  s_2883cba6969ed7::t_6f22eb8a6318de 1241,1245-1256,1258-1259
+  s_2883cba6969ed7::t_8b21ddc51765d3 1031
+  s_2883cba6969ed7::t_8648d021d7dda5 1174
+  s_2883cba6969ed7::t_7d188787cdb0d0 1242-1244
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "903499e31835f47a6d0411b1161646d930cc6617",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
