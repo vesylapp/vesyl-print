@@ -1,0 +1,58 @@
+rust/crates/vesyl-print/src/lib.rs
+  s_2883cba6969ed7::t_37fa5eadcf63ef 1-2,5-17,19-21
+  s_2883cba6969ed7::t_53a107cd22c352 18
+  s_2883cba6969ed7::t_c177e745f1491b 45
+  s_2883cba6969ed7::t_f0604867890bf3 3
+rust/crates/vesyl-print/src/update.rs
+  s_2883cba6969ed7::t_275c19528d3f6d 261
+  s_2883cba6969ed7::t_21058f66dc5e81 259-260
+  s_2883cba6969ed7::t_a75b9109b7979b 57-59
+  s_2883cba6969ed7::t_da5a5172c42139 1639-1641
+  s_2883cba6969ed7::t_8ad829945734bb 1546-1548
+  s_2883cba6969ed7::t_98f7f0918f9a9c 1614
+  s_2883cba6969ed7::t_972d4ae8202976 2067-2069,2073
+  s_2883cba6969ed7::t_455ff69f8cea24 1595-1599
+  s_2883cba6969ed7::t_6e734446393144 2262
+  s_2883cba6969ed7::t_5eabc4452bc167 3435-3436
+  s_2883cba6969ed7::t_3dd03dc0c6845d 3522-3545
+  s_2883cba6969ed7::t_64a2ff97012633 290,295,301
+  s_2883cba6969ed7::t_2eb1d8c76e1d1d 3707-3710
+  s_2883cba6969ed7::t_596eaa94a3c523 3838-3860
+  s_2883cba6969ed7::t_9332fa36937304 296-300
+  s_2883cba6969ed7::t_9b2bd2bf8c3762 3705-3706
+  s_2883cba6969ed7::t_474bcae3c0bbbd 1636-1638
+  s_2883cba6969ed7::t_e8fe2c660dc0fa 1170
+  s_2883cba6969ed7::t_7313d74203c534 591
+  s_2883cba6969ed7::t_11030f8c31c6f4 334,344,346
+  s_2883cba6969ed7::t_82882e74f9fe07 3811
+rust/crates/vesyl-print/src/util.rs
+  s_2883cba6969ed7::t_bb479d61c702dd 81
+  s_2883cba6969ed7::t_884858077aa0a6 82-83
+rust/crates/vesyl-print/src/config.rs
+  s_2883cba6969ed7::t_ef6c80aebc2a4c 50
+  s_2883cba6969ed7::t_341cb2dfcfc73a 238-240
+  s_2883cba6969ed7::t_7cf0d7ddec8bcb 188
+  s_2883cba6969ed7::t_63150d4161a6b7 49
+rust/crates/vesyl-print/src/cli.rs
+  s_2883cba6969ed7::t_6ce1a176e6c6d8 1690
+  s_2883cba6969ed7::t_3bf95de1399d6e 184
+  s_2883cba6969ed7::t_6175b759207d88 1040,1042
+  s_2883cba6969ed7::t_ca30308a00efc7 161
+  s_2883cba6969ed7::t_82a7f87f8e6b11 26-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c7a551946c30259e7321878c69bf0939251aa9da",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
