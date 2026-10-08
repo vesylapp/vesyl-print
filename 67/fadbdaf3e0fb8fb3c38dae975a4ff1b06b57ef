@@ -1,0 +1,33 @@
+rust/crates/vesyl-print/src/config.rs
+  s_2883cba6969ed7::t_4e2bfd17c53b33 438-494
+  s_2883cba6969ed7::t_36535094a0d782 8
+  s_2883cba6969ed7::t_2569d5ba772a27 332-333
+  s_2883cba6969ed7::t_e658bfb8542e10 231-234,356
+  s_2883cba6969ed7::t_9b2c36c7117782 226-229
+rust/crates/vesyl-print/src/util.rs
+  s_2883cba6969ed7::t_26727da40a8f83 256-261,265-277
+  s_2883cba6969ed7::t_9e5844bc17f674 262-264
+rust/crates/vesyl-print/src/cli.rs
+  s_2883cba6969ed7::t_2ba58618d46cc6 1393-1396
+  s_2883cba6969ed7::t_09b96d9a0ed2ef 1363-1392,1397-1398
+rust/crates/vesyl-print/src/update.rs
+  s_2883cba6969ed7::t_9ba9a342ba56ed 637-653
+  s_2883cba6969ed7::t_332805e6509005 2586-2643
+  s_2883cba6969ed7::t_e658bfb8542e10 607
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "67fadbdaf3e0fb8fb3c38dae975a4ff1b06b57ef",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
