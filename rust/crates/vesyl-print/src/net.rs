@@ -42,8 +42,9 @@ use ureq::unversioned::transport::{
 use url::Url;
 
 const LOG: &str = "vesyl-print.net";
-/// Redirects followed per request (urllib's `max_redirections`).
-const MAX_REDIRECTS: u32 = 10;
+/// Redirects followed per request (urllib's `max_redirections`), also by
+/// [`crate::cloud`]'s own same-host redirect loop.
+pub(crate) const MAX_REDIRECTS: u32 = 10;
 /// Cap on a proxy's response head to `CONNECT`.
 const MAX_PROXY_HEAD: usize = 16 << 10;
 
@@ -54,7 +55,7 @@ pub struct Timeouts {
     pub connect: Duration,
     /// Waiting for the response head.
     pub response: Duration,
-    /// Longest wait for any single read or write (Python's per-operation
+    /// Longest wait for any single read or write (urllib's per-operation
     /// timeout): a connection that goes silent mid-body fails after this.
     pub idle: Duration,
     /// Total budget for reading the body, a backstop against a server that
@@ -63,7 +64,8 @@ pub struct Timeouts {
 }
 
 impl Timeouts {
-    /// wms-api REST calls (`CloudClient`, Python timeout=30). The body budget
+    /// wms-api REST calls (`CloudClient`): 30 s to connect and for each read
+    /// or write, the urllib timeout the previous agent used. The body budget
     /// covers a large jobs/pending payload on a slow link.
     pub const API: Timeouts = Timeouts {
         connect: Duration::from_secs(30),
@@ -72,7 +74,8 @@ impl Timeouts {
         body: Duration::from_secs(10 * 60),
     };
 
-    /// Print-job content fetch (`jobs::http_get`, Python timeout=60).
+    /// Print-job content fetch (`jobs::http_get`): 60 s to connect and for
+    /// each read or write, the urllib timeout the previous agent used.
     pub const CONTENT: Timeouts = Timeouts {
         connect: Duration::from_secs(60),
         response: Duration::from_secs(60),
@@ -80,7 +83,9 @@ impl Timeouts {
         body: Duration::from_secs(15 * 60),
     };
 
-    /// OTA release manifest (`update::fetch_manifest`, Python timeout=120).
+    /// OTA release manifest (`update::fetch_manifest`): 120 s for each read
+    /// or write, the urllib timeout the previous agent used; 60 s to
+    /// connect.
     pub const MANIFEST: Timeouts = Timeouts {
         connect: Duration::from_secs(60),
         response: Duration::from_secs(120),
@@ -88,7 +93,8 @@ impl Timeouts {
         body: Duration::from_secs(10 * 60),
     };
 
-    /// OTA artifact download (Python timeout=300).
+    /// OTA artifact download: 300 s for each read or write, the urllib
+    /// timeout the previous agent used; 60 s to connect.
     pub const ARTIFACT: Timeouts = Timeouts {
         connect: Duration::from_secs(60),
         response: Duration::from_secs(300),
@@ -338,6 +344,34 @@ pub fn redact_proxy(proxy: &str) -> String {
         redacted
     } else {
         format!("{scheme}://{redacted}")
+    }
+}
+
+/// A URL safe for error and log text: `scheme://host[:port]/path`, without
+/// the userinfo, query or fragment, where credentials and signatures travel
+/// (a presigned download's `X-Amz-Signature`, a portal's session token).
+/// Text that does not parse as a URL is cut the same way: at `?` or `#`,
+/// and without a `user:pass@` in its authority.
+pub fn redact_url(url: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(url) {
+        // Only a URL with a host has userinfo; for others these fail.
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        return parsed.into();
+    }
+    let url = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+    let (scheme, rest) = url.split_once("://").map_or(("", url), |(s, r)| (s, r));
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let rest = match rest[..authority_end].rfind('@') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
+    if scheme.is_empty() {
+        rest.to_string()
+    } else {
+        format!("{scheme}://{rest}")
     }
 }
 
@@ -1063,6 +1097,28 @@ mod tests {
         assert_eq!(redact_proxy("user:secret@proxy:3128/x"), "***@proxy:3128/x");
         assert_eq!(redact_proxy("http://proxy:3128"), "http://proxy:3128");
         assert!(!redact_proxy("http://u:p@ss@proxy:1").contains("p@ss"));
+    }
+
+    #[test]
+    fn redacts_url_credentials_and_query() {
+        for (url, want) in [
+            (
+                "https://bucket.example.test/obj?X-Amz-Signature=sekrit#frag",
+                "https://bucket.example.test/obj",
+            ),
+            (
+                "https://user:pa55@other.example.test:8443/hb?token=abc",
+                "https://other.example.test:8443/hb",
+            ),
+            ("http://u@127.0.0.1:9/loop?k=v", "http://127.0.0.1:9/loop"),
+            ("https://wms-api.vesyl.dev", "https://wms-api.vesyl.dev/"),
+            // Not a URL: cut the same way as well as it can be.
+            ("https://u:pw@bad host/x?sig=1", "https://bad host/x"),
+            ("http://u:pw@[::1/x#f", "http://[::1/x"),
+            ("/v2/hb?token=abc", "/v2/hb"),
+        ] {
+            assert_eq!(redact_url(url), want, "{url}");
+        }
     }
 
     #[test]

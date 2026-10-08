@@ -3,8 +3,10 @@
 //! Transport comes from [`crate::net`] (urllib-style timeouts and proxy
 //! rules). Redirects are handled here rather than by ureq: ureq drops
 //! `Authorization` on every hop, and the unauthenticated follow-up's 401 would
-//! make the agent delete its credentials.
+//! make the agent delete its credentials. A URL in an error message is
+//! [`net::redact_url`]'s: no userinfo, query or fragment.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -18,8 +20,12 @@ use crate::JsonObject;
 const LOG: &str = "vesyl-print.cloud";
 /// Pending-jobs payloads can carry base64 PDFs; ureq's default cap is 10 MB.
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
-/// Same-host GET redirects followed per request (urllib allows 10).
-const MAX_REDIRECTS: usize = 5;
+/// Distinct same-host GET redirect targets followed per request, as urllib
+/// follows them (`max_redirections`).
+const MAX_REDIRECTS: usize = net::MAX_REDIRECTS as usize;
+/// Times one redirect target is followed per request (urllib's
+/// `max_repeats`): a redirect loop stops after five requests.
+const MAX_REPEATS: usize = 4;
 
 /// API or transport error. `status` is the HTTP code or 0 for network failure.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -120,8 +126,13 @@ fn location(resp: &Response<Body>) -> Option<&str> {
 /// Whether the device token may follow a redirect from `from` to `to`: same
 /// host, and either the same scheme and port or an http→https upgrade on the
 /// default ports. Another host or port, or a downgrade, never gets the token.
+/// Nor does a redirect that adds or changes userinfo (`user:pass@`): its
+/// target wants other credentials, and ureq would send the token instead.
 fn same_host_redirect(from: &Url, to: &Url) -> bool {
     if from.host_str().is_none() || from.host_str() != to.host_str() {
+        return false;
+    }
+    if (from.username(), from.password()) != (to.username(), to.password()) {
         return false;
     }
     match (from.scheme(), to.scheme()) {
@@ -142,18 +153,17 @@ fn follow_target(current: &Url, resp: &Response<Body>) -> Option<Url> {
     same_host_redirect(current, &to).then_some(to)
 }
 
-/// A 3xx we did not follow. Its status stays 3xx so it can never read as a
-/// rejected token (401), whatever the redirect target would have answered.
-fn redirect_error(resp: &Response<Body>) -> CloudError {
+/// A 3xx we did not follow, for the request to `at`. Its status stays 3xx so
+/// it can never read as a rejected token (401), whatever the redirect target
+/// would have answered. The target is named as [`net::redact_url`] shows it.
+fn redirect_error(at: &Url, resp: &Response<Body>) -> CloudError {
     let status = resp.status().as_u16();
-    match location(resp) {
-        Some(loc) => CloudError::new(
-            format!(
-                "unexpected redirect to {}",
-                loc.chars().take(200).collect::<String>()
-            ),
+    match location(resp).map(|loc| at.join(loc)) {
+        Some(Ok(to)) => CloudError::new(
+            format!("unexpected redirect to {}", net::redact_url(to.as_str())),
             status,
         ),
+        Some(Err(_)) => CloudError::new(format!("unexpected HTTP {status} redirect"), status),
         None => CloudError::new(format!("unexpected HTTP {status}"), status),
     }
 }
@@ -170,10 +180,10 @@ impl CloudClient {
         Self::with_timeouts(api_base_url, Timeouts::API)
     }
 
-    /// Python `CloudClient(timeout=...)`: like urllib's `timeout`, it bounds
-    /// connecting, the response head and every single read, so a connection
-    /// that goes silent fails after `timeout` while a slow but steady body
-    /// completes (within the API body budget).
+    /// Like urllib's `timeout`, `timeout` bounds connecting, the response
+    /// head and every single read, so a connection that goes silent fails
+    /// after `timeout` while a slow but steady body completes (within the
+    /// API body budget).
     pub fn with_timeout(api_base_url: &str, timeout: Duration) -> Self {
         Self::with_timeouts(
             api_base_url,
@@ -200,11 +210,13 @@ impl CloudClient {
     }
 
     /// GET `url`, re-sending the headers (token included) across same-host
-    /// redirects as urllib does. Any other 3xx comes back unfollowed.
-    fn get(&self, url: &str, auth: Option<&str>) -> Result<Response<Body>, CloudError> {
-        let mut current = Url::parse(url)
-            .map_err(|e| CloudError::new(format!("network error: invalid URL {url:?}: {e}"), 0))?;
-        let mut hops = 0;
+    /// redirects as urllib does, within urllib's limits: 10 distinct
+    /// targets, each at most 4 times. Any other 3xx comes back unfollowed,
+    /// with the URL that answered it.
+    fn get(&self, url: Url, auth: Option<&str>) -> Result<(Url, Response<Body>), CloudError> {
+        let mut current = url;
+        // Times each redirect target was followed (urllib's redirect_dict).
+        let mut visited: HashMap<String, usize> = HashMap::new();
         loop {
             // The agent picks the proxy per connection, so an http→https hop
             // gets https_proxy without a new agent.
@@ -217,16 +229,20 @@ impl CloudClient {
             }
             let resp = req.call().map_err(transport_error)?;
             let Some(next) = follow_target(&current, &resp) else {
-                return Ok(resp);
+                return Ok((current, resp));
             };
             let status = resp.status().as_u16();
-            if hops == MAX_REDIRECTS {
+            let seen = visited.get(next.as_str()).copied().unwrap_or(0);
+            if seen >= MAX_REPEATS || visited.len() >= MAX_REDIRECTS {
                 return Err(CloudError::new(
-                    format!("too many redirects (last to {next})"),
+                    format!(
+                        "too many redirects (last to {})",
+                        net::redact_url(next.as_str())
+                    ),
                     status,
                 ));
             }
-            hops += 1;
+            visited.insert(next.to_string(), seen + 1);
             log::debug!(target: LOG, "following HTTP {status} redirect to {}", next.path());
             current = next;
         }
@@ -241,32 +257,36 @@ impl CloudClient {
     ) -> Result<JsonObject, CloudError> {
         let url = self.url(path);
         log::debug!(target: LOG, "{method} {path}");
+        let target = Url::parse(&url).map_err(|e| {
+            let shown = net::redact_url(&url);
+            CloudError::new(format!("network error: invalid URL {shown:?}: {e}"), 0)
+        })?;
         let auth = token
             .filter(|t| !t.is_empty())
             .map(|t| format!("Bearer {t}"));
         // Always send a body for POST so the server never sees a bodiless request
         // (a GET on /heartbeat yields Rails RoutingError "Not Found").
-        let mut resp = match method {
-            "GET" => self.get(&url, auth.as_deref())?,
+        let (at, mut resp) = match method {
+            "GET" => self.get(target, auth.as_deref())?,
             _ => {
                 let empty = json!({});
                 let payload = serde_json::to_vec(body.unwrap_or(&empty)).expect("json");
                 let mut req = self
                     .agent
-                    .post(&url)
+                    .post(target.as_str())
                     .header("Accept", "application/json")
                     .header("Content-Type", "application/json");
                 if let Some(a) = &auth {
                     req = req.header("Authorization", a);
                 }
-                req.send(&payload[..]).map_err(transport_error)?
+                (target, req.send(&payload[..]).map_err(transport_error)?)
             }
         };
 
         let status = resp.status().as_u16();
         // POSTs are never re-sent, and GETs only within the same host (above).
         if (300..400).contains(&status) {
-            return Err(redirect_error(&resp));
+            return Err(redirect_error(&at, &resp));
         }
         let raw = resp
             .body_mut()
@@ -772,7 +792,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.status, 307);
         assert!(!err.unauthorized());
-        assert_eq!(err.message, "unexpected redirect to /v2/print/v1/heartbeat");
+        assert_eq!(
+            err.message,
+            format!(
+                "unexpected redirect to {}/v2/print/v1/heartbeat",
+                srv.base_url
+            )
+        );
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].body, b"{}");
@@ -789,13 +815,106 @@ mod tests {
         let err = client.whoami("tok").unwrap_err();
         assert_eq!(err.status, 302);
         assert!(err.message.starts_with("too many redirects"), "{err}");
-        assert_eq!(srv.requests().len(), 1 + MAX_REDIRECTS);
+        // urllib's loop detection: one target is followed 4 times.
+        assert_eq!(srv.requests().len(), 1 + MAX_REPEATS);
 
         let err = client.ack_job("tok", "j1").unwrap_err();
         assert_eq!(
             (err.status, err.message.as_str()),
             (302, "unexpected HTTP 302")
         );
+    }
+
+    /// A stub that redirects /print/v1/whoami → /r1 → … → /r`hops` (each
+    /// with a signed-looking query) and answers the last one 200, only with
+    /// the token.
+    fn redirect_chain(hops: usize) -> http_stub::Stub {
+        http_stub::serve(move |req, s| {
+            let path = req.path.split('?').next().unwrap_or_default();
+            let at: usize = path.strip_prefix("/r").map_or(0, |n| n.parse().unwrap());
+            if at < hops {
+                let to = format!("/r{}?sig=secret-{}", at + 1, at + 1);
+                respond(s, 302, &[("Location", &to)], b"")
+            } else {
+                whoami_v2(req, s)
+            }
+        })
+    }
+
+    /// urllib follows 10 redirects and refuses the 11th; so does the
+    /// same-host loop, with the token on every hop.
+    #[test]
+    fn same_host_redirect_chain_follows_ten_hops() {
+        let srv = redirect_chain(10);
+        let who = CloudClient::new(&srv.base_url).whoami("tok").unwrap();
+        assert_eq!(who["node_id"], "n1");
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 11);
+        assert!(reqs
+            .iter()
+            .all(|r| r.header("Authorization") == Some("Bearer tok")));
+
+        let srv = redirect_chain(11);
+        let err = CloudClient::new(&srv.base_url).whoami("tok").unwrap_err();
+        assert_eq!(err.status, 302);
+        assert!(!err.unauthorized());
+        assert_eq!(
+            err.message,
+            format!("too many redirects (last to {}/r11)", srv.base_url)
+        );
+        assert_eq!(srv.requests().len(), 11);
+    }
+
+    /// No redirect error names a URL's userinfo, query or fragment: those
+    /// can carry credentials (a presigned URL's signature, a portal's
+    /// session), and the message goes to the journal, status.json and the
+    /// LCD's stats page.
+    #[test]
+    fn redirect_errors_omit_query_and_userinfo() {
+        let leaks = |msg: &str| {
+            ["sekrit", "pw", "abc", "secret", "?", "#"]
+                .iter()
+                .any(|s| msg.contains(s))
+        };
+        // Cross-host GET.
+        let srv = http_stub::serve(|_, s| {
+            let to = "https://user:pw@bucket.example.test/obj?X-Amz-Signature=sekrit#frag";
+            respond(s, 302, &[("Location", to)], b"")
+        });
+        let err = CloudClient::new(&srv.base_url).whoami("tok").unwrap_err();
+        assert_eq!(err.status, 302);
+        assert_eq!(
+            err.message,
+            "unexpected redirect to https://bucket.example.test/obj"
+        );
+        // POST, to a relative Location.
+        let srv =
+            http_stub::serve(|_, s| respond(s, 307, &[("Location", "/v2/hb?token=abc")], b""));
+        let err = CloudClient::new(&srv.base_url)
+            .heartbeat("tok", &HeartbeatBody::default())
+            .unwrap_err();
+        assert!(
+            err.message.ends_with("/v2/hb") && !leaks(&err.message),
+            "{err}"
+        );
+        // A same-host loop.
+        let srv =
+            http_stub::serve(|_, s| respond(s, 302, &[("Location", "/loop?sig=secret")], b""));
+        let err = CloudClient::new(&srv.base_url).whoami("tok").unwrap_err();
+        assert!(err.message.starts_with("too many redirects"), "{err}");
+        assert!(!leaks(&err.message), "{err}");
+        // Same host, but with userinfo: not followed, and not shown.
+        let srv = http_stub::serve(|req, s| {
+            let to = format!("http://u:pw@127.0.0.1:{}/v2?k=abc", req.port());
+            respond(s, 302, &[("Location", &to)], b"")
+        });
+        let err = CloudClient::new(&srv.base_url).whoami("tok").unwrap_err();
+        assert_eq!(err.status, 302);
+        assert!(
+            err.message.ends_with("/v2") && !leaks(&err.message),
+            "{err}"
+        );
+        assert_eq!(srv.requests().len(), 1, "followed");
     }
 
     #[test]
@@ -810,12 +929,20 @@ mod tests {
         assert!(!ok("https://api.example/", "https://api.example:8443/"));
         assert!(!ok("http://api.example:8080/", "https://api.example/"));
         assert!(!ok("http://api.example/", "ftp://api.example/"));
+        // Userinfo: never added or changed by a redirect.
+        assert!(!ok("https://api.example/", "https://u:pw@api.example/v2"));
+        assert!(!ok("https://api.example/", "https://u@api.example/v2"));
+        assert!(!ok(
+            "https://u:a@api.example/",
+            "https://u:b@api.example/v2"
+        ));
+        assert!(ok("https://u:a@api.example/", "https://u:a@api.example/v2"));
     }
 
     #[test]
     fn slow_steady_body_outlives_the_per_phase_timeout() {
         // 2.5 s of body against a 1 s timeout: urllib's timeout is per socket
-        // operation, so Python completes this; an end-to-end deadline did not.
+        // operation, so urllib completes this; an end-to-end deadline did not.
         let body = r#"{"jobs":[{"id":"j1"},{"id":"j2"},{"id":"j3"}]}"#;
         let srv = http_stub::serve(move |_, s| {
             http_stub::trickle(s, body.as_bytes(), 10, Duration::from_millis(250))
@@ -868,7 +995,7 @@ mod tests {
         assert_eq!((err.status, err.message.as_str()), (0, "request timed out"));
         assert!(took >= Duration::from_millis(900), "{took:?}");
         assert!(took < Duration::from_secs(5), "{took:?}");
-        // The API defaults use Python's 30 s per read.
+        // The API defaults keep urllib's 30 s per read.
         assert_eq!(Timeouts::API.idle, Duration::from_secs(30));
     }
 
