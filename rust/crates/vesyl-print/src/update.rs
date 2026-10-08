@@ -17,8 +17,10 @@
 //! SHA-256 + Ed25519 signature over the canonical manifest (signature field
 //! excluded) — byte-compatible with `scripts/build-release.sh`.
 //!
-//! A slot is runnable when it contains the `vesyl-print` binary (the agent and
-//! CLI; the LCD display is still Python and ships in the same slot).
+//! A slot is runnable ([`slot_is_runnable`]) when it holds an executable
+//! `vesyl-print`, the binary the units exec (the agent and CLI; the LCD
+//! display is still Python and ships in the same slot). Installs and
+//! rollbacks activate no other slot, and the apply-update helper refuses one.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -76,8 +78,12 @@ pub const STATUS_ROLLED_BACK: &str = "rolled_back";
 /// While in these states, do not pull/process new print jobs (OTA in progress).
 const JOB_PAUSE_STATUSES: &[&str] = &[STATUS_DOWNLOADING, STATUS_INSTALLING, STATUS_PENDING_HEALTH];
 
-/// Files that mark a release slot as runnable (Python app or Rust binary).
-const SLOT_ENTRYPOINTS: &[&str] = &["vesyl-print", "bin/vesyl-print"];
+/// What the units exec from a slot (`<slot>/vesyl-print agent`), and what
+/// `scripts/apply-update` requires before it activates one.
+const SLOT_BINARY: &str = "vesyl-print";
+
+/// [`extract_tarball`] unpacks into `<slot>` + this, beside the slot.
+const STAGING_SUFFIX: &str = ".staging";
 
 /// Installed root-owned helper (NOPASSWD sudoers on appliances).
 const APPLY_HELPER: &str = "/usr/local/lib/vesyl-print/apply-update";
@@ -87,8 +93,25 @@ fn version_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^\d+\.\d+\.\d+([.-][0-9A-Za-z.]+)?$").expect("regex"))
 }
 
+/// A release version: the pattern `scripts/apply-update` (and
+/// build-release.sh, setup.sh) checks, except that a last dot-component of
+/// `staging` is refused. `<version>.staging` is the directory an extract
+/// leaves beside its slot if it dies midway, so such a name never counts as
+/// a release ([`list_releases`], `current`), and no manifest can name a slot
+/// that is another version's staging dir.
 pub fn is_version(s: &str) -> bool {
-    version_re().is_match(s)
+    version_re().is_match(s) && !s.ends_with(STAGING_SUFFIX)
+}
+
+/// True when `dir` is a slot the units can start and `scripts/apply-update`
+/// will activate: a real directory (not a symlink) holding `vesyl-print`, a
+/// regular file with an execute bit. As with the helper's `[[ -f && -x ]]`,
+/// a symlink there is judged by what it points at.
+pub fn slot_is_runnable(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+        && fs::metadata(dir.join(SLOT_BINARY))
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -763,66 +786,101 @@ pub fn extract_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), UpdateErro
             "exists",
         ));
     }
-    let parent = dest_dir.parent().unwrap_or(Path::new("."));
-    crate::util::create_dir_all_owned(parent).map_err(io_err("bad_archive"))?;
-    clean_stale(parent);
-    let staging = PathBuf::from(format!("{}.staging", dest_dir.display()));
-    // Left by an extract that died midway, perhaps one run as root.
-    clear_release_dir(&staging)?;
-    // Root hands it to the owner of `releases/`, so the agent can clear
-    // whatever a crash leaves in it.
-    crate::util::create_dir_all_owned(&staging).map_err(io_err("bad_archive"))?;
-
-    let open = || -> Result<tar::Archive<flate2::read::GzDecoder<File>>, UpdateError> {
-        let f = File::open(tarball)
-            .map_err(|e| UpdateError::new(format!("extract failed: {e}"), "bad_archive"))?;
-        Ok(tar::Archive::new(flate2::read::GzDecoder::new(f)))
-    };
-    let extract = || -> Result<(), UpdateError> {
-        let fail =
-            |e: std::io::Error| UpdateError::new(format!("extract failed: {e}"), "bad_archive");
-        // Pass 1: validate every member before writing anything.
-        for entry in open()?.entries().map_err(fail)? {
-            let entry = entry.map_err(fail)?;
-            let path = entry.path().map_err(fail)?.into_owned();
-            let link = entry.link_name().map_err(fail)?.map(|l| l.into_owned());
-            if unsafe_archive_path(&path) || link.as_deref().is_some_and(unsafe_archive_path) {
-                return Err(UpdateError::new(
-                    format!("refusing unsafe path in archive: {}", path.display()),
-                    "bad_archive",
-                ));
-            }
-        }
-        // Pass 2: unpack.
-        let mut archive = open()?;
-        archive.set_preserve_permissions(false);
-        archive.unpack(&staging).map_err(fail)
-    };
-    if let Err(e) = extract() {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(e);
-    }
-
-    // If archive has a single top-level dir, peel it.
-    let children: Vec<PathBuf> = fs::read_dir(&staging)
-        .map_err(io_err("bad_archive"))?
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    if children.len() == 1 && children[0].is_dir() {
-        fs::rename(&children[0], dest_dir).map_err(io_err("bad_archive"))?;
-        let _ = fs::remove_dir_all(&staging);
-    } else {
-        fs::rename(&staging, dest_dir).map_err(io_err("bad_archive"))?;
-    }
-    // An operator running `update apply` as root must not leave a root-owned
-    // slot the non-root agent can never replace or remove.
-    crate::util::hand_tree_to_parent_owner(dest_dir).map_err(io_err("bad_archive"))?;
-    Ok(())
+    Staged::unpack(tarball, dest_dir)?.put_in_place(dest_dir)
 }
 
-/// Root (the CLI) writes it as the slot's owner, like the rest of the slot.
+/// A release unpacked into `<slot>.staging`, beside its slot, and not yet in
+/// place: an install checks it there, before it touches the slot itself.
+struct Staged {
+    /// The staging dir.
+    dir: PathBuf,
+    /// The release in it: the archive's single top-level directory, else
+    /// the staging dir itself.
+    tree: PathBuf,
+}
+
+impl Staged {
+    /// Unpack `tarball` into a fresh staging dir for the slot `dest_dir`.
+    /// Rejects absolute paths, `..`, and links that point outside the archive.
+    fn unpack(tarball: &Path, dest_dir: &Path) -> Result<Staged, UpdateError> {
+        let parent = dest_dir.parent().unwrap_or(Path::new("."));
+        crate::util::create_dir_all_owned(parent).map_err(io_err("bad_archive"))?;
+        clean_stale(parent);
+        let mut staging = dest_dir.as_os_str().to_owned();
+        staging.push(STAGING_SUFFIX);
+        let staging = PathBuf::from(staging);
+        // Left by an extract that died midway, perhaps one run as root.
+        clear_release_dir(&staging)?;
+        // Root hands it to the owner of `releases/`, so the agent can clear
+        // whatever a crash leaves in it.
+        crate::util::create_dir_all_owned(&staging).map_err(io_err("bad_archive"))?;
+
+        let open = || -> Result<tar::Archive<flate2::read::GzDecoder<File>>, UpdateError> {
+            let f = File::open(tarball)
+                .map_err(|e| UpdateError::new(format!("extract failed: {e}"), "bad_archive"))?;
+            Ok(tar::Archive::new(flate2::read::GzDecoder::new(f)))
+        };
+        let extract = || -> Result<Vec<fs::DirEntry>, UpdateError> {
+            let fail =
+                |e: std::io::Error| UpdateError::new(format!("extract failed: {e}"), "bad_archive");
+            // Pass 1: validate every member before writing anything.
+            for entry in open()?.entries().map_err(fail)? {
+                let entry = entry.map_err(fail)?;
+                let path = entry.path().map_err(fail)?.into_owned();
+                let link = entry.link_name().map_err(fail)?.map(|l| l.into_owned());
+                if unsafe_archive_path(&path) || link.as_deref().is_some_and(unsafe_archive_path) {
+                    return Err(UpdateError::new(
+                        format!("refusing unsafe path in archive: {}", path.display()),
+                        "bad_archive",
+                    ));
+                }
+            }
+            // Pass 2: unpack.
+            let mut archive = open()?;
+            archive.set_preserve_permissions(false);
+            archive.unpack(&staging).map_err(fail)?;
+            Ok(fs::read_dir(&staging).map_err(fail)?.flatten().collect())
+        };
+        let children = match extract() {
+            Ok(children) => children,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(e);
+            }
+        };
+        // If archive has a single top-level dir, peel it. Never a symlink:
+        // moved to where the slot goes, its target would resolve elsewhere.
+        let tree = match children.as_slice() {
+            [only] if only.file_type().is_ok_and(|t| t.is_dir()) => only.path(),
+            _ => staging.clone(),
+        };
+        Ok(Staged { dir: staging, tree })
+    }
+
+    /// Move the release to `dest_dir`, which must not exist, and remove the
+    /// staging dir. An operator running `update apply` as root must not leave
+    /// a root-owned slot the non-root agent can never replace or remove, so
+    /// the slot, `VERSION` and all, goes to the owner of `releases/`.
+    fn put_in_place(self, dest_dir: &Path) -> Result<(), UpdateError> {
+        if let Err(e) = fs::rename(&self.tree, dest_dir) {
+            self.discard();
+            return Err(UpdateError::new(e.to_string(), "bad_archive"));
+        }
+        if self.tree != self.dir {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+        crate::util::hand_tree_to_parent_owner(dest_dir).map_err(io_err("bad_archive"))
+    }
+
+    fn discard(self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// A `VERSION` symlink from the archive is replaced, never written through.
+/// Written by root (the CLI), it ends up the slot owner's like the rest of
+/// the slot: kept by [`write_durable`] in a slot already in place, handed
+/// over with it by an install, which writes it before then.
 pub fn write_version_file(release_dir: &Path, version: &str) -> std::io::Result<()> {
     write_durable(
         &release_dir.join("VERSION"),
@@ -882,22 +940,51 @@ pub fn flip_current(install_root: &Path, version: &str) -> Result<PathBuf, Updat
     Ok(release_dir)
 }
 
+/// What runs the helper: `sudo -n` (NOPASSWD on appliances). Unit tests run
+/// a stand-in helper script with `sh` instead, so no test ever runs sudo.
+#[cfg(not(test))]
+const HELPER_RUNNER: &[&str] = &["sudo", "-n"];
+#[cfg(test)]
+const HELPER_RUNNER: &[&str] = &["sh"];
+
+/// A stand-in for the apply-update helper (run with `sh`, see
+/// `HELPER_RUNNER`): appends its arguments to `<dir>/helper.calls`, then
+/// exits 0, or refuses with exit 1 when `refuse`.
+#[cfg(test)]
+pub(crate) fn fake_helper(dir: &Path, refuse: bool) -> PathBuf {
+    let helper = dir.join("apply-update");
+    let calls = dir.join("helper.calls");
+    let exit = if refuse {
+        "echo 'apply-update: refused' >&2; exit 1"
+    } else {
+        "exit 0"
+    };
+    fs::write(
+        &helper,
+        format!("echo \"$*\" >> '{}'\n{exit}\n", calls.display()),
+    )
+    .unwrap();
+    helper
+}
+
 /// `sudo -n <helper> activate <release_dir> <current>`.
 fn helper_activate(helper: &Path, release_dir: &Path, current: &Path) -> Result<(), UpdateError> {
     let h = helper.display().to_string();
     let r = release_dir.display().to_string();
     let c = current.display().to_string();
-    let out = crate::printers::run_with_timeout(
-        "sudo",
-        &["-n", &h, "activate", &r, &c],
-        Duration::from_secs(60),
-    )
-    .map_err(|e| {
-        UpdateError::new(
-            format!("apply-update activate failed: {e}"),
-            "activate_failed",
-        )
-    })?;
+    let (runner, runner_args) = HELPER_RUNNER.split_first().expect("runner");
+    let args: Vec<&str> = runner_args
+        .iter()
+        .copied()
+        .chain([h.as_str(), "activate", r.as_str(), c.as_str()])
+        .collect();
+    let out =
+        crate::printers::run_with_timeout(runner, &args, Duration::from_secs(60)).map_err(|e| {
+            UpdateError::new(
+                format!("apply-update activate failed: {e}"),
+                "activate_failed",
+            )
+        })?;
     if !out.success {
         return Err(UpdateError::new(
             format!("apply-update activate failed: {}", out.stderr.trim()),
@@ -907,7 +994,29 @@ fn helper_activate(helper: &Path, release_dir: &Path, current: &Path) -> Result<
     Ok(())
 }
 
-/// Flip current to the previous release (or an explicit version).
+/// Point `current` at `releases/<version>`. Where the apply-update helper is
+/// installed (appliances), only through it: it checks the slot again as
+/// root, and when it refuses, nothing is flipped here instead. Without one
+/// (lab installs run by the service user, tests), [`flip_current`] does it.
+fn activate(
+    install_root: &Path,
+    version: &str,
+    apply_helper: Option<&Path>,
+) -> Result<PathBuf, UpdateError> {
+    match apply_helper.filter(|h| h.is_file()) {
+        Some(helper) => {
+            let release_dir = install_root.join("releases").join(version);
+            helper_activate(helper, &release_dir, &install_root.join("current"))?;
+            Ok(release_dir)
+        }
+        None => flip_current(install_root, version),
+    }
+}
+
+/// Activate the newest release other than the one `current` points at, or
+/// `to_version`. Only a runnable slot ([`slot_is_runnable`]) is a candidate:
+/// others are passed over when choosing, and an explicit `to_version` that
+/// cannot run is refused, as the helper would refuse it.
 pub fn rollback(
     install_root: &Path,
     to_version: Option<&str>,
@@ -920,6 +1029,7 @@ pub fn rollback(
             "no_rollback",
         ));
     }
+    let slot = |v: &str| install_root.join("releases").join(v);
     let cur_ver = current_release_dir(install_root).map(|c| dir_name(&c));
     let target = match to_version {
         Some(v) => {
@@ -929,28 +1039,42 @@ pub fn rollback(
                     "missing_release",
                 ));
             }
+            if !slot_is_runnable(&slot(v)) {
+                return Err(UpdateError::new(
+                    format!("release {v} cannot run: no executable {SLOT_BINARY} in its slot"),
+                    "not_runnable",
+                ));
+            }
             v.to_string()
         }
-        None => releases
-            .iter()
-            .rev()
-            .find(|v| Some(v.as_str()) != cur_ver.as_deref())
-            .cloned()
-            .ok_or_else(|| UpdateError::new("no previous release for rollback", "no_rollback"))?,
-    };
-    let release_dir = install_root.join("releases").join(&target);
-    match apply_helper.filter(|h| h.is_file()) {
-        Some(helper) => {
-            if let Err(e) = helper_activate(helper, &release_dir, &install_root.join("current")) {
-                // Lab installs / unit tests: fall back to in-process symlink flip.
-                log::warn!(target: LOG, "{e}; flipping current in-process");
-                flip_current(install_root, &target)?;
-            }
-        }
         None => {
-            flip_current(install_root, &target)?;
+            let (runnable, broken): (Vec<&String>, Vec<&String>) = releases
+                .iter()
+                .filter(|v| Some(v.as_str()) != cur_ver.as_deref())
+                .partition(|v| slot_is_runnable(&slot(v)));
+            let broken = broken
+                .iter()
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !broken.is_empty() {
+                log::warn!(target: LOG, "passing over releases without an executable {SLOT_BINARY}: {broken}");
+            }
+            let Some(newest) = runnable.last() else {
+                let why = if broken.is_empty() {
+                    String::new()
+                } else {
+                    format!(": no executable {SLOT_BINARY} in {broken}")
+                };
+                return Err(UpdateError::new(
+                    format!("no previous release for rollback{why}"),
+                    "no_rollback",
+                ));
+            };
+            newest.to_string()
         }
-    }
+    };
+    activate(install_root, &target, apply_helper)?;
     log::info!(target: LOG, "rolled back to {target}");
     Ok(target)
 }
@@ -1059,6 +1183,57 @@ pub fn apply_release(
     public_key_pem: Option<&str>,
     require_signature: bool,
 ) -> Result<PathBuf, UpdateError> {
+    check_manifest(manifest, env, public_key_pem, require_signature)?;
+
+    let update_dir = env.install_root.join("update");
+    crate::util::create_dir_all_owned(&update_dir).map_err(io_err("download_failed"))?;
+    let tarball = update_dir.join(format!("vesyl-print-{}.tar.gz", manifest.version));
+
+    log::info!(target: LOG, "downloading {}", manifest.artifact_url);
+    http_download_to_file(&manifest.artifact_url, &tarball, &manifest.artifact_sha256)?;
+
+    let release_dir = install_release(manifest, env, &tarball)?;
+    let _ = fs::remove_file(&tarball);
+    Ok(release_dir)
+}
+
+/// [`apply_release`] for an artifact already on disk (`update apply
+/// --file`): the same checks, install and activation, with `tarball`
+/// checked against the manifest's SHA-256 instead of downloaded.
+pub fn apply_local_release(
+    manifest: &ReleaseManifest,
+    env: &UpdateEnv,
+    tarball: &Path,
+    public_key_pem: Option<&str>,
+    require_signature: bool,
+) -> Result<PathBuf, UpdateError> {
+    check_manifest(manifest, env, public_key_pem, require_signature)?;
+    let sha = sha256_file(tarball).map_err(|e| {
+        UpdateError::new(
+            format!("cannot read {}: {e}", tarball.display()),
+            "bad_archive",
+        )
+    })?;
+    if sha != manifest.artifact_sha256 {
+        return Err(UpdateError::new(
+            format!(
+                "sha256 mismatch: file={sha} manifest={}",
+                manifest.artifact_sha256
+            ),
+            "bad_checksum",
+        ));
+    }
+    install_release(manifest, env, tarball)
+}
+
+/// What every install checks before it touches anything: that this agent
+/// is new enough for the release (`min_agent_version`), and the signature.
+fn check_manifest(
+    manifest: &ReleaseManifest,
+    env: &UpdateEnv,
+    public_key_pem: Option<&str>,
+    require_signature: bool,
+) -> Result<(), UpdateError> {
     if let Some(min) = &manifest.min_agent_version {
         if version_cmp(&env.running_version, min).is_lt() {
             return Err(UpdateError::new(
@@ -1067,45 +1242,44 @@ pub fn apply_release(
             ));
         }
     }
-    verify_manifest(manifest, public_key_pem, require_signature)?;
+    verify_manifest(manifest, public_key_pem, require_signature)
+}
 
+/// Install the verified `tarball` as the slot for `manifest.version`, then
+/// [`activate`] it. The archive is unpacked into a staging dir beside the
+/// slot and must hold a runnable slot ([`slot_is_runnable`]) before its
+/// `VERSION` is written and it replaces the slot: a bad archive leaves an
+/// installed slot of the same version as it was.
+fn install_release(
+    manifest: &ReleaseManifest,
+    env: &UpdateEnv,
+    tarball: &Path,
+) -> Result<PathBuf, UpdateError> {
     let root = &env.install_root;
-    let update_dir = root.join("update");
-    crate::util::create_dir_all_owned(&update_dir).map_err(io_err("download_failed"))?;
-    let tarball = update_dir.join(format!("vesyl-print-{}.tar.gz", manifest.version));
-
-    log::info!(target: LOG, "downloading {}", manifest.artifact_url);
-    http_download_to_file(&manifest.artifact_url, &tarball, &manifest.artifact_sha256)?;
-
     let release_dir = root.join("releases").join(&manifest.version);
-    // A slot of this version from an earlier install. If the agent cannot
-    // delete it (root unpacked it), it is moved aside: failing here would
-    // download the artifact again on every heartbeat, and never install.
-    clear_release_dir(&release_dir)?;
     log::info!(target: LOG, "extracting to {}", release_dir.display());
-    extract_tarball(&tarball, &release_dir)?;
-    write_version_file(&release_dir, &manifest.version).map_err(io_err("bad_archive"))?;
-
-    // Minimal sanity: an entrypoint is present.
-    if !SLOT_ENTRYPOINTS
-        .iter()
-        .any(|e| release_dir.join(e).is_file())
-    {
-        let _ = fs::remove_dir_all(&release_dir);
-        return Err(UpdateError::new(
-            "archive missing the vesyl-print binary",
-            "bad_archive",
-        ));
-    }
-
-    match env.apply_helper.as_deref().filter(|h| h.is_file()) {
-        Some(helper) => helper_activate(helper, &release_dir, &root.join("current"))?,
-        None => {
-            flip_current(root, &manifest.version)?;
+    let staged = Staged::unpack(tarball, &release_dir)?;
+    let checked = (|| {
+        if !slot_is_runnable(&staged.tree) {
+            return Err(UpdateError::new(
+                "archive missing an executable vesyl-print binary",
+                "bad_archive",
+            ));
         }
+        write_version_file(&staged.tree, &manifest.version).map_err(io_err("bad_archive"))?;
+        // A slot of this version from an earlier install. If the agent cannot
+        // delete it (root unpacked it), it is moved aside: failing here would
+        // download the artifact again on every heartbeat, and never install.
+        clear_release_dir(&release_dir)
+    })();
+    if let Err(e) = checked {
+        staged.discard();
+        return Err(e);
     }
+    staged.put_in_place(&release_dir)?;
+
+    activate(root, &manifest.version, env.apply_helper.as_deref())?;
     log::info!(target: LOG, "activated version {}", manifest.version);
-    let _ = fs::remove_file(&tarball);
     Ok(release_dir)
 }
 
@@ -1215,7 +1389,9 @@ impl Slot {
 /// Fast checks on the active release dir (no network).
 pub fn local_slot_healthy(env: &UpdateEnv, expected_version: Option<&str>) -> Result<(), String> {
     let cur = current_release_dir(&env.install_root).ok_or("current symlink missing or broken")?;
-    if !SLOT_ENTRYPOINTS.iter().any(|e| cur.join(e).is_file()) {
+    // Whether it can run was checked when `current` was pointed here (the
+    // helper, else `slot_is_runnable`); here, that it is still in place.
+    if !cur.join(SLOT_BINARY).is_file() {
         return Err("current slot missing the vesyl-print binary".into());
     }
     if let Some(expected) = expected_version.filter(|e| !e.is_empty()) {
@@ -1962,6 +2138,36 @@ mod tests {
         tarball
     }
 
+    /// A release tarball in `dir` holding only `files` (path, executable)
+    /// under `vesyl-print-<version>/`.
+    fn tarball_with(dir: &Path, version: &str, files: &[(&str, bool)]) -> PathBuf {
+        let tarball = dir.join(format!("vesyl-print-{version}-custom.tar.gz"));
+        evil_tarball(&tarball, |tar| {
+            for (path, exec) in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(4);
+                h.set_mode(if *exec { 0o755 } else { 0o644 });
+                tar.append_data(
+                    &mut h,
+                    format!("vesyl-print-{version}/{path}"),
+                    &b"\x7fELF"[..],
+                )
+                .unwrap();
+            }
+        });
+        tarball
+    }
+
+    /// Unsigned manifest for the local `tarball`.
+    fn manifest_for(tarball: &Path, version: &str) -> ReleaseManifest {
+        ReleaseManifest::from_dict(&obj(json!({
+            "version": version,
+            "artifact_url": url::Url::from_file_path(tarball).unwrap().to_string(),
+            "artifact_sha256": sha256_file(tarball).unwrap(),
+        })))
+        .unwrap()
+    }
+
     fn cfg(td: &Path) -> Config {
         Config {
             api_base_url: "https://example.test".into(),
@@ -2436,9 +2642,14 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let root = two_slots(td.path());
         assert!(local_slot_healthy(&env(&root), Some("0.4.0")).is_ok());
-        // A Python-era slot (agent.py / main.py only) is no longer runnable.
+        // The units exec <slot>/vesyl-print: the binary only under bin/ fails.
         let cur = fs::canonicalize(root.join("current")).unwrap();
-        fs::remove_file(cur.join("vesyl-print")).unwrap();
+        fs::create_dir(cur.join("bin")).unwrap();
+        fs::rename(cur.join("vesyl-print"), cur.join("bin/vesyl-print")).unwrap();
+        let err = local_slot_healthy(&env(&root), Some("0.4.0")).unwrap_err();
+        assert!(err.contains("vesyl-print binary"), "{err}");
+        // A Python-era slot (agent.py / main.py only) is no longer runnable.
+        fs::remove_dir_all(cur.join("bin")).unwrap();
         fs::write(cur.join("agent.py"), "# old python agent\n").unwrap();
         let err = local_slot_healthy(&env(&root), Some("0.4.0")).unwrap_err();
         assert!(err.contains("vesyl-print binary"), "{err}");
@@ -2468,6 +2679,334 @@ mod tests {
         let err = apply_release(&m, &env(&root), None, false).unwrap_err();
         assert_eq!(err.code, "bad_archive");
         assert!(!root.join("releases/0.9.0").exists());
+    }
+
+    // --- runnable slots, rollback, the install path, staging (B1-B4) ----------
+
+    /// A slot under `root/releases` holding `files` (path, executable).
+    fn slot_with(root: &Path, version: &str, files: &[(&str, bool)]) -> PathBuf {
+        let slot = root.join("releases").join(version);
+        fs::create_dir_all(&slot).unwrap();
+        for (path, exec) in files {
+            let file = slot.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, b"\x7fELF").unwrap();
+            crate::util::set_mode(&file, if *exec { 0o755 } else { 0o644 }).unwrap();
+        }
+        slot
+    }
+
+    /// What the units exec and the helper checks (`[[ -f && -x ]]` on
+    /// `<slot>/vesyl-print`, in a slot that is not a symlink), and nothing
+    /// else, makes a slot runnable.
+    #[test]
+    fn a_runnable_slot_has_an_executable_binary_at_its_root() {
+        use std::os::unix::fs::symlink;
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        assert!(slot_is_runnable(&slot_with(
+            root,
+            "1.0.0",
+            &[("vesyl-print", true)]
+        )));
+        for (version, files) in [
+            ("1.0.1", &[("vesyl-print", false)][..]),
+            ("1.0.2", &[("bin/vesyl-print", true)]),
+            ("1.0.3", &[("vesyl-print/vesyl-print", true)]),
+            ("1.0.4", &[("main.py", false)]),
+        ] {
+            assert!(
+                !slot_is_runnable(&slot_with(root, version, files)),
+                "{version}"
+            );
+        }
+        assert!(!slot_is_runnable(&root.join("releases/9.9.9")));
+        // A symlinked binary counts by what it points at...
+        let linked = slot_with(root, "1.1.0", &[("bin/vesyl-print", true)]);
+        symlink("bin/vesyl-print", linked.join("vesyl-print")).unwrap();
+        assert!(slot_is_runnable(&linked));
+        let dangling = slot_with(root, "1.1.1", &[]);
+        symlink("bin/vesyl-print", dangling.join("vesyl-print")).unwrap();
+        assert!(!slot_is_runnable(&dangling));
+        // ... but a symlinked slot is refused, as the helper refuses it.
+        symlink("1.0.0", root.join("releases/1.2.0")).unwrap();
+        assert!(!slot_is_runnable(&root.join("releases/1.2.0")));
+    }
+
+    /// An archive whose binary is not executable, or is only under bin/,
+    /// is refused before activation, however it arrives, and leaves nothing.
+    #[test]
+    fn archive_needs_an_executable_binary_at_its_root() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        for (version, files) in [
+            ("0.9.0", &[("vesyl-print", false)][..]),
+            ("0.9.1", &[("bin/vesyl-print", true)]),
+        ] {
+            let tarball = tarball_with(td.path(), version, files);
+            let m = manifest_for(&tarball, version);
+            for err in [
+                apply_release(&m, &env(&root), None, false).unwrap_err(),
+                apply_local_release(&m, &env(&root), &tarball, None, false).unwrap_err(),
+            ] {
+                assert_eq!(err.code, "bad_archive", "{version}: {err}");
+                assert_eq!(
+                    err.message, "archive missing an executable vesyl-print binary",
+                    "{version}"
+                );
+            }
+            assert_eq!(current_name(&root), "0.4.0", "{version}");
+        }
+        let left: Vec<String> = fs::read_dir(root.join("releases"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert_eq!(list_releases(&root), ["0.3.0", "0.4.0"]);
+    }
+
+    /// The archive is checked in its staging dir, before the slot it would
+    /// replace is touched: a bad archive of an installed version leaves that
+    /// slot as it was, and writes nothing outside the staging dir.
+    #[test]
+    fn bad_archive_leaves_the_installed_slot_alone() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let slot = root.join("releases/0.4.0");
+        let binary = fs::read(slot.join("vesyl-print")).unwrap();
+        let bad = tarball_with(td.path(), "0.4.0", &[("README", false)]);
+        let err =
+            apply_release(&manifest_for(&bad, "0.4.0"), &env(&root), None, false).unwrap_err();
+        assert_eq!(err.code, "bad_archive");
+        assert_eq!(fs::read(slot.join("vesyl-print")).unwrap(), binary);
+        assert!(slot_is_runnable(&slot));
+        assert!(local_slot_healthy(&env(&root), Some("0.4.0")).is_ok());
+
+        // Its one entry a link to "." (inside the archive): moved to where
+        // the slot goes, it would be `releases/` itself, and VERSION would
+        // be written there.
+        let linked = td.path().join("linked.tar.gz");
+        evil_tarball(&linked, |tar| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            tar.append_link(&mut h, "vesyl-print-0.4.0", ".").unwrap();
+        });
+        let m = manifest_for(&linked, "0.4.0");
+        let err = apply_local_release(&m, &env(&root), &linked, None, false).unwrap_err();
+        assert_eq!(err.code, "bad_archive");
+        assert!(!root.join("releases/VERSION").exists());
+        assert_eq!(fs::read(slot.join("vesyl-print")).unwrap(), binary);
+        let mut left: Vec<String> = fs::read_dir(root.join("releases"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["0.3.0", "0.4.0"]);
+    }
+
+    /// `update apply --file` checks what an online apply checks: a release
+    /// this agent is too old for is refused, and a wrong checksum.
+    #[test]
+    fn local_release_checks_the_manifest_and_the_artifact() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let tarball = build_release(&td.path().join("0.5.0"), "0.5.0");
+        let mut m = manifest_for(&tarball, "0.5.0");
+        m.min_agent_version = Some("0.4.1".into());
+        let err = apply_local_release(&m, &env(&root), &tarball, None, false).unwrap_err();
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            ("too_old", "current 0.4.0 < min_agent_version 0.4.1")
+        );
+        m.min_agent_version = Some("0.4.0".into());
+        let other = td.path().join("other.tar.gz");
+        fs::write(&other, b"not the artifact").unwrap();
+        let err = apply_local_release(&m, &env(&root), &other, None, false).unwrap_err();
+        assert_eq!(err.code, "bad_checksum");
+        assert!(err.message.starts_with("sha256 mismatch: file="), "{err}");
+        assert!(!root.join("releases/0.5.0").exists());
+
+        let dir = apply_local_release(&m, &env(&root), &tarball, None, false).unwrap();
+        assert_eq!(dir, root.join("releases/0.5.0"));
+        assert_eq!(current_name(&root), "0.5.0");
+        assert_eq!(fs::read_to_string(dir.join("VERSION")).unwrap(), "0.5.0\n");
+        // Nothing downloaded, and the operator's tarball is left alone.
+        assert!(!root.join("update").exists());
+        assert!(tarball.is_file());
+    }
+
+    /// Rollback activates only a slot that can run: others are passed over
+    /// when choosing, an explicit one is refused, and with none left the
+    /// error says what was passed over.
+    #[test]
+    fn rollback_only_activates_runnable_slots() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        // Newer than 0.3.0, so before they were picked first.
+        slot_with(&root, "0.3.5", &[("vesyl-print", false)]);
+        slot_with(&root, "0.3.6", &[("bin/vesyl-print", true)]);
+        assert_eq!(rollback(&root, None, None).unwrap(), "0.3.0");
+        assert_eq!(current_name(&root), "0.3.0");
+        for v in ["0.3.5", "0.3.6"] {
+            let err = rollback(&root, Some(v), None).unwrap_err();
+            assert_eq!(err.code, "not_runnable", "{v}");
+            assert_eq!(
+                err.message,
+                format!("release {v} cannot run: no executable vesyl-print in its slot")
+            );
+            assert_eq!(current_name(&root), "0.3.0");
+        }
+        // From 0.3.0, 0.4.0 is the one other slot that runs.
+        assert_eq!(rollback(&root, None, None).unwrap(), "0.4.0");
+        fs::remove_dir_all(root.join("releases/0.3.0")).unwrap();
+        let err = rollback(&root, None, None).unwrap_err();
+        assert_eq!(err.code, "no_rollback");
+        assert_eq!(
+            err.message,
+            "no previous release for rollback: no executable vesyl-print in 0.3.5, 0.3.6"
+        );
+        assert_eq!(current_name(&root), "0.4.0");
+    }
+
+    /// Where the apply-update helper is installed, it alone activates: when
+    /// it refuses, nothing is flipped in-process instead, past the checks it
+    /// makes as root. That holds for rollbacks and installs alike.
+    #[test]
+    fn the_helper_alone_activates_when_installed() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let line = |v: &str| {
+            format!(
+                "activate {} {}\n",
+                root.join("releases").join(v).display(),
+                root.join("current").display()
+            )
+        };
+        let refusing = td.path().join("refusing");
+        fs::create_dir(&refusing).unwrap();
+        let helper = fake_helper(&refusing, true);
+        for to in [None, Some("0.3.0")] {
+            let err = rollback(&root, to, Some(&helper)).unwrap_err();
+            assert_eq!(err.code, "activate_failed", "{to:?}");
+            assert_eq!(
+                err.message,
+                "apply-update activate failed: apply-update: refused"
+            );
+            assert_eq!(current_name(&root), "0.4.0", "{to:?}");
+        }
+        let tarball = build_release(&td.path().join("0.5.0"), "0.5.0");
+        let m = manifest_for(&tarball, "0.5.0");
+        let refused = UpdateEnv {
+            apply_helper: Some(helper),
+            ..env(&root)
+        };
+        for err in [
+            apply_release(&m, &refused, None, false).unwrap_err(),
+            apply_local_release(&m, &refused, &tarball, None, false).unwrap_err(),
+        ] {
+            assert_eq!(err.code, "activate_failed");
+            assert_eq!(current_name(&root), "0.4.0");
+        }
+        assert_eq!(
+            fs::read_to_string(refusing.join("helper.calls")).unwrap(),
+            [line("0.3.0"), line("0.3.0"), line("0.5.0"), line("0.5.0")].concat()
+        );
+
+        // A helper that accepts: its word is the activation (this stand-in
+        // flips nothing, so `current` stays where it was).
+        let accepting = td.path().join("accepting");
+        fs::create_dir(&accepting).unwrap();
+        let helped = UpdateEnv {
+            apply_helper: Some(fake_helper(&accepting, false)),
+            ..env(&root)
+        };
+        assert_eq!(
+            rollback(&root, None, helped.apply_helper.as_deref()).unwrap(),
+            "0.5.0"
+        );
+        apply_local_release(&m, &helped, &tarball, None, false).unwrap();
+        assert_eq!(current_name(&root), "0.4.0");
+        assert_eq!(
+            fs::read_to_string(accepting.join("helper.calls")).unwrap(),
+            [line("0.5.0"), line("0.5.0")].concat()
+        );
+    }
+
+    /// The health gate never rolls back to a slot that cannot run: it
+    /// fails instead, leaving `current` and the services as they are.
+    #[test]
+    fn gate_never_rolls_back_to_a_slot_that_cannot_run() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        crate::util::set_mode(&root.join("releases/0.3.0/vesyl-print"), 0o644).unwrap();
+        let agent = UpdateEnv {
+            restart: true,
+            ..env(&root)
+        };
+        let (out, restarts) = restarts_during(|| {
+            process_pending_health(
+                pending("2000-01-01T00:00:00+00:00".into()),
+                &cfg(td.path()),
+                &agent,
+                WhoamiResult::Error,
+                Some("timeout"),
+                None,
+            )
+        });
+        assert_eq!(out.status, STATUS_FAILED);
+        assert_eq!(
+            out.last_error.as_deref(),
+            Some(
+                "health failed: timeout; rollback error: \
+                 release 0.3.0 cannot run: no executable vesyl-print in its slot"
+            )
+        );
+        assert!(failed_health_gate(&out));
+        assert_eq!(current_name(&root), "0.4.0");
+        assert_eq!(restarts, 0);
+    }
+
+    /// `<version>.staging` is where an extract unpacks. One a crash left is
+    /// never a release (listed, rolled back to, `current`'s version), and no
+    /// manifest names a slot that is another version's staging dir.
+    #[test]
+    fn staging_dirs_are_never_releases() {
+        for v in ["0.5.0.staging", "0.5.0-rc.1.staging"] {
+            assert!(!is_version(v), "{v}");
+            let err = ReleaseManifest::from_dict(&obj(json!({
+                "version": v, "artifact_url": "https://x/a.tar.gz", "artifact_sha256": "a".repeat(64),
+            })))
+            .unwrap_err();
+            assert_eq!(err.code, "bad_manifest", "{v}");
+        }
+        for v in [
+            "0.5.0",
+            "0.5.0-rc.1",
+            "1.0.0.2",
+            "0.5.0-staging",
+            "0.5.0.staging2",
+        ] {
+            assert!(is_version(v), "{v}");
+        }
+
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        // A flat archive's, cut off before its rename: it holds the binary.
+        let staging = slot_with(&root, "0.5.0.staging", &[("vesyl-print", true)]);
+        assert!(slot_is_runnable(&staging));
+        assert_eq!(list_releases(&root), ["0.3.0", "0.4.0"]);
+        assert_eq!(rollback(&root, None, None).unwrap(), "0.3.0");
+        assert_eq!(rollback(&root, None, None).unwrap(), "0.4.0");
+        assert_eq!(
+            rollback(&root, Some("0.5.0.staging"), None)
+                .unwrap_err()
+                .code,
+            "missing_release"
+        );
+        flip_current(&root, "0.5.0.staging").unwrap();
+        assert_eq!(current_release_version(&root), None);
     }
 
     #[test]

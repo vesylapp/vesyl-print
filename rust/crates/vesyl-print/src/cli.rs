@@ -846,7 +846,8 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
     }
 }
 
-/// Offline tarball + manifest: verify, extract and flip `current` in-process.
+/// Offline tarball + manifest: installed and activated like an online apply
+/// ([`update::apply_local_release`]), only not downloaded.
 fn apply_local(
     deps: &Deps,
     out: &mut dyn Write,
@@ -867,33 +868,23 @@ fn apply_local(
         .ok()
         .filter(|p| p.is_file())
         .ok_or_else(|| Die(format!("file not found: {}", file.display())))?;
-    let sha = update::sha256_file(&tarball)?;
-    if sha != manifest.artifact_sha256 {
-        return die(format!(
-            "sha256 mismatch: file={sha} manifest={}",
-            manifest.artifact_sha256
-        ));
-    }
     // Verification is skipped only when signatures are disabled in config; an
     // unreadable configured key is an error.
     let pem = update::manifest_public_key(cfg)?;
-    if cfg.update_require_signature {
-        update::verify_manifest(&manifest, pem.as_deref(), true)?;
-    }
-    let root = &deps.update_env.install_root;
-    let previous = update::slot_before_activation(&deps.update_env);
-    let release_dir = root.join("releases").join(&manifest.version);
-    if release_dir.exists() {
-        fs::remove_dir_all(&release_dir)?;
-    }
-    update::extract_tarball(&tarball, &release_dir)?;
-    update::write_version_file(&release_dir, &manifest.version)?;
-    update::flip_current(root, &manifest.version)?;
+    let env = &deps.update_env;
+    let previous = update::slot_before_activation(env);
+    update::apply_local_release(
+        &manifest,
+        env,
+        &tarball,
+        pem.as_deref(),
+        cfg.update_require_signature,
+    )?;
     writeln!(
         out,
         "activated {} at {}",
         manifest.version,
-        root.join("current").display()
+        env.install_root.join("current").display()
     )?;
     after_manual_activation(deps, out, &manifest.version, previous, restart)?;
     Ok(0)
@@ -1805,18 +1796,35 @@ mod tests {
         );
     }
 
+    /// A slot holding the executable binary, as an install leaves it.
+    fn runnable_slot(root: &Path, version: &str) -> PathBuf {
+        let slot = root.join("releases").join(version);
+        fs::create_dir_all(&slot).unwrap();
+        fs::write(slot.join("vesyl-print"), b"bin").unwrap();
+        crate::util::set_mode(&slot.join("vesyl-print"), 0o755).unwrap();
+        slot
+    }
+
     #[test]
     fn version_and_rollback() {
         let td = tempfile::tempdir().unwrap();
         let d = deps(td.path(), "http://127.0.0.1:9");
         let root = &d.update_env.install_root;
         for v in ["0.3.0", "0.4.0"] {
-            fs::create_dir_all(root.join("releases").join(v)).unwrap();
+            runnable_slot(root, v);
         }
         update::flip_current(root, "0.4.0").unwrap();
+        // A staging dir a crashed extract left is not a release, and a slot
+        // without an executable binary is never rolled back to.
+        runnable_slot(root, "0.5.0.staging");
+        fs::create_dir_all(root.join("releases/0.3.5")).unwrap();
+        fs::write(root.join("releases/0.3.5/vesyl-print"), b"bin").unwrap();
         let (r, out) = run_args(&d, &["version"]);
         assert_eq!(r.unwrap(), 0);
-        assert!(out.contains("releases:       0.3.0, 0.4.0"), "{out}");
+        assert!(
+            out.contains("releases:       0.3.0, 0.3.5, 0.4.0\n"),
+            "{out}"
+        );
         let (r, out) = run_args(&d, &["update", "rollback"]);
         assert_eq!(r.unwrap(), 0);
         assert_eq!(out, "rolled back to 0.3.0\n");
@@ -1824,14 +1832,30 @@ mod tests {
             update::current_release_version(root).as_deref(),
             Some("0.3.0")
         );
+        let (r, out) = run_args(&d, &["update", "rollback", "--version", "0.3.5"]);
+        assert_eq!(
+            r.unwrap_err().0,
+            "release 0.3.5 cannot run: no executable vesyl-print in its slot"
+        );
+        assert_eq!(out, "");
+        assert_eq!(
+            update::current_release_version(root).as_deref(),
+            Some("0.3.0")
+        );
     }
 
-    /// Release tarball (Rust binary entrypoint) and its unsigned manifest,
+    /// Release tarball (the executable binary) and its unsigned manifest,
     /// whose `artifact_url` points at the tarball (`file://`).
     fn release(td: &Path, version: &str) -> (PathBuf, PathBuf) {
+        release_with_mode(td, version, 0o755)
+    }
+
+    /// [`release`] with the binary's mode `mode`.
+    fn release_with_mode(td: &Path, version: &str, mode: u32) -> (PathBuf, PathBuf) {
         let src = td.join(format!("src-{version}"));
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("vesyl-print"), b"bin").unwrap();
+        crate::util::set_mode(&src.join("vesyl-print"), mode).unwrap();
         let tarball = td.join(format!("vesyl-print-{version}.tar.gz"));
         let gz = flate2::write::GzEncoder::new(
             fs::File::create(&tarball).unwrap(),
@@ -1873,7 +1897,7 @@ mod tests {
     /// The slot an operator activates the new release from.
     fn installed_slot(d: &Deps, version: &str) {
         let root = &d.update_env.install_root;
-        fs::create_dir_all(root.join("releases").join(version)).unwrap();
+        runnable_slot(root, version);
         update::flip_current(root, version).unwrap();
     }
 
@@ -1919,6 +1943,230 @@ mod tests {
             ],
         );
         assert!(r.unwrap_err().0.starts_with("sha256 mismatch"));
+    }
+
+    fn apply_file(d: &Deps, tarball: &Path, manifest: &Path) -> (CmdResult, String) {
+        run_args(
+            d,
+            &[
+                "update",
+                "apply",
+                "--file",
+                tarball.to_str().unwrap(),
+                "--manifest",
+                manifest.to_str().unwrap(),
+            ],
+        )
+    }
+
+    /// `update apply --file` refuses what an online apply refuses: a
+    /// release this agent is too old for, and an archive without the
+    /// executable binary the units exec.
+    #[test]
+    fn update_apply_file_checks_what_an_online_apply_checks() {
+        let td = tempfile::tempdir().unwrap();
+        let d = unsigned_deps(td.path());
+        installed_slot(&d, "0.8.0");
+        let root = &d.update_env.install_root;
+
+        let (tarball, manifest) = release(td.path(), "0.9.0");
+        let mut m: Value = serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+        m["min_agent_version"] = json!("99.0.0");
+        fs::write(&manifest, m.to_string()).unwrap();
+        let (r, out) = apply_file(&d, &tarball, &manifest);
+        assert_eq!(
+            r.unwrap_err().0,
+            format!("current {} < min_agent_version 99.0.0", agent_version())
+        );
+        assert_eq!(out, "");
+
+        let (tarball, manifest) = release_with_mode(td.path(), "0.9.1", 0o644);
+        let (r, out) = apply_file(&d, &tarball, &manifest);
+        assert_eq!(
+            r.unwrap_err().0,
+            "archive missing an executable vesyl-print binary"
+        );
+        assert_eq!(out, "");
+
+        assert_eq!(update::list_releases(root), ["0.8.0"]);
+        assert_eq!(
+            update::current_release_version(root).as_deref(),
+            Some("0.8.0")
+        );
+    }
+
+    /// A slot of the version being applied that the agent cannot delete
+    /// (root unpacked it) is moved aside, as an online apply does, rather
+    /// than failing the apply.
+    #[test]
+    fn update_apply_file_moves_aside_a_slot_it_cannot_delete() {
+        let td = tempfile::tempdir().unwrap();
+        let d = unsigned_deps(td.path());
+        installed_slot(&d, "0.8.0");
+        let releases = d.update_env.install_root.join("releases");
+        let locked = releases.join("0.9.0/locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("vesyl-print"), b"old").unwrap();
+        crate::util::set_mode(&locked, 0o555).unwrap();
+
+        let (tarball, manifest) = release(td.path(), "0.9.0");
+        let (r, out) = apply_file(&d, &tarball, &manifest);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert_eq!(
+            update::current_release_version(&d.update_env.install_root).as_deref(),
+            Some("0.9.0")
+        );
+        assert!(update::slot_is_runnable(&releases.join("0.9.0")));
+        assert!(!releases.join("0.9.0/locked").exists());
+        // Root deletes it outright; anyone else moves it aside.
+        let aside = releases.join(".0.9.0.stale-1/locked");
+        if aside.exists() {
+            crate::util::set_mode(&aside, 0o755).unwrap();
+        }
+    }
+
+    /// With the apply-update helper installed, `update apply --file`
+    /// activates through it, as an online apply does, never in-process:
+    /// when it refuses, the apply fails and `current` stays.
+    #[test]
+    fn update_apply_file_activates_through_the_helper() {
+        let td = tempfile::tempdir().unwrap();
+        let mut d = unsigned_deps(td.path());
+        installed_slot(&d, "0.8.0");
+        let root = d.update_env.install_root.clone();
+        let line = format!(
+            "activate {} {}\n",
+            root.join("releases/0.9.0").display(),
+            root.join("current").display()
+        );
+        let (tarball, manifest) = release(td.path(), "0.9.0");
+        for refuse in [true, false] {
+            let dir = td.path().join(format!("helper-{refuse}"));
+            fs::create_dir(&dir).unwrap();
+            d.update_env.apply_helper = Some(update::fake_helper(&dir, refuse));
+            let (r, out) = apply_file(&d, &tarball, &manifest);
+            if refuse {
+                assert_eq!(
+                    r.unwrap_err().0,
+                    "apply-update activate failed: apply-update: refused"
+                );
+            } else {
+                assert_eq!(r.unwrap(), 0, "{out}");
+                assert!(out.starts_with("activated 0.9.0"), "{out}");
+            }
+            assert_eq!(fs::read_to_string(dir.join("helper.calls")).unwrap(), line);
+            // This stand-in flips nothing: nothing else did either.
+            assert_eq!(
+                update::current_release_version(&root).as_deref(),
+                Some("0.8.0"),
+                "refuse={refuse}"
+            );
+        }
+    }
+
+    const SERVICE_USER_TD: &str = "VESYL_TEST_CLI_SERVICE_USER_TD";
+
+    /// Every path under `dir` whose owner (lstat) is not `uid`.
+    fn not_owned_by(dir: &Path, uid: u32) -> Vec<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        let mut wrong = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.uid() != uid {
+                wrong.push(path.clone());
+            }
+            if meta.is_dir() {
+                stack.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            }
+        }
+        wrong
+    }
+
+    /// `sudo vesyl-print update apply --file` into the service user's
+    /// install root (as `setup.sh` leaves it) leaves nothing in `releases/`
+    /// root's: the slot, `VERSION` included, is the service user's. So the
+    /// agent, running as that user, later installs the same version over it
+    /// by deleting it, not moving it aside for good. Needs root (or a user
+    /// namespace): `unshare --map-root-user --map-auto <test binary>
+    /// --include-ignored`.
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown and switch users"]
+    fn root_update_apply_file_leaves_the_slot_to_the_service_user() {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let d = unsigned_deps(td.path());
+        installed_slot(&d, "0.8.0");
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        crate::util::hand_tree_to_parent_owner(&d.update_env.install_root).unwrap();
+        let (tarball, manifest) = release(td.path(), "0.9.0");
+
+        let (r, out) = apply_file(&d, &tarball, &manifest);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        let releases = d.update_env.install_root.join("releases");
+        assert!(releases.join("0.9.0/VERSION").is_file());
+        assert_eq!(not_owned_by(&releases, 1000), Vec::<PathBuf>::new());
+
+        // Through /proc: the service user may not search the directories the
+        // test binary sits in.
+        let out = std::process::Command::new("/proc/self/exe")
+            .args([
+                "--exact",
+                "cli::tests::root_update_apply_file_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SERVICE_USER_TD, td.path())
+            .uid(1000)
+            .gid(1000)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut names: Vec<String> = fs::read_dir(&releases)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["0.8.0", "0.9.0"], "moved aside instead of deleted");
+    }
+
+    /// The agent's OTA of the same version, as the service user.
+    #[test]
+    #[ignore = "child process of root_update_apply_file_leaves_the_slot_to_the_service_user"]
+    fn root_update_apply_file_child() {
+        let Some(td) = std::env::var_os(SERVICE_USER_TD).map(PathBuf::from) else {
+            return;
+        };
+        let raw = fs::read_to_string(td.join("m-0.9.0.json")).unwrap();
+        let manifest = ReleaseManifest::from_dict(
+            serde_json::from_str::<Value>(&raw)
+                .unwrap()
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        let env = UpdateEnv {
+            install_root: td.join("install"),
+            apply_helper: None,
+            running_version: agent_version().into(),
+            running_from_slot: false,
+            restart: false,
+        };
+        update::apply_release(&manifest, &env, None, false).unwrap();
+        assert_eq!(
+            update::current_release_version(&env.install_root).as_deref(),
+            Some("0.9.0")
+        );
     }
 
     #[test]

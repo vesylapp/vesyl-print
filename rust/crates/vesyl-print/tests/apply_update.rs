@@ -6,7 +6,8 @@
 //! helper with its fixed install root pointed at a temp dir (standing in for
 //! /opt/vesyl-print), the root check bypassed and systemctl stubbed, then
 //! check what it accepts and that every rejected call leaves the whole tree
-//! untouched.
+//! untouched, and that `update::slot_is_runnable` (what the agent and CLI
+//! check) accepts exactly the slots the helper accepts.
 
 mod common;
 
@@ -15,6 +16,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use common::{have_tools, path_str, repo_root, run, sh_quote, snapshot, write, write_exe, Run};
+use vesyl_print::update::slot_is_runnable;
 
 /// The helper's fixed PATH; GNU ln and mv must be found there.
 const HELPER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
@@ -280,6 +282,49 @@ fn slot_without_the_binary_is_never_activated() {
         );
     }
     assert_eq!(h.current(), Some(PathBuf::from("releases/1.2.3")));
+}
+
+/// `update::slot_is_runnable`, which the agent and CLI check before they
+/// install or roll back to a slot, agrees with the helper on every shape of
+/// slot, symlinks included.
+#[test]
+fn rust_runnable_check_agrees_with_the_helper() {
+    let (h, _) = rejecting!();
+    let releases = h.releases();
+    let script = "#!/bin/sh\n";
+    write(&releases.join("1.0.1/vesyl-print"), script);
+    write_exe(&releases.join("1.0.2/bin/vesyl-print"), script);
+    fs::create_dir_all(releases.join("1.0.3/vesyl-print")).unwrap();
+    write(&releases.join("1.0.4/main.py"), "# LCD\n");
+    // A link to the executable counts, as `[[ -f && -x ]]` follows it ...
+    write_exe(&releases.join("1.1.0/bin/vesyl-print"), script);
+    symlink("bin/vesyl-print", releases.join("1.1.0/vesyl-print")).unwrap();
+    // ... unless it dangles or what it points at is not executable.
+    fs::create_dir_all(releases.join("1.1.1")).unwrap();
+    symlink("bin/vesyl-print", releases.join("1.1.1/vesyl-print")).unwrap();
+    write(&releases.join("1.1.2/bin/vesyl-print"), script);
+    symlink("bin/vesyl-print", releases.join("1.1.2/vesyl-print")).unwrap();
+    // A symlinked slot never counts.
+    symlink("1.2.4", releases.join("1.2.5")).unwrap();
+    for (version, runnable) in [
+        ("1.2.4", true),
+        ("1.0.1", false),
+        ("1.0.2", false),
+        ("1.0.3", false),
+        ("1.0.4", false),
+        ("1.1.0", true),
+        ("1.1.1", false),
+        ("1.1.2", false),
+        ("1.2.5", false),
+    ] {
+        assert_eq!(
+            slot_is_runnable(&releases.join(version)),
+            runnable,
+            "{version}"
+        );
+        let r = h.activate(version);
+        assert_eq!(r.ok(), runnable, "{version}: {}", r.log());
+    }
 }
 
 #[test]
