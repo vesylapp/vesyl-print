@@ -1971,9 +1971,15 @@ mod tests {
         );
         assert_eq!(r.unwrap(), 0, "{out}");
         assert!(out.starts_with("activated 0.9.0"));
+        let root = &d.update_env.install_root;
         assert_eq!(
-            update::current_release_version(&d.update_env.install_root).as_deref(),
+            update::current_release_version(root).as_deref(),
             Some("0.9.0")
+        );
+        // The archive has no VERSION: the slot's comes from the manifest.
+        assert_eq!(
+            fs::read_to_string(root.join("releases/0.9.0/VERSION")).ok(),
+            Some("0.9.0\n".into())
         );
         // Without --restart the old agent keeps running: no gate is armed
         // (it would expire unrestarted and roll the activation back), only

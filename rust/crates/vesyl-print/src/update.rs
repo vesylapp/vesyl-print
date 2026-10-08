@@ -2898,6 +2898,28 @@ mod tests {
         assert!(tarball.is_file());
     }
 
+    /// The slot's `VERSION`, which the LCD reads as the version it runs, is
+    /// the manifest's: every install writes it, whether the archive ships a
+    /// stale one or none.
+    #[test]
+    fn install_writes_the_manifest_version() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        // A 0.5.0 archive whose VERSION still says 0.4.9, and one without.
+        let stale = build_release(&td.path().join("stale"), "0.4.9");
+        let bare = tarball_with(td.path(), "0.5.1", &[("vesyl-print", true)]);
+        for (tarball, version) in [(stale, "0.5.0"), (bare, "0.5.1")] {
+            let m = manifest_for(&tarball, version);
+            let online = apply_release(&m, &env(&root), None, false).unwrap();
+            let written = fs::read_to_string(online.join("VERSION")).ok();
+            assert_eq!(written, Some(format!("{version}\n")), "apply_release");
+            let local = apply_local_release(&m, &env(&root), &tarball, None, false).unwrap();
+            let written = fs::read_to_string(local.join("VERSION")).ok();
+            assert_eq!(written, Some(format!("{version}\n")), "apply_local_release");
+            assert_eq!(current_name(&root), version);
+        }
+    }
+
     /// Rollback activates only a slot that can run: others are passed over
     /// when choosing, an explicit one is refused, and with none left the
     /// error says what was passed over.
