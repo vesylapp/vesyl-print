@@ -953,8 +953,7 @@ impl Agent {
                 }),
                 handlers,
             ));
-            if sess.start() {
-                *lock(&holder) = Some(sess.clone());
+            if start_cable_session(&holder, &sess) {
                 return (Some(sess), true);
             }
             (None, true)
@@ -1215,6 +1214,22 @@ impl Agent {
             on_disconnected: Some(Arc::new(|| log::info!(target: LOG, "cable disconnected"))),
         }
     }
+}
+
+/// Start `sess` as the agent's cable session. It goes into `holder` first:
+/// its socket thread can subscribe before `start` returns, and the
+/// on_subscribed handler looks it up there to report the printers. One that
+/// does not start (no ticket) is taken out again.
+fn start_cable_session(
+    holder: &Mutex<Option<Arc<PrintCableSession>>>,
+    sess: &Arc<PrintCableSession>,
+) -> bool {
+    *lock(holder) = Some(sess.clone());
+    if sess.start() {
+        return true;
+    }
+    lock(holder).take();
+    false
 }
 
 fn classify_pull_error(e: &CloudError) -> PullResult {
@@ -2778,6 +2793,8 @@ mod tests {
         url: String,
         /// When `message` was sent.
         pushed: mpsc::Receiver<Instant>,
+        /// The text frames the client sent once subscribed, in order.
+        frames: mpsc::Receiver<String>,
         /// When the client hung up.
         closed: mpsc::Receiver<Instant>,
         server: thread::JoinHandle<()>,
@@ -2787,6 +2804,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/print/cable", listener.local_addr().unwrap());
         let (pushed_tx, pushed) = mpsc::channel();
+        let (frames_tx, frames) = mpsc::channel();
         let (closed_tx, closed) = mpsc::channel();
         let server = thread::spawn(move || {
             // Never wait forever: a test that failed early stops the agent.
@@ -2817,15 +2835,67 @@ mod tests {
             ws.send(Message::text(push.to_string())).unwrap();
             let _ = pushed_tx.send(Instant::now());
             // Acks, job statuses and heartbeats, until the agent hangs up.
-            while ws.read().is_ok() {}
+            while let Ok(frame) = ws.read() {
+                if let Message::Text(text) = frame {
+                    let _ = frames_tx.send(text.to_string());
+                }
+            }
             let _ = closed_tx.send(Instant::now());
         });
         CableEndpoint {
             url,
             pushed,
+            frames,
             closed,
             server,
         }
+    }
+
+    /// The channel action and data of a client frame.
+    fn performed(frame: &str) -> (String, Value) {
+        let frame: Value = serde_json::from_str(frame).unwrap();
+        let data: Value = serde_json::from_str(frame["data"].as_str().unwrap_or("{}")).unwrap();
+        (py_str(&data["action"]), data)
+    }
+
+    /// J2: the cable can subscribe before the session's `start` returns
+    /// (here it lingers 300 ms once its socket thread runs, as if preempted
+    /// there). The agent put the session where its on_subscribed handler
+    /// looks for it only once `start` had returned, so the first
+    /// report_printers was never sent.
+    #[test]
+    fn the_first_report_printers_goes_out_however_soon_the_cable_subscribes() {
+        let td = tempfile::tempdir().unwrap();
+        let cable = cable_endpoint(json!({"type": "noop"}), Duration::ZERO);
+        let mut agent = test_agent(td.path(), "http://127.0.0.1:9");
+        agent.inventory = Arc::new(|| Some(vec![json!({"cups_name": "Zebra"})]));
+        let holder: Arc<Mutex<Option<Arc<PrintCableSession>>>> = Arc::default();
+        let handlers = agent.session_handlers(
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+            holder.clone(),
+            Arc::default(),
+        );
+        let sess = Arc::new(
+            PrintCableSession::new(
+                &cable.url,
+                Box::new(|| Ok(obj(json!({"ticket": "t"})))),
+                handlers,
+            )
+            .with_start_pause(Duration::from_millis(300)),
+        );
+        assert!(start_cable_session(&holder, &sess));
+        let report = cable
+            .frames
+            .recv_timeout(Duration::from_secs(5))
+            .map(|f| performed(&f));
+        sess.stop();
+        lock(&holder).take();
+        cable.server.join().unwrap();
+        let (action, data) = report.expect("no frame after the subscription");
+        assert_eq!(action, "report_printers");
+        assert_eq!(data["printers"], json!([{"cups_name": "Zebra"}]));
     }
 
     fn pushed_job(id: &str) -> Value {
