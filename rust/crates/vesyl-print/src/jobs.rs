@@ -47,7 +47,7 @@ use serde_json::{json, Value};
 
 use crate::config::WaitCups;
 use crate::net;
-use crate::printers::{run_with_timeout, CmdOutput};
+use crate::printers::{run_cups, CmdOutput};
 use crate::util::{py_int, py_str, truthy, utc_now_iso, write_durable};
 use crate::{zpl, BoxError, JsonObject};
 
@@ -448,9 +448,27 @@ fn lp_failure(text: &str) -> JobError {
 /// When `raw` is set, passes `-o raw` so CUPS does not filter/transform
 /// the payload (required for ZPL/EPL on raw thermal queues).
 pub fn default_lp(cups_name: &str, path: &Path, args: &LpArgs) -> Result<Option<String>, JobError> {
+    run_lp(&["lp"], cups_name, path, args)
+}
+
+/// [`default_lp`] with `lp` run as `cmd` (its program and leading
+/// arguments). It runs untranslated ([`run_cups`]): the request id and the
+/// unknown-queue markers are read in English, and in German `lp` says
+/// "Anfrage-ID ist …", so no job got its CUPS id.
+fn run_lp(
+    cmd: &[&str],
+    cups_name: &str,
+    path: &Path,
+    args: &LpArgs,
+) -> Result<Option<String>, JobError> {
+    let (program, lead) = cmd.split_first().expect("lp command");
     let argv = lp_args(cups_name, path, args);
-    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let out = run_with_timeout("lp", &argv, Duration::from_secs(60))
+    let argv: Vec<&str> = lead
+        .iter()
+        .copied()
+        .chain(argv.iter().map(String::as_str))
+        .collect();
+    let out = run_cups(program, &argv, Duration::from_secs(60))
         .map_err(|e| JobError::new(format!("lp failed: {e}"), "lp_error"))?;
     if !out.success {
         let err = if !out.stderr.trim().is_empty() {
@@ -478,14 +496,11 @@ const MAX_WATCHED_JOBS: usize = 1000;
 /// Runs `lpstat` with the given arguments.
 type Lpstat = dyn Fn(&[&str]) -> io::Result<CmdOutput>;
 
-/// `lpstat`'s environment: CUPS translates the labels of its output into
-/// the locale's language ("Alerts:" is "Alarme:" in German), and
-/// [`completed_outcome`] reads the untranslated ones. CUPS takes the
-/// language from LC_MESSAGES before LC_ALL when the locale is missing.
-const LPSTAT_ENV: &[(&str, &str)] = &[("LC_ALL", "C.UTF-8"), ("LC_MESSAGES", "C.UTF-8")];
-
+/// `lpstat`, untranslated ([`run_cups`]): CUPS translates the labels of its
+/// output into the locale's language ("Alerts:" is "Alarme:" in German),
+/// and [`completed_outcome`] reads the untranslated ones.
 fn run_lpstat(args: &[&str]) -> io::Result<CmdOutput> {
-    crate::printers::run_with_timeout_env("lpstat", args, LPSTAT_ENV, Duration::from_secs(15))
+    run_cups("lpstat", args, Duration::from_secs(15))
 }
 
 /// stdout of a successful `lpstat` run. A run that fails to start, times out
@@ -3553,18 +3568,60 @@ mod tests {
         assert_eq!(completed_outcome("", "Q-1"), CupsOutcome::Printed);
     }
 
-    /// lpstat runs untranslated: in a German locale CUPS prints "Alarme:"
-    /// where completed_outcome looks for "Alerts:".
-    #[test]
-    fn lpstat_runs_untranslated() {
-        let out = crate::printers::run_with_timeout_env(
-            "sh",
-            &["-c", "echo \"$LC_ALL $LC_MESSAGES\""],
-            LPSTAT_ENV,
-            Duration::from_secs(10),
+    /// A fake `lp` in `dir`, run as `sh <script>`: it answers like CUPS on a
+    /// German node (`german` on stderr, exit 1, when `fail`), unless both
+    /// LC_ALL and LC_MESSAGES name the C locale.
+    fn german_lp(dir: &Path, english: &str, german: &str, fail: bool) -> String {
+        let script = dir.join("lp");
+        let (to, exit) = if fail { (" >&2", 1) } else { ("", 0) };
+        fs::write(
+            &script,
+            format!(
+                "case \"${{LC_ALL:-}}\" in C|C.*) all=C ;; *) all= ;; esac\n\
+                 case \"${{LC_MESSAGES:-}}\" in C|C.*) msgs=C ;; *) msgs= ;; esac\n\
+                 if [ \"$all$msgs\" = CC ]; then echo '{english}'{to}\n\
+                 else echo '{german}'{to}; fi\nexit {exit}\n"
+            ),
         )
         .unwrap();
-        assert_eq!(out.stdout, "C.UTF-8 C.UTF-8\n");
+        script.display().to_string()
+    }
+
+    /// J6: CUPS translates `lp`'s answer ("Anfrage-ID ist Zebra-42" in
+    /// German), so on a German node no job got its CUPS request id (none
+    /// was followed to printed) and an unknown queue was a retryable lp
+    /// error. lp runs untranslated, as lpstat does ("Alerts:" is "Alarme:").
+    #[test]
+    fn lp_runs_untranslated() {
+        let td = tempfile::tempdir().unwrap();
+        let file = td.path().join("label.zpl");
+        fs::write(&file, "^XA^XZ").unwrap();
+        let args = LpArgs {
+            title: Some("Ship label"),
+            copies: 1,
+            raw: true,
+        };
+        let lp = german_lp(
+            td.path(),
+            "request id is Zebra-42 (1 file(s))",
+            "Anfrage-ID ist Zebra-42 (1 Datei(en))",
+            false,
+        );
+        assert_eq!(
+            run_lp(&["sh", &lp], "Zebra", &file, &args)
+                .unwrap()
+                .as_deref(),
+            Some("Zebra-42")
+        );
+        let lp = german_lp(
+            td.path(),
+            "lp: Error - The printer or class does not exist.",
+            "lp: Fehler - Der Drucker oder die Klasse existiert nicht.",
+            true,
+        );
+        let err = run_lp(&["sh", &lp], "Gone", &file, &args).unwrap_err();
+        assert_eq!(err.code, "unknown_queue", "{}", err.message);
+        assert!(err.is_permanent());
     }
 
     /// `lpstat -W completed -l`, newest first (real CUPS layout).
