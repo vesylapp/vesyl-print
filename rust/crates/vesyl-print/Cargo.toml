@@ -24,7 +24,9 @@ tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
-ureq = { version = "3.4.2", features = ["json", "platform-verifier"] }
+# No default "gzip": urllib never asked for gzip, and a gzip-encoded .tar.gz would
+# fail the OTA checksum. "rustls" is the only other default feature.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json", "platform-verifier"] }
 url = "2.5.8"
 uuid = { version = "1.27.0", features = ["v4"] }
 

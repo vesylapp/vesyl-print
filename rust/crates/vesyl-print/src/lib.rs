@@ -25,6 +25,7 @@ pub mod cloud;
 pub mod config;
 pub mod jobs;
 pub mod logging;
+pub mod net;
 pub mod printers;
 pub mod statusio;
 pub mod sysinfo;
