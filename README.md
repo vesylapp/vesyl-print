@@ -47,7 +47,7 @@ On the Pi, run `setup.sh` from an **extracted release tarball** (it carries the
 `vesyl-print` binary):
 
 ```bash
-V=0.4.0
+V=0.5.0
 curl -fLO https://github.com/vesylapp/vesyl-print/releases/download/v$V/vesyl-print-$V-linux-aarch64.tar.gz
 tar -xzf vesyl-print-$V-linux-aarch64.tar.gz
 cp ~/tailscale.key vesyl-print-$V/keys/tailscale.key   # optional, one-time auth key
@@ -57,13 +57,30 @@ sudo ./vesyl-print-$V/setup.sh
 This installs the packages (CUPS, poppler-utils, NetworkManager; python3,
 Pillow, numpy, segno and DejaVu fonts for the LCD), the display overlay, config
 dirs, the root helpers + sudoers, the release, the CLI wrapper and both systemd
-units, then deletes the extracted tree. Options go after `sudo`, which drops
-the caller's environment: `sudo SKIP_TAILSCALE=1 ./setup.sh` (see the header of
-`setup.sh`).
+units, then deletes the extracted `vesyl-print-$V/` (`SKIP_SOURCE_CLEANUP=1`
+keeps it; a git checkout or a directory with another name is never deleted).
+Options go after `sudo`, which drops the caller's environment:
+`sudo SKIP_TAILSCALE=1 ./setup.sh` (see the header of `setup.sh`).
+
+Run it with `sudo` from the account the services should run as (e.g.
+`vesyl`): that account (`SUDO_USER`) becomes the units' `User=`, the owner of
+`/etc/vesyl-print`, `/var/lib/vesyl-print` and the install root, and the
+account allowed to run the root helpers through sudo. `setup.sh` takes
+`SUDO_USER` whenever it is set and not root, and a root shell opened with
+`sudo -i` or `sudo -s` keeps it: `./setup.sh` run there makes the account
+that ran `sudo` (e.g. `pi`) the service account. Only when `SUDO_USER` is
+unset or root (a direct root login, `su -`, or `sudo` run from a root shell)
+does `setup.sh` fall back to the owner of the extracted tree, and it stops,
+before changing anything, if that owner is root; `chown -R` the tree to the
+service account first. A custom install root
+(`sudo INSTALL_ROOT=/srv/vesyl-print ./setup.sh`) is written into the units,
+the CLI wrapper and both root helpers.
 
 A git checkout has no binary, so `setup.sh` stops before changing anything.
-Build a release from a checkout with `BUILD_ONLY=1 ./scripts/build-release.sh`
-(needs cargo-zigbuild) and run the `setup.sh` inside the extracted tarball.
+Build a release from a checkout (needs cargo-zigbuild) with
+`BUILD_ONLY=1 ./scripts/build-release.sh [VERSION]` and run the `setup.sh`
+inside the extracted tarball; how to number a build that is not a release is
+covered below.
 
 ```text
 /opt/vesyl-print/current → releases/<VERSION>/   vesyl-print binary, LCD (*.py), assets
@@ -83,6 +100,19 @@ slots without a `vesyl-print` binary, and keeps `/etc/vesyl-print` (config,
 credentials) and `/var/lib/vesyl-print` (queue, state). Releases carry
 `min_agent_version` 0.4.0, so a Python 0.3.x agent refuses them instead of
 installing a slot its units cannot run.
+
+Release tarballs never carry `keys/tailscale.key`, so on a device that is
+already on the tailnet `setup.sh` reports "No Tailscale auth key" and leaves
+Tailscale as it is. Lab devices that ran the 0.4.0 / 0.4.1 lab builds are
+re-provisioned the same way, from the published v0.5.0 tarball (or a later
+release). A tarball built before that tag must not be numbered 0.5.0 or
+0.5.0-anything: the agent ignores a `-` suffix when it compares versions
+([OTA_UPDATES.md §4.8](./OTA_UPDATES.md#48-version-source-of-truth)), so a
+device running such a build would take v0.5.0 as already installed and never
+update to it. Number an interim lab build below 0.5.0 but at or above
+the 0.4.0 floor, e.g. `BUILD_ONLY=1 ./scripts/build-release.sh 0.4.2` (give
+the version: until the release bumps it, the checkout's `VERSION` is 0.3.17,
+below the floor, and a build of it is refused).
 
 ## Config
 
@@ -150,9 +180,14 @@ writes under `/var/lib/vesyl-print/`:
 | File | Written by | LCD use |
 |------|------------|---------|
 | `status.json` | agent; CLI `claim` / `unpair` | pairing + cloud state, warehouse, last error |
-| `printers.json` | agent, after each inventory refresh (about every 15 s), mode 0644 | printer rows and status dots |
+| `printers.json` | agent, after each inventory refresh (about every 15 s), mode 0644 | printer rows and status dots; re-read every 8 s |
 | `update_status.json` | agent (OTA) | update banner / footer |
 | `queue/`, `processed/` | agent | local queue depth |
+
+A `printers.json` older than 120 s (by its `updated_at`, else the file's
+mtime) means the agent stopped refreshing it: the LCD still lists the printers
+but shows every status as `unknown`, never a stale `idle`. A missing or
+unreadable file keeps the rows it already shows.
 
 `printers.json`:
 
@@ -228,16 +263,26 @@ vesyl-print version
 vesyl-print update check|apply|rollback
 ```
 
-The LCD and its stream page use the `--json` forms:
+The LCD and its stream page use the `--json` forms (the stream page's claim
+form runs `vesyl-print claim CODE [--name N] --json`, the LCD's Test button
+`vesyl-print test-print --queue Q --format F --json`):
 
-- `claim CODE --json` prints one object: `{"ok": true, "node_id", "name",
-  "organization_name", "warehouse_name"}`, or `{"ok": false, "error", "status",
-  "code"}` with exit 1 (`status` is the HTTP status, 0 for transport errors).
-- `test-print --queue Q --format pdf|zpl --json` sends the built-in 4x6 test
-  label (`assets/test-labels/vesyl-roadrunner-4x6.pdf|.zpl` of the running
-  release) through a private, temporary queue, not the agent's, and returns
-  once `lp` has accepted it: `{"ok": true, "state": "delivered", "job_id",
-  "queue", "format"}`, or `{"ok": false, "error", "code"}` with exit 1.
+- `claim CODE [--name N] --json` prints one object: `{"ok": true, "node_id",
+  "name", "organization_name", "warehouse_name"}`, or `{"ok": false, "error",
+  "status", "code"}` with exit 1 (`status` is the HTTP status: 400 for a code
+  too short to send, 0 for transport and local errors; `code` is the cloud's
+  error code or null).
+- `test-print --queue Q --format pdf|zpl [--json]` sends the built-in 4x6 test
+  label (`assets/test-labels/vesyl-roadrunner-4x6.pdf|.zpl`) through a
+  private, temporary job store, not the agent's queue, and returns once `lp`
+  has accepted it: `{"ok": true, "state": "delivered", "job_id", "queue",
+  "format"}`, or `{"ok": false, "error", "code"}` with exit 1 (`code` is the
+  job error code, e.g. `unknown_queue`). `zpl` is native ZPL for raw / Zebra
+  queues; `pdf` works on any queue (rasterized to ZPL on a raw one). Without
+  `--json` it prints the same fields as text.
+- The test labels come from `assets/` next to the running `vesyl-print`
+  binary, i.e. the active release slot; `VESYL_PRINT_ASSETS_DIR` points
+  `test-print` at another directory holding `test-labels/` (tests, dev).
 
 ### Local print test (no cloud)
 
@@ -255,7 +300,12 @@ Jobs go through the durable pipeline:
 4. Watch CUPS in the background (`wait_cups: async`) so the next job can
    `lp` immediately. Page order is the CUPS queue, not “wait for printed.”
 
-Content types: `pdf_*`, `png_*`, `jpeg_*`/`jpg_*`, `raw_*` (ZPL/EPL), `local_path`.
+Cloud job content types: `pdf_*`, `png_*`, `jpeg_*`/`jpg_*` and `raw_*`
+(ZPL/EPL), each as `*_uri` (fetched) or `*_base64` (inline). `local_path` (a
+file on the Pi) is CLI-only: `print-test` and `test-print` use it, and the
+agent rejects a cloud job carrying it before queueing, since it would print
+any file the agent can read. Such a job is reported `error` ("content_type
+local_path is only accepted from the local CLI") and never acked or printed.
 Raw payloads are written as `.zpl`/`.raw` **without** PDF/PNG magic sniffing and
 submitted with `lp -o raw`. Thermal printers usually need a **raw** CUPS queue
 (`lpadmin -m raw` or `socket://host:9100`); driverless IPP Everywhere often will
@@ -263,13 +313,21 @@ not honor raw. Inventory reports `supports_raw` per queue for WMS.
 
 **PDF / PNG / JPEG → Zebra:** if the queue is raw (USB ZD220, `socket://…:9100`),
 the agent rasterizes the file (`pdftoppm`, from poppler-utils) to 1-bit and
-wraps it in a ZPL `^GFA` graphic (ASCII hex), then `lp -o raw`. Options:
-`zpl_max_width_dots` (default 448), `zpl_dpi` (203), `zpl_threshold`,
-`zpl_invert`, `no_zpl_convert`. Native ZPL (`raw_*` / files starting with
-`^XA`) is sent unchanged.
+wraps it in a ZPL `^GFA` graphic (ASCII hex), then `lp -o raw`. A multi-page
+PDF prints one label per page, in order (each page its own `^XA`…`^XZ`), as
+CUPS does on a filtered queue; `copies` repeats the whole document. At most
+**50 pages**: a longer PDF fails with the permanent error
+`pdf_too_many_pages`, so its queue file is retired to `queue/failed/` instead
+of being retried. Options: `zpl_page` (print just that page),
+`zpl_max_width_dots` / `zpl_max_height_dots` (default: a 4×6" label at the
+head's resolution, 812 × 1218 dots at 203 dpi), `zpl_dpi` (default: the
+queue name's `203dpi` / `300dpi` / `600dpi` token, else 203; clamped to
+72–600), `zpl_threshold` (128), `zpl_invert`, `no_zpl_convert`. Native ZPL
+(`raw_*` / files starting with `^XA`) is sent unchanged.
 
 **Printer discovery:** when the agent starts it provisions printers once, in
-the background: IPP/`lpinfo`, then a scan of local `/24` LAN segments for TCP
+the background (the LCD no longer does): USB and IPP devices from `lpinfo`,
+then a scan of local `/24` LAN segments for TCP
 **9100** that skips IPs already known from IPP/CUPS, GETs `http://IP/` to
 confirm a Zebra print server (e.g. “ZTC ZD421-203dpi ZPL”), and adds an
 AppSocket queue:
@@ -317,13 +375,29 @@ and the provisioning files; never `rust/`, `tests/` or secrets.
 
 ```bash
 # 1) Set repo secret UPDATE_PRIVATE_KEY (Ed25519 PEM; public half = keys/update_public.pem)
-# 2) Bump VERSION, commit, tag, push:
-git tag v0.4.0
-git push origin v0.4.0
+# 2) Bump VERSION, commit only VERSION, tag, push (the tag must match VERSION):
+echo 0.5.0 > VERSION && git commit -m "Release 0.5.0" VERSION
+git tag v0.5.0
+git push origin HEAD v0.5.0
 # CI: build (BUILD_ONLY=1) → sign (SIGN_ONLY=1) → publish (VERIFY_ONLY=1 + gh release)
 ```
 
-Local build: `UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 0.4.0` builds
+Name `VERSION` in the commit rather than using `git commit -a`, which also
+commits every other modified tracked file, including a key copied over the
+tracked `keys/tailscale.key` (see `keys/README.md`).
+
+**The first Rust-only release is v0.5.0.** The lab Pi already ran two lab
+builds, 0.4.0 and 0.4.1, signed with a throwaway lab key. A device that
+already reports the desired version does nothing, so a real 0.4.0 or 0.4.1
+would never replace the lab build of the same number. Tag above them, with
+`VERSION` bumped to 0.5.0 in the same commit. `MIN_AGENT_VERSION` keeps its
+default, 0.4.0: the Python-era cutoff, not the release version. The agent
+compares versions by number and ignores a `-` suffix (0.5.0-rc.1 counts as
+0.5.0), so a build made before the tag must not be numbered 0.5.0 or
+0.5.0-anything either: number an interim lab build below 0.5.0 (e.g. 0.4.2)
+and re-provision the lab Pi from the published v0.5.0 tarball.
+
+Local build: `UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 0.5.0` builds
 and signs in one go (needs cargo-zigbuild, jq, rsync, openssl). `BUILD_ONLY=1`,
 `SIGN_ONLY=1` and `VERIFY_ONLY=1` run one step each; see
 [OTA_UPDATES.md §4.2](./OTA_UPDATES.md#42-artifact-format).
@@ -337,9 +411,9 @@ and signs in one go (needs cargo-zigbuild, jq, rsync, openssl). `BUILD_ONLY=1`,
 ```json
 {
   "ok": true,
-  "desired_agent_version": "0.4.0",
+  "desired_agent_version": "0.5.0",
   "update_channel": "stable",
-  "update_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json"
+  "update_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.5.0/vesyl-print-0.5.0.manifest.json"
 }
 ```
 
@@ -357,10 +431,20 @@ and signs in one go (needs cargo-zigbuild, jq, rsync, openssl). `BUILD_ONLY=1`,
 ```bash
 vesyl-print version
 vesyl-print update check
-vesyl-print update apply --manifest-url https://github.com/vesylapp/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json
-vesyl-print update apply --file ./release.tar.gz --manifest ./release.manifest.json
-vesyl-print update rollback [--version 0.4.0] --restart
+vesyl-print update apply [--version 0.5.0]
+vesyl-print update apply --manifest-url https://github.com/vesylapp/vesyl-print/releases/download/v0.5.0/vesyl-print-0.5.0.manifest.json [--restart]
+vesyl-print update apply --file ./release.tar.gz --manifest ./release.manifest.json [--restart]
+vesyl-print update rollback [--version 0.5.0] --restart
 ```
+
+`update apply` without a source takes the cloud's desired version (or
+`--version`) and goes the heartbeat way: install, `pending_health`, restart,
+health gate. `--manifest-url` and `--file` install and activate only. Add
+`--restart` to also arm the health gate (`pending_health` until
+`update_health_gate_seconds`, rollback to the slot that was active) and
+restart the services. Without it nothing restarts and no gate is armed: the
+running agent carries on, and the new slot starts, unchecked, on the next
+service restart.
 
 ### Config (`/etc/vesyl-print/config.json`)
 
@@ -438,9 +522,23 @@ cd .. && python3 -m unittest discover -s tests   # LCD display (Python)
 ```
 
 Unit tests mock HTTP; no network or real tokens required. The Rust integration
-tests (`rust/crates/vesyl-print/tests/`) run `scripts/build-release.sh` and
-`scripts/apply-update` in temp dirs with a fake cargo and throwaway keys; they
-need bash, jq, rsync, openssl and GNU coreutils.
+tests (`rust/crates/vesyl-print/tests/`) run `scripts/build-release.sh`,
+`scripts/apply-update` and `setup.sh`'s preflight in temp dirs with a fake
+cargo and throwaway keys; they need bash, jq, rsync, openssl and GNU
+coreutils. Tests named `root_*` are ignored by default: they chown, and the
+`setup.sh` ones run all of it in a chroot (host `/usr` read-only, apt-get,
+systemctl, tailscale and the like stubbed). Run them in a user namespace,
+each test binary on its own:
+
+```bash
+cargo test --locked --no-run --message-format=json \
+  | jq -r 'select(.reason=="compiler-artifact" and .profile.test==true) | .executable'
+unshare --map-root-user --map-auto <test binary> --include-ignored
+```
+
+CI: `.github/workflows/rust.yml` (format, clippy, Rust and script tests) and
+`.github/workflows/lcd.yml` (the Python LCD tests, with Pillow, numpy and the
+DejaVu fonts from apt as on devices; segno too where the runner packages it).
 
 ## LCD views
 
@@ -476,7 +574,7 @@ If no device is found, the LCD stays on the default page (Ops when paired).
 
 ### Pairing / footer states
 
-Footer shows **agent version** just left of the status dot (e.g. `v0.4.0 ● cloud`).
+Footer shows **agent version** just left of the status dot (e.g. `v0.5.0 ● cloud`).
 
 | State | Footer / message |
 |-------|------------------|
@@ -501,7 +599,7 @@ setup.sh                      provisioning; run it from an extracted release
 vesyl-print-*.service         systemd units (setup.sh installs them)
 scripts/build-release.sh      release tarball + signed manifest (CI and local)
 scripts/apply-update          root OTA helper: activate / restart / rollback
-scripts/wifi-setup            root Wi-Fi helper (runs wifi_setup.py)
+scripts/wifi-setup            root Wi-Fi helper (runs wifi_setup.py; see OTA_UPDATES.md §4.4)
 scripts/bootstrap-fresh-pi.sh first boot: appliance id, hostname, LCD driver
 assets/                       logo, boot splash, 4x6 test labels
 keys/                         OTA public key (keys/README.md)

@@ -14,8 +14,12 @@ if sys.version_info < (3, 9):
     sys.stderr.write("wifi-setup requires Python 3.9+\n")
     raise SystemExit(2)
 
+# Fixed, never taken from the caller. setup.sh rewrites this line when it
+# installs the helper for a non-default INSTALL_ROOT.
+INSTALL_ROOT = Path("/opt/vesyl-print")
+
 CANDIDATES = (
-    Path("/opt/vesyl-print/current"),
+    INSTALL_ROOT / "current",
     Path(__file__).resolve().parents[1],
 )
 for root in CANDIDATES:

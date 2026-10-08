@@ -1,8 +1,12 @@
 # Rust agent/CLI: format, lint and test on every change under rust/, and on
-# changes to what the tests read: the release scripts they drive
-# (scripts/build-release.sh, scripts/apply-update), the files a release tarball
-# must carry, the ActionCable fixtures and the release public key. The script
-# tests use bash, jq, rsync and openssl from the runner image.
+# changes to what the tests read: the scripts they drive
+# (scripts/build-release.sh, scripts/apply-update, setup.sh's preflight with
+# the helpers it installs), the files a release tarball must carry, the
+# ActionCable fixtures and the release public key. The script tests use bash,
+# grep, sed, jq, rsync and openssl from the runner image.
+#
+# Actions are pinned to the same commit SHAs as release.yml; bump them
+# together.
 name: Rust
 
 on:
@@ -36,6 +40,9 @@ on:
       - "tests/fixtures/**"
       - ".github/workflows/rust.yml"
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -43,13 +50,16 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: rust
 
