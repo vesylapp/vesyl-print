@@ -21,7 +21,8 @@
 #   7. installs the vesyl-print CLI wrapper (runs current/vesyl-print),
 #   8. installs and enables the LCD + cloud agent systemd services,
 #   9. installs Tailscale and joins the tailnet (auth key from keys/tailscale.key),
-#  10. removes the source tree used for factory setup (app runs from /opt).
+#  10. removes the extracted release it ran from (app runs from /opt); never
+#      a git checkout or a directory not named vesyl-print-X.Y.Z.
 #
 # Usage:  sudo ./setup.sh
 #
@@ -68,6 +69,39 @@ RELEASE_DIR="${INSTALL_ROOT}/releases/${APP_VERSION}"
 CURRENT_LINK="${INSTALL_ROOT}/current"
 APP_BIN="$REPO_DIR/vesyl-print"
 
+# Each root helper fixes its install root on one line, which is rewritten for
+# INSTALL_ROOT when it is installed: the line as an anchored sed pattern, and
+# what it becomes.
+APPLY_UPDATE_ROOT='^INSTALL_ROOT=/opt/vesyl-print$'
+APPLY_UPDATE_ROOT_LINE="INSTALL_ROOT=$INSTALL_ROOT"
+WIFI_SETUP_ROOT='^INSTALL_ROOT = Path("/opt/vesyl-print")$'
+WIFI_SETUP_ROOT_LINE="INSTALL_ROOT = Path(\"$INSTALL_ROOT\")"
+
+# with_install_root FILE PATTERN LINE: FILE on stdout, with the line matching
+# PATTERN replaced by LINE. Exactly one line must match, so an edit to a
+# helper cannot silently skip the substitution and leave the installed copy
+# working on /opt/vesyl-print.
+with_install_root() {
+    local n
+    n="$(grep -c -- "$2" "$1")" || true
+    [[ "$n" == 1 ]] ||
+        die "$1: ${n:-0} lines match '$2' (its install root), expected exactly 1"
+    sed "s|$2|$3|" "$1"
+}
+
+# A file of the release being installed (with SKIP_APP_INSTALL=1, of the
+# active one when this tree lacks it).
+release_file() {
+    local f
+    for f in "$REPO_DIR/$1" "$CURRENT_LINK/$1"; do
+        if [[ -f "$f" ]]; then
+            printf '%s\n' "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # --- 0. preflight (before sudo or any change) ------------------------------
 # The agent and CLI are the vesyl-print binary, which only release tarballs
 # carry. Check it is here, runs, and belongs to this release.
@@ -106,6 +140,13 @@ fi
 for f in "${DISPLAY_SERVICE}.service" "${AGENT_SERVICE}.service" scripts/apply-update; do
     [[ -f "$REPO_DIR/$f" ]] || die "$REPO_DIR/$f missing (not a vesyl-print release tree?)"
 done
+# The root helpers' install-root lines, which step 5 rewrites.
+with_install_root "$REPO_DIR/scripts/apply-update" \
+    "$APPLY_UPDATE_ROOT" "$APPLY_UPDATE_ROOT_LINE" >/dev/null
+WIFI_SRC="$(release_file scripts/wifi-setup)" || WIFI_SRC=""
+if [[ -n "$WIFI_SRC" ]]; then
+    with_install_root "$WIFI_SRC" "$WIFI_SETUP_ROOT" "$WIFI_SETUP_ROOT_LINE" >/dev/null
+fi
 
 # --- must run as root ------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
@@ -252,31 +293,25 @@ else
 fi
 
 # --- 5. root helpers + sudoers ---------------------------------------------
-# Taken from the release being installed (with SKIP_APP_INSTALL=1, from the
-# active one when this tree lacks them).
-release_file() {
-    local f
-    for f in "$REPO_DIR/$1" "$CURRENT_LINK/$1"; do
-        if [[ -f "$f" ]]; then
-            printf '%s\n' "$f"
-            return 0
-        fi
-    done
-    return 1
+# Taken from the release being installed (see release_file). Their install
+# root is fixed in the file, never taken from the caller.
+# install_helper SRC DEST PATTERN LINE (see with_install_root)
+install_helper() {
+    local tmp
+    tmp="$(mktemp)"
+    with_install_root "$1" "$3" "$4" >"$tmp"
+    install -o root -g root -m 0755 "$tmp" "$2"
+    rm -f "$tmp"
 }
 
 install -d -m 0755 /usr/local/lib/vesyl-print
 echo "==> Installing OTA helper: $APPLY_UPDATE"
-# Its install root is fixed in the file, never taken from the caller.
-tmp="$(mktemp)"
-sed "s|^INSTALL_ROOT=/opt/vesyl-print\$|INSTALL_ROOT=$INSTALL_ROOT|" \
-    "$REPO_DIR/scripts/apply-update" >"$tmp"
-install -o root -g root -m 0755 "$tmp" "$APPLY_UPDATE"
-rm -f "$tmp"
+install_helper "$REPO_DIR/scripts/apply-update" "$APPLY_UPDATE" \
+    "$APPLY_UPDATE_ROOT" "$APPLY_UPDATE_ROOT_LINE"
 
-if WIFI_SRC="$(release_file scripts/wifi-setup)"; then
+if [[ -n "$WIFI_SRC" ]]; then
     echo "==> Installing Wi-Fi helper: $WIFI_SETUP"
-    install -o root -g root -m 0755 "$WIFI_SRC" "$WIFI_SETUP"
+    install_helper "$WIFI_SRC" "$WIFI_SETUP" "$WIFI_SETUP_ROOT" "$WIFI_SETUP_ROOT_LINE"
 else
     echo "   WARNING: scripts/wifi-setup missing — skip helper" >&2
 fi
@@ -506,7 +541,8 @@ fi
 # --- 10. Remove factory source tree ----------------------------------------
 # App + CLI run from /opt/vesyl-print/current. The tree used for setup (an
 # extracted release, e.g. ~/vesyl-print-X.Y.Z) may hold one-time secrets
-# (Tailscale key) and is not needed.
+# (Tailscale key) and is not needed. Only that tree is removed: never the
+# install root or a slot, a git checkout, or a directory with another name.
 if [[ "${SKIP_SOURCE_CLEANUP:-}" == "1" ]]; then
     echo "==> SKIP_SOURCE_CLEANUP=1 — keeping source tree $REPO_DIR"
 elif [[ "${SKIP_APP_INSTALL:-}" == "1" ]]; then
@@ -534,6 +570,14 @@ else
             safe_to_remove=0
         elif [[ ! -f "$REPO_RESOLVED/setup.sh" || ! -f "$REPO_RESOLVED/VERSION" ]]; then
             echo "==> Source cleanup skipped: $REPO_RESOLVED does not look like vesyl-print source"
+            safe_to_remove=0
+        elif [[ -e "$REPO_RESOLVED/.git" ]]; then
+            echo "==> Source cleanup skipped: $REPO_RESOLVED is a git checkout"
+            safe_to_remove=0
+        elif [[ "${REPO_RESOLVED##*/}" != vesyl-print-* ]]; then
+            # Release tarballs unpack into vesyl-print-X.Y.Z/; anything else
+            # (a home directory, say) is not ours to delete.
+            echo "==> Source cleanup skipped: $REPO_RESOLVED is not an extracted release (vesyl-print-X.Y.Z)"
             safe_to_remove=0
         fi
     fi
