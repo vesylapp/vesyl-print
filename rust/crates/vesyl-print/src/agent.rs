@@ -1,7 +1,6 @@
 //! Cloud agent: whoami + heartbeat + job pull + ActionCable push.
 
 use std::collections::VecDeque;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
@@ -34,8 +33,9 @@ const PRUNE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 /// doubles from MIN up to MAX, and drops back to MIN once a session subscribes.
 const CABLE_RETRY_MIN: Duration = Duration::from_secs(5);
 const CABLE_RETRY_MAX: Duration = Duration::from_secs(60);
-/// `last_error` for an OTA that the previous agent process never finished.
-pub const UPDATE_INTERRUPTED: &str = "interrupted (agent restarted during update)";
+/// `last_error` for an OTA download / install that never finished: the
+/// previous agent process died during it, or the heartbeat running it panicked.
+pub const UPDATE_INTERRUPTED: &str = "update interrupted before it finished";
 
 /// The bits of a cable session the job hooks need (mockable in tests).
 pub trait CableChannel: Send + Sync {
@@ -75,10 +75,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// logged and comes back as `None`, so one bad request or job cannot take
 /// down the agent along with every job queued behind it.
 fn contained<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
-    match catch_unwind(AssertUnwindSafe(f)) {
+    match jobs::catch_panic(f) {
         Ok(v) => Some(v),
-        Err(_) => {
-            log::error!(target: LOG, "{what} panicked — continuing");
+        Err(msg) => {
+            log::error!(target: LOG, "{what} panicked: {msg} — continuing");
             None
         }
     }
@@ -377,12 +377,14 @@ impl Agent {
         generation
     }
 
-    /// A fresh process cannot be mid-download or mid-install, so an update
-    /// status left at `downloading` / `installing` means the previous process
-    /// died during an OTA. Left alone it would pause jobs, and the held push
-    /// jobs would keep the update deferred forever. Mark it failed instead;
-    /// `run_once` still promotes it to `pending_health` when the interrupted
-    /// install had already switched slots.
+    /// Only [`Agent::run_once`] downloads and installs updates, synchronously.
+    /// So at agent start, and whenever run_once has returned or unwound, an
+    /// update status of `downloading` / `installing` is stale: the previous
+    /// process died mid-update, or the heartbeat running it panicked. Left
+    /// alone it would pause jobs, and the held push jobs would keep the
+    /// update deferred forever. Mark it failed instead; `run_once` still
+    /// promotes it to `pending_health` when the interrupted install had
+    /// already switched slots.
     fn recover_interrupted_update(&self) {
         let Some(mut st) = update::read_update_status(&self.cfg.update_status_path()) else {
             return;
@@ -392,13 +394,24 @@ impl Agent {
         }
         log::warn!(
             target: LOG,
-            "update to {} was {} when the agent stopped — marking it failed",
+            "update to {} stopped while {} and is not running — marking it failed",
             st.target_version.as_deref().unwrap_or("?"),
             st.status
         );
         st.status = update::STATUS_FAILED.into();
         st.last_error = Some(UPDATE_INTERRUPTED.into());
         self.write_update_status(&st);
+    }
+
+    /// The loop's REST heartbeat: `run_once` ([`Agent::run_once`], passed in
+    /// so tests can make it unwind) with panics contained. Once it has
+    /// returned or unwound no update is downloading or installing, so a
+    /// status still saying so (a panic mid-download, say) is cleared before
+    /// the loop reads it to decide whether to hold jobs.
+    fn heartbeat_step(&self, run_once: impl FnOnce() -> AgentStatus) -> Option<AgentStatus> {
+        let st = contained("heartbeat", run_once);
+        self.recover_interrupted_update();
+        st
     }
 
     fn prune_processed_markers(&self) {
@@ -917,9 +930,9 @@ impl Agent {
             // files (retryable failures) must not hold off every OTA.
             let jobs_busy = !lock(&push_jobs).is_empty();
             let st = if elapsed_since(last_hb, hb_interval) {
-                let st = contained("heartbeat", || self.run_once(jobs_busy));
+                let st = self.heartbeat_step(|| self.run_once(jobs_busy));
                 last_hb = Some(Instant::now());
-                // Re-read: OTA may have entered downloading/installing/pending_health.
+                // Re-read: an OTA may have activated (pending_health) or failed.
                 ota_pause = update::should_pause_jobs_from_path(&cfg.update_status_path());
                 match &st {
                     Some(s) if s.cloud == CloudState::Online => backoff = 1.0,
@@ -1621,15 +1634,48 @@ mod tests {
             }
         });
         let mut agent = test_agent(td.path(), &srv.base_url);
-        agent.pipeline.lp = Arc::new(|_, path, _| {
+        let content: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+        let c = content.clone();
+        agent.pipeline.lp = Arc::new(move |_, path, _| {
             if path.file_stem().is_some_and(|s| s == "p1") {
+                *c.lock().unwrap() = Some(path.to_path_buf());
                 panic!("failed to spawn thread");
             }
             Ok(None)
         });
-        assert_eq!(agent.pull_and_process("tok", None), PullResult::Ok);
+        let cable = Arc::new(FakeCable {
+            ok: true,
+            calls: Mutex::default(),
+        });
+        assert_eq!(
+            agent.pull_and_process("tok", Some(cable.clone())),
+            PullResult::Ok
+        );
         assert!(agent.store.is_processed("p2"));
-        // p1's outcome is unknown: it stays queued for the next start.
+        // p1 is reported failed, not left at printing...
+        let p1: Vec<Value> = cable
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(action, data)| action == "job_status" && data["job_id"] == "p1")
+            .map(|(_, data)| json!([data["status"], data["message"]]))
+            .collect();
+        assert_eq!(
+            p1,
+            [
+                json!(["printing", null]),
+                json!(["error", "job panicked: failed to spawn thread"]),
+            ]
+        );
+        // ...its temp content and vesyl-print-* dir are gone...
+        let content = content.lock().unwrap().clone().expect("lp saw p1");
+        let dir = content.parent().unwrap();
+        assert!(dir
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("vesyl-print-")));
+        assert!(!content.exists() && !dir.exists(), "{}", dir.display());
+        // ...and, its outcome unknown, it stays queued for the next start.
         assert_eq!(agent.store.list_queued_ids(), ["p1"]);
     }
 
@@ -1850,6 +1896,101 @@ mod tests {
             let after = update::read_update_status(&path).unwrap();
             assert_eq!((after.status.as_str(), after.last_error), (status, None));
         }
+    }
+
+    /// What maybe_update_from_heartbeat persists before fetching the manifest.
+    fn downloading_9_9_9() -> UpdateStatus {
+        UpdateStatus {
+            target_version: Some("9.9.9".into()),
+            previous_version: Some("0.3.17".into()),
+            ..UpdateStatus::with_status(update::STATUS_DOWNLOADING)
+        }
+    }
+
+    /// A heartbeat that unwinds mid-download (the OS refusing a thread the
+    /// manifest fetch needs) must not leave `downloading` behind in a live
+    /// process: the loop would hold push jobs and pause pulls, and the held
+    /// jobs would keep the update deferred, with no restart to clear it.
+    #[test]
+    fn heartbeat_that_unwinds_mid_update_releases_the_pause() {
+        let td = tempfile::tempdir().unwrap();
+        let agent = test_agent(td.path(), "http://127.0.0.1:9");
+        let path = agent.cfg.update_status_path();
+        let st = agent.heartbeat_step(|| {
+            update::write_update_status(&path, &downloading_9_9_9()).unwrap();
+            assert!(update::should_pause_jobs_from_path(&path));
+            panic!("failed to spawn thread: Os {{ code: 11 }}");
+        });
+        assert!(st.is_none());
+        let after = update::read_update_status(&path).unwrap();
+        assert_eq!(after.status, update::STATUS_FAILED);
+        assert_eq!(after.last_error.as_deref(), Some(UPDATE_INTERRUPTED));
+        assert_eq!(after.target_version.as_deref(), Some("9.9.9"));
+        assert_eq!(after.previous_version.as_deref(), Some("0.3.17"));
+        assert!(!update::should_pause_jobs_from_path(&path));
+
+        // A heartbeat that returns normally is checked the same way; any
+        // other state it leaves is untouched.
+        let st = agent.heartbeat_step(|| {
+            update::write_update_status(&path, &downloading_9_9_9()).unwrap();
+            agent.run_once(false)
+        });
+        assert_eq!(st.unwrap().pairing, PairingState::Unpaired);
+        let after = update::read_update_status(&path).unwrap();
+        assert_eq!(after.status, update::STATUS_FAILED);
+        assert_eq!(after.last_error.as_deref(), Some(UPDATE_INTERRUPTED));
+        let mut pending = UpdateStatus::default();
+        update::mark_pending_health(&mut pending, "9.9.9", Some("0.3.17".into()), 120, None);
+        let st = agent.heartbeat_step(|| {
+            update::write_update_status(&path, &pending).unwrap();
+            panic!("restart helper refused a thread");
+        });
+        assert!(st.is_none());
+        let after = update::read_update_status(&path).unwrap();
+        assert_eq!(
+            (after.status.as_str(), after.last_error),
+            (update::STATUS_PENDING_HEALTH, None)
+        );
+    }
+
+    /// The same inside `Agent::run`: after the heartbeat unwinds mid-download
+    /// the loop goes on pulling jobs instead of holding them.
+    #[test]
+    fn run_loop_recovers_from_a_heartbeat_that_unwinds_mid_update() {
+        let td = tempfile::tempdir().unwrap();
+        let srv = stub(|_, path| match path {
+            "/print/v1/whoami" => (200, WHOAMI.into()),
+            "/print/v1/jobs/pending" => (200, r#"{"jobs":[]}"#.into()),
+            _ => (200, "{}".into()),
+        });
+        let mut agent = test_agent(td.path(), &srv.base_url);
+        agent.cfg.cable_enabled = false;
+        agent.cfg.pull_interval_seconds = 1;
+        pair(&agent);
+        // No refresher thread, so run_once queries the inventory inline: the
+        // one injectable step inside it. Its first call plays the OTA
+        // download: persist `downloading`, then panic as a refused thread does.
+        agent.shared = Arc::new(Shared {
+            spawn: Arc::new(|_, _| Err(std::io::Error::from_raw_os_error(libc::EAGAIN))),
+            ..Shared::default()
+        });
+        let path = agent.cfg.update_status_path();
+        let first = Arc::new(AtomicBool::new(true));
+        agent.inventory = Arc::new(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                update::write_update_status(&path, &downloading_9_9_9()).unwrap();
+                panic!("failed to spawn thread: Os {{ code: 11 }}");
+            }
+            Some(Vec::new())
+        });
+
+        run_for(&agent, Duration::from_millis(1500));
+
+        assert_eq!(srv.count("/print/v1/whoami"), 1, "one heartbeat ran");
+        assert!(srv.count("/print/v1/jobs/pending") >= 1, "pull not paused");
+        let after = update::read_update_status(&agent.cfg.update_status_path()).unwrap();
+        assert_eq!(after.status, update::STATUS_FAILED);
+        assert_eq!(after.last_error.as_deref(), Some(UPDATE_INTERRUPTED));
     }
 
     /// The pull is stamped when it starts, so with a 1 s pull interval it

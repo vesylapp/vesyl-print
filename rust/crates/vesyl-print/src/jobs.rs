@@ -25,6 +25,7 @@
 //! magic sniff) and submit with `lp -o raw`. PDF/PNG/JPEG sent to a raw Zebra
 //! queue are converted to ZPL `^GFA` graphics (see [`crate::zpl`]).
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
@@ -100,6 +101,21 @@ fn invalid_id_error() -> io::Error {
 /// Mutex lock that survives a panicked holder (state here stays consistent).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The message of a caught panic (`panic!` payloads are `&str` or `String`).
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
+}
+
+/// Run `f`; a panic (e.g. the OS refusing a thread deep inside a library)
+/// comes back as `Err` with its message.
+pub(crate) fn catch_panic<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(|p| panic_message(&*p))
 }
 
 /// Print / queue failure with a short machine-friendly code.
@@ -581,7 +597,10 @@ fn wait_cups_job_with(
     let mut last_log: Option<Instant> = None;
 
     while Instant::now() < deadline {
-        match query_cups(lpstat, &keys) {
+        // A panic (a thread `lpstat` needs is refused) is a failed query.
+        let polled = catch_panic(|| query_cups(lpstat, &keys))
+            .unwrap_or_else(|msg| Err(format!("CUPS query panicked: {msg}")));
+        match polled {
             Ok(done) => {
                 failures = 0;
                 if let Some(outcome) = done.get(job_key) {
@@ -610,7 +629,9 @@ fn wait_cups_job_with(
         }
         // Keep admin inventory fresh while this thread is blocked on paper-out.
         if let Some(tick) = on_tick {
-            tick();
+            if let Err(msg) = catch_panic(|| tick()) {
+                log::warn!(target: LOG, "CUPS wait tick for {job_key} panicked: {msg}");
+            }
         }
         thread::sleep(poll.max(Duration::from_millis(250)));
     }
@@ -768,8 +789,8 @@ impl CupsWatcher {
                 keys.dedup();
                 keys
             };
-            let polled = catch_unwind(AssertUnwindSafe(|| (self.poll)(&keys)))
-                .unwrap_or_else(|_| Err("CUPS query panicked".into()));
+            let polled = catch_panic(|| (self.poll)(&keys))
+                .unwrap_or_else(|msg| Err(format!("CUPS query panicked: {msg}")));
             for (w, outcome) in self.settle(&keys, polled, &mut failures) {
                 report_cups_outcome(w, outcome);
             }
@@ -836,21 +857,24 @@ impl CupsWatcher {
     }
 }
 
-fn report_cups_outcome(w: WatchedJob, outcome: CupsOutcome) {
-    let send = |state: JobState, detail: &str| match catch_unwind(AssertUnwindSafe(|| {
-        (w.report)(&w.job, state, Some(detail))
-    })) {
+/// Send one job status through `report`. A failure, or a panic (the status
+/// call needing a thread the OS refuses), is logged and goes no further: a
+/// status update never fails a job, least of all after `lp` accepted it.
+fn send_state(report: &StateFn, job: &PrintJob, state: JobState, detail: Option<&str>) {
+    match catch_panic(|| report(job, state, detail)) {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            log::debug!(target: LOG, "report_state {} failed: {e}", state.as_str())
-        }
-        Err(_) => log::error!(
+        Ok(Err(e)) => log::debug!(target: LOG, "report_state {} failed: {e}", state.as_str()),
+        Err(msg) => log::error!(
             target: LOG,
-            "report_state {} panicked for job {}",
+            "report_state {} panicked for job {}: {msg}",
             state.as_str(),
-            w.job.id
+            job.id
         ),
-    };
+    }
+}
+
+fn report_cups_outcome(w: WatchedJob, outcome: CupsOutcome) {
+    let send = |state: JobState, detail: &str| send_state(&w.report, &w.job, state, Some(detail));
     match outcome {
         CupsOutcome::Printed => send(JobState::Printed, &w.cups_id),
         CupsOutcome::Error => send(JobState::Error, &format!("CUPS job {} failed", w.cups_id)),
@@ -1323,9 +1347,7 @@ fn retire_queue_file(store: &JobStore, name: &str, err: &JobError) {
 
 impl Pipeline {
     fn report(&self, job: &PrintJob, state: JobState, detail: Option<&str>) {
-        if let Err(e) = (self.report_state)(job, state, detail) {
-            log::debug!(target: LOG, "report_state {} failed: {e}", state.as_str());
-        }
+        send_state(&self.report_state, job, state, detail);
     }
 
     /// Run the full durable pipeline for one job.
@@ -1333,6 +1355,13 @@ impl Pipeline {
     /// Returns `Printed`, `Delivered` (CUPS not tracked or tracked in the
     /// background), or a `JobError` after reporting `error` (a permanent one
     /// also moves the queue file to `queue/failed/`).
+    ///
+    /// A panic in a step (e.g. the OS refusing a thread that `lp` or a cloud
+    /// call needs) is handled like Python's catch-all: the ack and status
+    /// reports are best-effort as ever, a panic while materializing or
+    /// printing is a retryable `job_error` (reported, temp files removed,
+    /// queue file kept), and one while waiting on CUPS after `lp` accepted
+    /// the job leaves it delivered.
     pub fn process(&self, job: &PrintJob, store: &JobStore) -> Result<JobOutcome, JobError> {
         let job_id = job.id.as_str();
         if !valid_job_id(job_id) {
@@ -1354,14 +1383,18 @@ impl Pipeline {
         store.write_queue(job).map_err(io_err)?;
 
         // 3. Ack only after disk durability. Non-fatal: cloud can redeliver.
-        if let Err(e) = (self.ack)(job) {
-            log::warn!(target: LOG, "ack failed for job {job_id}: {e}");
+        // An ack that panics did not happen either; the job still prints.
+        match catch_panic(|| (self.ack)(job)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!(target: LOG, "ack failed for job {job_id}: {e}"),
+            Err(msg) => log::warn!(target: LOG, "ack failed for job {job_id}: panicked: {msg}"),
         }
 
         // 4–6. Materialize + submit + optional CUPS completion wait
         self.report(job, JobState::Printing, None);
         let mut temp: Option<PathBuf> = None;
-        let result = self.submit(job, store, &mut temp);
+        let result = catch_panic(|| self.submit(job, store, &mut temp))
+            .unwrap_or_else(|msg| Err(JobError::new(format!("job panicked: {msg}"), "job_error")));
 
         if let Some(path) = &temp {
             let _ = fs::remove_file(path);
@@ -1459,19 +1492,24 @@ impl Pipeline {
         let mut outcome = JobOutcome::Delivered;
         match (&cups_job, self.wait_cups) {
             (Some(cid), WaitCups::Sync) => {
-                match (self.wait_cups_job)(cid, self.on_wait_tick.as_ref()) {
-                    CupsOutcome::Printed => {
+                // CUPS has the job: a panic while waiting leaves it delivered
+                // (a job error would keep the queue file and print it again).
+                match catch_panic(|| (self.wait_cups_job)(cid, self.on_wait_tick.as_ref())) {
+                    Ok(CupsOutcome::Printed) => {
                         self.report(job, JobState::Printed, Some(cid));
                         outcome = JobOutcome::Printed;
                     }
-                    CupsOutcome::Error => {
+                    Ok(CupsOutcome::Error) => {
                         return Err(JobError::new(
                             format!("CUPS job {cid} failed"),
                             "cups_job_failed",
                         ));
                     }
-                    CupsOutcome::Unknown => {
+                    Ok(CupsOutcome::Unknown) => {
                         log::info!(target: LOG, "job {job_id} CUPS tracking timed out for {cid} — left delivered");
+                    }
+                    Err(msg) => {
+                        log::error!(target: LOG, "job {job_id} CUPS wait for {cid} panicked: {msg} — left delivered");
                     }
                 }
             }
@@ -1512,12 +1550,13 @@ impl Pipeline {
                     continue;
                 }
             };
-            // A panic (e.g. the OS refusing a thread) fails this job, not the drain.
-            let r = match catch_unwind(AssertUnwindSafe(|| self.process(&job, store))) {
+            // process() turns a panicking step into a job error; this is the
+            // backstop, so one job can never stop the drain.
+            let r = match catch_panic(|| self.process(&job, store)) {
                 Ok(Ok(o)) => o.as_str().to_string(),
                 Ok(Err(e)) => format!("error:{}", e.code),
-                Err(_) => {
-                    log::error!(target: LOG, "job {job_id} panicked — left queued");
+                Err(msg) => {
+                    log::error!(target: LOG, "job {job_id} panicked: {msg} — left queued");
                     "error:job_panic".to_string()
                 }
             };
@@ -1996,30 +2035,130 @@ mod tests {
         assert!(!st.has_queue_file(&j.id));
     }
 
+    /// A step that panics (the OS refusing one of `lp`'s helper threads) is a
+    /// retryable job error: reported, temp content removed, queue file kept,
+    /// and the drain carries on.
     #[test]
     fn drain_survives_a_panicking_job() {
         let td = tempfile::tempdir().unwrap();
         let st = store(td.path());
         st.write_queue(&png_job("q1")).unwrap();
         st.write_queue(&png_job("q2")).unwrap();
+        let events: Events = Arc::default();
+        let ev = events.clone();
+        let content: Arc<Mutex<Option<PathBuf>>> = Arc::default();
+        let c = content.clone();
         let p = Pipeline {
-            lp: Arc::new(|_, path, _| {
+            lp: Arc::new(move |_, path, _| {
                 if path.file_stem().is_some_and(|s| s == "q1") {
+                    *c.lock().unwrap() = Some(path.to_path_buf());
                     panic!("failed to spawn thread");
                 }
                 Ok(None)
+            }),
+            report_state: Arc::new(move |j, state, detail| {
+                ev.lock().unwrap().push(format!(
+                    "{}:{}:{}",
+                    j.id,
+                    state.as_str(),
+                    detail.unwrap_or("")
+                ));
+                Ok(())
             }),
             ..test_pipeline()
         };
         assert_eq!(
             p.drain(&st),
             vec![
-                ("q1".to_string(), "error:job_panic".to_string()),
+                ("q1".to_string(), "error:job_error".to_string()),
                 ("q2".to_string(), "delivered".to_string()),
             ]
         );
-        // Outcome unknown: q1 stays queued for the next start.
+        let q1: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with("q1:"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            q1,
+            [
+                "q1:printing:",
+                "q1:error:job panicked: failed to spawn thread"
+            ]
+        );
+        // The temp file and the vesyl-print-* dir it was written to are gone.
+        let content = content.lock().unwrap().clone().expect("lp saw q1");
+        let dir = content.parent().unwrap();
+        assert!(dir
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("vesyl-print-")));
+        assert!(!content.exists() && !dir.exists(), "{}", dir.display());
+        // Outcome unknown: q1 stays queued (not retired) for the next start.
         assert_eq!(st.list_queued_ids(), ["q1"]);
+        assert!(!st.failed_dir().exists());
+        assert!(!st.is_processed("q1"));
+    }
+
+    /// An ack or status report that panics (its REST call refused a thread)
+    /// is a failed ack or report like any other: the job still prints, once.
+    #[test]
+    fn panicking_ack_and_reports_do_not_fail_the_job() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let printed = Arc::new(AtomicUsize::new(0));
+        let pr = printed.clone();
+        let p = Pipeline {
+            ack: Arc::new(|_| panic!("failed to spawn thread")),
+            report_state: Arc::new(|_, _, _| panic!("failed to spawn thread")),
+            lp: Arc::new(move |_, _, _| {
+                pr.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("Q-1".into()))
+            }),
+            wait_cups_job: Arc::new(|_, _| CupsOutcome::Printed),
+            wait_cups: WaitCups::Sync,
+            ..test_pipeline()
+        };
+        assert_eq!(p.process(&png_job("r1"), &st).unwrap(), JobOutcome::Printed);
+        assert!(st.is_processed("r1") && !st.has_queue_file("r1"));
+        // A redelivery is answered from the marker; its report panics too.
+        assert_eq!(p.process(&png_job("r1"), &st).unwrap(), JobOutcome::Printed);
+        assert_eq!(printed.load(Ordering::SeqCst), 1);
+        // A failed print still fails with its own error.
+        let offline = Pipeline {
+            lp: Arc::new(|_, _, _| Err(JobError::new("printer offline", "lp_error"))),
+            ..p.clone()
+        };
+        let err = offline.process(&png_job("r2"), &st).unwrap_err();
+        assert_eq!(err.code, "lp_error");
+        assert!(st.has_queue_file("r2"));
+    }
+
+    /// Once `lp` accepted the job, a panic while waiting on CUPS leaves it
+    /// delivered: an error (queue file kept) would print the label again on
+    /// the next start.
+    #[test]
+    fn panic_while_waiting_on_cups_leaves_the_job_delivered() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let events: Events = Arc::default();
+        let p = Pipeline {
+            lp: Arc::new(|_, _, _| Ok(Some("Q-5".into()))),
+            wait_cups_job: Arc::new(|_, _| panic!("failed to spawn thread")),
+            wait_cups: WaitCups::Sync,
+            report_state: recording_state(&events),
+            ..test_pipeline()
+        };
+        assert_eq!(
+            p.process(&png_job("w1"), &st).unwrap(),
+            JobOutcome::Delivered
+        );
+        assert!(st.is_processed("w1") && !st.has_queue_file("w1"));
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["state:printing", "state:delivered"]
+        );
     }
 
     /// Device d2d071: a print-test job whose file the agent can't read used
@@ -2945,6 +3084,34 @@ Zebra-40                ben            1024   Wed 08 Oct 2026 01:00:00 AM CDT
         );
         assert_eq!(outcome, CupsOutcome::Printed);
         assert_eq!(ticks.load(Ordering::SeqCst), 2);
+    }
+
+    /// In the synchronous wait a panicking `lpstat` run is one failed query
+    /// and a panicking tick is skipped: the wait goes on to the outcome.
+    #[test]
+    fn sync_wait_survives_panicking_lpstat_and_tick() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let p = polls.clone();
+        let lpstat = move |args: &[&str]| -> io::Result<CmdOutput> {
+            if args[1] != "not-completed" {
+                return ok(COMPLETED);
+            }
+            match p.fetch_add(1, Ordering::SeqCst) {
+                0 => panic!("failed to spawn thread"),
+                1 => ok("Zebra-43 ben 1 date\n"),
+                _ => ok(""),
+            }
+        };
+        let tick: TickFn = Arc::new(|| panic!("wait tick panicked"));
+        let outcome = wait_cups_job_with(
+            "Zebra-43",
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+            Some(&tick),
+            &lpstat,
+        );
+        assert_eq!(outcome, CupsOutcome::Printed);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
