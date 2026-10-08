@@ -221,7 +221,9 @@ pick one), and keeps config, credentials and the queue. Until then the
 devices that ran the 0.4 bridge (Python units handing off to the binary) report
 0.4.x and are not covered by that floor: re-provision them before offering them
 a newer release. The lab Pi ran two such lab builds, 0.4.0 and 0.4.1 (signed
-with a throwaway lab key), so the first real release is 0.5.0 (§4.8).
+with a throwaway lab key), so the first real release is 0.5.0, and the lab Pi
+is re-provisioned from its published tarball, never from a build made before
+the tag and numbered 0.5.0 or 0.5.0-anything (§4.8).
 
 A release tarball never holds `keys/tailscale.key`, so re-provisioning a
 device that is already on the tailnet leaves Tailscale alone ("No Tailscale
@@ -434,6 +436,22 @@ equals the desired one stays idle (§4.3 step 3), so a real 0.4.0 or 0.4.1
 would never replace the lab build of the same number. Tag `v0.5.0` with
 `VERSION` bumped to 0.5.0 in the same commit. `MIN_AGENT_VERSION` keeps its
 default of 0.4.0, the Python-era cutoff (§4.2).
+
+That equality ignores suffixes: `update.rs` `version_cmp` compares only the
+numbers before any `-` or `+` (a part that is not a number counts as 0), so
+0.5.0-rc.1 and 0.5.0.lab are both 0.5.0. A device running a build numbered
+like that stays idle when the cloud asks for the real v0.5.0, as it does for
+`update apply --version 0.5.0`, and `update check` calls it up to date.
+Moving it takes a manual `update apply --manifest-url …` (or `--file`) or
+another re-provision. So:
+
+- Re-provision the lab Pi from the published v0.5.0 tarball (§4.2.1).
+- A tarball built before the tag must not be numbered 0.5.0 or anything that
+  reads as 0.5.0. Number an interim lab build below 0.5.0 and at or above
+  `MIN_AGENT_VERSION` 0.4.0, e.g. 0.4.2:
+  `BUILD_ONLY=1 ./scripts/build-release.sh 0.4.2`. Give the version: until
+  the release bumps it, `VERSION` is 0.3.17, below the floor, and
+  `build-release.sh` refuses it.
 
 ### 4.9 Implementation map
 

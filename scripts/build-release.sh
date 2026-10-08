@@ -243,7 +243,8 @@ PACKAGE_FILTER=(
 )
 # What a device needs from the tree: the units run vesyl-print and main.py,
 # setup.sh provisions from it (with both root helpers), test-print sends the
-# test labels, and base.jpg is the sample image (printers::test_image).
+# test labels, and base.jpg is the sample image for
+# `vesyl-print print-test --file /opt/vesyl-print/current/base.jpg`.
 REQUIRED_FILES=(
   vesyl-print
   VERSION

@@ -22,12 +22,17 @@ configs whose `update_public_key_path` points there.
 keys/tailscale.key
 ```
 
-- **Never commit.** `.gitignore` ignores it, and every other `*.key` or
-  `*.pem` in `keys/` except `update_public.pem`. Used only by `setup.sh` on
-  first provision: copy it into `keys/` of the extracted release before
-  running `setup.sh`. Release tarballs never carry it, so re-running
-  `setup.sh` from a release on a device that is already on the tailnet skips
-  Tailscale and leaves it joined.
+- **Never commit.** `.gitignore` lists it, and every other `*.key` or `*.pem`
+  in `keys/` except `update_public.pem`, but `keys/tailscale.key` is still
+  tracked in this repository, and ignore rules do not apply to tracked files:
+  git shows a changed copy as modified, and `git commit -a` or `git add -u`
+  commits it. The rule protects it only once the file is removed from the
+  index (`git rm --cached keys/tailscale.key`, a maintainer decision). Until
+  then, never put a live key in a checkout's `keys/`.
+- Used only by `setup.sh` on first provision: copy it into `keys/` of the
+  extracted release (not a checkout) before running `setup.sh`. Release
+  tarballs never carry it, so re-running `setup.sh` from a release on a
+  device that is already on the tailnet skips Tailscale and leaves it joined.
 - Contents: a **one-time** Tailscale auth key (single line).
 - `setup.sh` installs Tailscale (if needed) and runs:
 

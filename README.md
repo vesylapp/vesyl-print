@@ -63,16 +63,24 @@ Options go after `sudo`, which drops the caller's environment:
 `sudo SKIP_TAILSCALE=1 ./setup.sh` (see the header of `setup.sh`).
 
 Run it with `sudo` from the account the services should run as (e.g.
-`vesyl`): that account (`SUDO_USER`) becomes the units' `User=`. Run from a
-root shell, `setup.sh` falls back to the owner of the extracted tree and
-stops, before changing anything, if that is root; `chown -R` the tree to the
-service account first. A custom install root (`sudo
-INSTALL_ROOT=/srv/vesyl-print ./setup.sh`) is written into the units, the CLI
-wrapper and both root helpers.
+`vesyl`): that account (`SUDO_USER`) becomes the units' `User=`, the owner of
+`/etc/vesyl-print`, `/var/lib/vesyl-print` and the install root, and the
+account allowed to run the root helpers through sudo. `setup.sh` takes
+`SUDO_USER` whenever it is set and not root, and a root shell opened with
+`sudo -i` or `sudo -s` keeps it: `./setup.sh` run there makes the account
+that ran `sudo` (e.g. `pi`) the service account. Only when `SUDO_USER` is
+unset or root (a direct root login, `su -`, or `sudo` run from a root shell)
+does `setup.sh` fall back to the owner of the extracted tree, and it stops,
+before changing anything, if that owner is root; `chown -R` the tree to the
+service account first. A custom install root
+(`sudo INSTALL_ROOT=/srv/vesyl-print ./setup.sh`) is written into the units,
+the CLI wrapper and both root helpers.
 
 A git checkout has no binary, so `setup.sh` stops before changing anything.
-Build a release from a checkout with `BUILD_ONLY=1 ./scripts/build-release.sh`
-(needs cargo-zigbuild) and run the `setup.sh` inside the extracted tarball.
+Build a release from a checkout (needs cargo-zigbuild) with
+`BUILD_ONLY=1 ./scripts/build-release.sh [VERSION]` and run the `setup.sh`
+inside the extracted tarball; how to number a build that is not a release is
+covered below.
 
 ```text
 /opt/vesyl-print/current → releases/<VERSION>/   vesyl-print binary, LCD (*.py), assets
@@ -96,7 +104,15 @@ installing a slot its units cannot run.
 Release tarballs never carry `keys/tailscale.key`, so on a device that is
 already on the tailnet `setup.sh` reports "No Tailscale auth key" and leaves
 Tailscale as it is. Lab devices that ran the 0.4.0 / 0.4.1 lab builds are
-re-provisioned the same way, from 0.5.0 or later.
+re-provisioned the same way, from the published v0.5.0 tarball (or a later
+release). A tarball built before that tag must not be numbered 0.5.0 or
+0.5.0-anything: the agent ignores a `-` suffix when it compares versions
+([OTA_UPDATES.md §4.8](./OTA_UPDATES.md#48-version-source-of-truth)), so a
+device running such a build would take v0.5.0 as already installed and never
+update to it. Number an interim lab build below 0.5.0 but at or above
+the 0.4.0 floor, e.g. `BUILD_ONLY=1 ./scripts/build-release.sh 0.4.2` (give
+the version: until the release bumps it, the checkout's `VERSION` is 0.3.17,
+below the floor, and a build of it is refused).
 
 ## Config
 
@@ -359,19 +375,27 @@ and the provisioning files; never `rust/`, `tests/` or secrets.
 
 ```bash
 # 1) Set repo secret UPDATE_PRIVATE_KEY (Ed25519 PEM; public half = keys/update_public.pem)
-# 2) Bump VERSION, commit, tag, push (the tag must match VERSION):
-echo 0.5.0 > VERSION && git commit -am "Release 0.5.0"
+# 2) Bump VERSION, commit only VERSION, tag, push (the tag must match VERSION):
+echo 0.5.0 > VERSION && git commit -m "Release 0.5.0" VERSION
 git tag v0.5.0
 git push origin HEAD v0.5.0
 # CI: build (BUILD_ONLY=1) → sign (SIGN_ONLY=1) → publish (VERIFY_ONLY=1 + gh release)
 ```
+
+Name `VERSION` in the commit rather than using `git commit -a`, which also
+commits every other modified tracked file, including a key copied over the
+tracked `keys/tailscale.key` (see `keys/README.md`).
 
 **The first Rust-only release is v0.5.0.** The lab Pi already ran two lab
 builds, 0.4.0 and 0.4.1, signed with a throwaway lab key. A device that
 already reports the desired version does nothing, so a real 0.4.0 or 0.4.1
 would never replace the lab build of the same number. Tag above them, with
 `VERSION` bumped to 0.5.0 in the same commit. `MIN_AGENT_VERSION` keeps its
-default, 0.4.0: the Python-era cutoff, not the release version.
+default, 0.4.0: the Python-era cutoff, not the release version. The agent
+compares versions by number and ignores a `-` suffix (0.5.0-rc.1 counts as
+0.5.0), so a build made before the tag must not be numbered 0.5.0 or
+0.5.0-anything either: number an interim lab build below 0.5.0 (e.g. 0.4.2)
+and re-provision the lab Pi from the published v0.5.0 tarball.
 
 Local build: `UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 0.5.0` builds
 and signs in one go (needs cargo-zigbuild, jq, rsync, openssl). `BUILD_ONLY=1`,

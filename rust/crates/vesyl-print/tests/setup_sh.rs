@@ -1,6 +1,7 @@
 //! `setup.sh`: the root helpers are installed with INSTALL_ROOT written in,
 //! a non-default install root provisions and activates through the installed
-//! `apply-update`, and re-provisioning from an extracted release without a
+//! `apply-update`, the services run as SUDO_USER or else the tree's owner
+//! (never root), and re-provisioning from an extracted release without a
 //! Tailscale key skips Tailscale and removes only that tree.
 //!
 //! The unprivileged tests run setup.sh's preflight, which checks the release
@@ -459,6 +460,16 @@ fn owner(path: &Path) -> u32 {
     fs::symlink_metadata(path).unwrap().uid()
 }
 
+/// `chown -R uid:uid path`, never following a symlink.
+fn chown_tree(path: &Path, uid: u32) {
+    std::os::unix::fs::lchown(path, Some(uid), Some(uid)).unwrap();
+    if fs::symlink_metadata(path).unwrap().is_dir() {
+        for entry in fs::read_dir(path).unwrap() {
+            chown_tree(&entry.unwrap().path(), uid);
+        }
+    }
+}
+
 /// True when the stubs' log has a call of `name`.
 fn called(calls: &str, name: &str) -> bool {
     calls
@@ -679,6 +690,77 @@ fn root_reprovisions_a_joined_device_from_an_extracted_release() {
             .any(|l| l == "INSTALL_ROOT = Path(\"/opt/vesyl-print\")"),
         "{wifi}"
     );
+}
+
+#[test]
+#[ignore = "needs root (or a user namespace mapping uid 1000) to chroot and chown"]
+fn root_service_account_is_the_sudo_user_else_the_tree_owner() {
+    let Some(mut sb) = Sandbox::new() else { return };
+    // Extracted in a root shell: the tree belongs to root.
+    let src = format!("/root/vesyl-print-{VERSION}");
+    release_tree(&sb.at(&src));
+    let setup = format!("{src}/setup.sh");
+    let run_as = format!("==> Run as user:  {SERVICE_USER}\n");
+
+    // A direct root login or `su -` (no SUDO_USER), or `sudo` run from a
+    // root shell (SUDO_USER=root): the tree's owner, root, so setup.sh stops
+    // before it changes anything.
+    let no_sudo_user: &[(&str, &str)] = &[];
+    for env in [no_sudo_user, &[("SUDO_USER", "root")]] {
+        let r = sb.exec(env, &[&setup]);
+        assert_eq!(r.code, Some(1), "{env:?}: {}", r.log());
+        assert!(
+            r.stderr
+                .contains("the services need a normal account (e.g. vesyl), not 'root'"),
+            "{env:?}: {}",
+            r.log()
+        );
+        assert_eq!(sb.calls(), "", "{env:?}");
+        assert!(!sb.at("/etc/vesyl-print").exists(), "{env:?}");
+        assert!(!sb.at("/opt/vesyl-print").exists(), "{env:?}");
+        assert!(!sb.usr_local.join("lib/vesyl-print").exists(), "{env:?}");
+    }
+
+    // A `sudo -i` or `sudo -s` shell keeps SUDO_USER: the account that ran
+    // sudo becomes the service account, whoever owns the tree.
+    let r = sb.exec(
+        &[("SUDO_USER", SERVICE_USER), ("SKIP_SOURCE_CLEANUP", "1")],
+        &[&setup],
+    );
+    assert!(r.ok(), "{}", r.log());
+    assert!(r.stdout.contains(&run_as), "{}", r.log());
+    assert_eq!(owner(&sb.at(&src)), 0);
+    for unit in ["vesyl-print-agent.service", "vesyl-print-display.service"] {
+        let text = read(&sb.at("/etc/systemd/system").join(unit));
+        assert!(text.contains("\nUser=vesyl\n"), "{text}");
+    }
+    for path in [
+        "/etc/vesyl-print",
+        "/var/lib/vesyl-print",
+        "/opt/vesyl-print",
+        "/opt/vesyl-print/releases",
+    ] {
+        assert_eq!(owner(&sb.at(path)), SERVICE_UID, "{path}");
+    }
+    let sudoers = read(&sb.at("/etc/sudoers.d/vesyl-print"));
+    assert!(
+        sudoers
+            .lines()
+            .any(|l| l == "vesyl ALL=(root) NOPASSWD: /usr/local/lib/vesyl-print/apply-update"),
+        "{sudoers}"
+    );
+
+    // Once the tree is chowned to the service account, its owner is the
+    // account, for `sudo` from a root shell and for a root login alike.
+    chown_tree(&sb.at(&src), SERVICE_UID);
+    let sudo_from_root: &[(&str, &str)] = &[("SUDO_USER", "root"), ("SKIP_SOURCE_CLEANUP", "1")];
+    for env in [sudo_from_root, no_sudo_user] {
+        let r = sb.exec(env, &[&setup]);
+        assert!(r.ok(), "{env:?}: {}", r.log());
+        assert!(r.stdout.contains(&run_as), "{env:?}: {}", r.log());
+    }
+    // The last run removed the extracted tree.
+    assert!(!sb.at(&src).exists());
 }
 
 #[test]
