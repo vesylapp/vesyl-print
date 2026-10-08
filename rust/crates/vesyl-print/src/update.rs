@@ -1080,11 +1080,31 @@ impl WhoamiResult {
     }
 }
 
+/// True when this process is the agent that the gated activation replaces:
+/// it was started from a release slot, it runs the version the gate would
+/// roll back to, and the gate is for another version. Activations arm the
+/// gate before the services restart (a heartbeat OTA in this very process,
+/// or `update apply … --restart` from the CLI), and `systemctl restart
+/// --no-block` lets this process finish its current cycle first.
+fn replaced_by_gated_activation(st: &UpdateStatus, env: &UpdateEnv, expected: &str) -> bool {
+    env.running_from_slot
+        && !same_version(&env.running_version, expected)
+        && st
+            .previous_version
+            .as_deref()
+            .is_some_and(|p| same_version(p, &env.running_version))
+}
+
 /// Post-update health gate.
 ///
 /// Declares success only after local slot checks pass and (when paired) whoami
 /// reaches the API. On hard failure or deadline expiry: auto-rollback to
 /// `previous_version` when available, set `rolled_back`, and restart services.
+///
+/// The agent being replaced leaves the gate alone until the deadline: it can
+/// never pass the running-version check, so judging the new slot would roll
+/// back an activation whose restart is already on its way. A deadline that
+/// passes while it still runs means the restart never came; it rolls back.
 pub fn process_pending_health(
     st: UpdateStatus,
     cfg: &Config,
@@ -1103,12 +1123,23 @@ pub fn process_pending_health(
     }
 
     let now = now_iso.map(String::from).unwrap_or_else(utc_now);
-    st.last_checked_at = Some(now.clone());
-    st.health_attempts += 1;
     let expected = st
         .target_version
         .clone()
         .unwrap_or_else(|| st.current_version.clone());
+    if replaced_by_gated_activation(&st, env, &expected)
+        && !deadline_passed(st.health_deadline_at.as_deref(), &now)
+    {
+        log::info!(
+            target: LOG,
+            "pending_health for {expected}: waiting for the restart (running {})",
+            env.running_version
+        );
+        return st;
+    }
+
+    st.last_checked_at = Some(now.clone());
+    st.health_attempts += 1;
 
     let local = local_slot_healthy(env, Some(&expected));
     let cloud_ok = whoami != WhoamiResult::Error;
@@ -1244,13 +1275,37 @@ fn failed_health_gate(st: &UpdateStatus) -> bool {
                 .is_some_and(|e| e.starts_with(HEALTH_FAILED)))
 }
 
+/// The status to start a heartbeat update from: `status` as the caller read
+/// it earlier in its cycle, unless `status_path` now holds a `pending_health`
+/// it does not have. That is a gate armed meanwhile by another process
+/// (`update apply … --restart`); the caller writes the result back, so its
+/// stale copy would disarm the gate the restarted agent needs.
+fn current_status(status: Option<UpdateStatus>, status_path: Option<&Path>) -> UpdateStatus {
+    let Some(armed) = status_path
+        .and_then(read_update_status)
+        .filter(|on_disk| on_disk.is(STATUS_PENDING_HEALTH))
+    else {
+        return status.unwrap_or_default();
+    };
+    if status.as_ref() != Some(&armed) {
+        log::info!(
+            target: LOG,
+            "update status changed on disk: pending_health for {} (was {})",
+            armed.target_version.as_deref().unwrap_or("?"),
+            status.as_ref().map_or("none", |s| s.status.as_str())
+        );
+    }
+    armed
+}
+
 /// Inspect a heartbeat response and optionally apply an update.
 ///
 /// After a successful activate, status becomes `pending_health` (not idle);
 /// the new process must call [`process_pending_health`] after restart. When
 /// `jobs_busy`, download/install is deferred so slots never flip mid-print.
 /// A version that already failed its health gate here is not re-applied for
-/// the same desired version (see below).
+/// the same desired version (see below). With `status_path`, a gate armed
+/// there since `status` was read wins over `status` (see `current_status`).
 pub fn maybe_update_from_heartbeat(
     hb: &JsonObject,
     cfg: &Config,
@@ -1259,7 +1314,7 @@ pub fn maybe_update_from_heartbeat(
     status_path: Option<&Path>,
     jobs_busy: bool,
 ) -> UpdateStatus {
-    let mut st = status.unwrap_or_default();
+    let mut st = current_status(status, status_path);
     st.current_version = env.running_version.clone();
     st.last_checked_at = Some(utc_now());
 
@@ -2478,6 +2533,120 @@ mod tests {
             ..env(&td.path().join("empty"))
         };
         assert_eq!(slot_before_activation(&lab).as_deref(), Some("0.3.9"));
+    }
+
+    /// The 0.3.0 agent still runs from its slot after 0.4.0 was activated and
+    /// the gate armed (the restart is queued): it must not judge 0.4.0.
+    #[test]
+    fn replaced_agent_waits_for_the_restart() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = cfg(td.path());
+        let old = UpdateEnv {
+            running_version: "0.3.0".into(),
+            running_from_slot: true,
+            ..env(&root)
+        };
+        let gate = pending(utc_now_plus(120));
+        for whoami in [WhoamiResult::Ok, WhoamiResult::Error] {
+            let out = process_pending_health(gate.clone(), &c, &old, whoami, Some("timeout"), None);
+            // Untouched: no attempt counted, no error, no rollback.
+            assert_eq!(out, gate, "{whoami:?}");
+            assert_eq!(current_name(&root), "0.4.0");
+        }
+
+        // The restarted agent runs the gate as usual.
+        let new = UpdateEnv {
+            running_version: "0.4.0".into(),
+            ..old.clone()
+        };
+        let out = process_pending_health(gate.clone(), &c, &new, WhoamiResult::Ok, None, None);
+        assert_eq!(out.status, STATUS_IDLE);
+        // So does one that runs from the new slot but reports another version
+        // (a mislabeled build): it fails fast.
+        let mislabeled = UpdateEnv {
+            running_version: "0.4.1".into(),
+            ..old.clone()
+        };
+        let out =
+            process_pending_health(gate.clone(), &c, &mislabeled, WhoamiResult::Ok, None, None);
+        assert_eq!(out.status, STATUS_ROLLED_BACK);
+        assert_eq!(current_name(&root), "0.3.0");
+        flip_current(&root, "0.4.0").unwrap();
+
+        // Still the old agent at the deadline: the restart never came.
+        let late = utc_now_plus(121);
+        let out = process_pending_health(gate, &c, &old, WhoamiResult::Ok, None, Some(&late));
+        assert_eq!(out.status, STATUS_ROLLED_BACK);
+        assert_eq!(
+            out.last_error.as_deref(),
+            Some(
+                "health failed: running version \"0.3.0\" != expected \"0.4.0\"; rolled back to 0.3.0"
+            )
+        );
+        assert_eq!(current_name(&root), "0.3.0");
+    }
+
+    /// A gate armed on disk after the agent read its status this cycle
+    /// (`update apply … --restart`) survives the agent's heartbeat write-back.
+    #[test]
+    fn heartbeat_keeps_a_gate_armed_meanwhile() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let path = td.path().join("update_status.json");
+        let old = UpdateEnv {
+            running_version: "0.3.0".into(),
+            running_from_slot: true,
+            ..env(&root)
+        };
+        let armed = arm_health_gate(&c, &path, "0.4.0", Some("0.3.0".into())).unwrap();
+        let stale = [
+            None,
+            Some(UpdateStatus::default()),
+            Some(UpdateStatus {
+                status: STATUS_FAILED.into(),
+                target_version: Some("0.4.0".into()),
+                last_error: Some("network error: Connection refused".into()),
+                ..Default::default()
+            }),
+            // An older gate (another target).
+            Some(UpdateStatus {
+                target_version: Some("0.3.5".into()),
+                ..pending(utc_now_plus(60))
+            }),
+        ];
+        // No desired version, and one that would otherwise be installed.
+        for hb in [obj(json!({"ok": true})), desire(td.path(), "0.5.0")] {
+            for st in &stale {
+                let out =
+                    maybe_update_from_heartbeat(&hb, &c, &old, st.clone(), Some(&path), false);
+                assert_eq!(out.status, STATUS_PENDING_HEALTH, "{st:?}");
+                assert_eq!(out.target_version.as_deref(), Some("0.4.0"), "{st:?}");
+                assert_eq!(out.previous_version.as_deref(), Some("0.3.0"), "{st:?}");
+                assert_eq!(out.health_deadline_at, armed.health_deadline_at);
+                assert_eq!(current_name(&root), "0.4.0");
+                assert!(!root.join("releases/0.5.0").exists(), "installed 0.5.0");
+            }
+        }
+
+        // Only a pending_health on disk wins; any other status there does not.
+        write_update_status(&path, &UpdateStatus::default()).unwrap();
+        let rolled = UpdateStatus {
+            status: STATUS_ROLLED_BACK.into(),
+            target_version: Some("0.5.0".into()),
+            last_error: Some("health failed: timeout; rolled back to 0.4.0".into()),
+            ..Default::default()
+        };
+        let hb = desire(td.path(), "0.5.0");
+        let out =
+            maybe_update_from_heartbeat(&hb, &c, &env(&root), Some(rolled), Some(&path), false);
+        assert_eq!(out.status, STATUS_ROLLED_BACK);
+        // Without a status path (the CLI's own `update apply`) nothing is re-read.
+        arm_health_gate(&c, &path, "0.4.0", Some("0.3.0".into())).unwrap();
+        let out =
+            maybe_update_from_heartbeat(&obj(json!({"ok": true})), &c, &old, None, None, false);
+        assert_eq!(out.status, STATUS_IDLE);
     }
 
     // --- artifact transport (C31) ----------------------------------------------

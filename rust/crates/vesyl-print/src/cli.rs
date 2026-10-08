@@ -781,8 +781,11 @@ fn apply_local(
 ///
 /// With `--restart`, arm the post-update health gate first (as the heartbeat
 /// path does), so a new slot that cannot reach the API rolls itself back to
-/// `previous`. Without it the old agent keeps running; arming the gate then
-/// would make that agent roll the activation back (running version mismatch).
+/// `previous`. The agent being replaced may still finish a cycle after the
+/// restart is queued; it leaves the gate to its successor (see
+/// [`update::process_pending_health`]). Without `--restart` the old agent
+/// keeps running, so a gate armed now would expire unrestarted and roll the
+/// activation back.
 fn after_manual_activation(
     deps: &Deps,
     out: &mut dyn Write,
@@ -876,7 +879,13 @@ fn cmd_print_test(deps: &Deps, out: &mut dyn Write, args: PrintTestArgs) -> CmdR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::InventoryFn;
+    use crate::cloud::http_stub::{self, respond};
     use crate::testutil::serve;
+    use std::sync::atomic::Ordering;
+    use std::sync::{mpsc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     fn sample() -> Vec<Value> {
         serde_json::from_value(json!([
@@ -1201,7 +1210,8 @@ mod tests {
             Some("0.9.0")
         );
         // Without --restart the old agent keeps running: no gate is armed
-        // (it would roll the activation back), only a hint is printed.
+        // (it would expire unrestarted and roll the activation back), only
+        // a hint is printed.
         assert!(out.contains("--restart also arms the post-update health gate"));
         assert!(!d.cfg.update_status_path().exists());
 
@@ -1312,6 +1322,184 @@ mod tests {
         );
         assert_eq!(r.unwrap(), 0, "{out}");
         assert!(!d.cfg.update_status_path().exists());
+    }
+
+    // --- `update apply … --restart` while the agent it replaces is mid-cycle --
+
+    /// Where the replaced agent's cycle is held while the CLI runs.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum HeldIn {
+        Whoami,
+        Inventory,
+    }
+
+    /// Holds the first call that reaches it until the test lets it go.
+    struct Hold {
+        first: AtomicBool,
+        arrived: mpsc::Sender<()>,
+        go: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Hold {
+        fn here(&self) {
+            if self.first.swap(false, Ordering::SeqCst) {
+                let _ = self.arrived.send(());
+                let _ = self
+                    .go
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(20));
+            }
+        }
+    }
+
+    /// A paired agent at `version`, started from its slot (`current`).
+    fn slot_agent(d: &Deps, version: &str, inventory: InventoryFn) -> Agent {
+        Agent {
+            cfg: d.cfg.clone(),
+            client: CloudClient::new(&d.cfg.api_base_url),
+            store: JobStore::from_config(&d.cfg),
+            inventory,
+            update_env: UpdateEnv {
+                running_version: version.into(),
+                running_from_slot: true,
+                ..d.update_env.clone()
+            },
+            pipeline: Pipeline::default(),
+        }
+    }
+
+    /// `update apply <how> --restart` while the 0.8.0 agent it replaces is
+    /// held at `held_in`. systemd lets that agent finish its cycle after the
+    /// restart is queued; it must neither judge 0.9.0 (and roll it back) nor
+    /// write back the status it read before the gate was armed. The restarted
+    /// 0.9.0 agent then finds the gate and passes it.
+    fn apply_while_replaced_agent_is_mid_cycle(how: &str, held_in: HeldIn) {
+        let ctx = format!("update apply {how} with the old agent held in {held_in:?}");
+        let td = tempfile::tempdir().unwrap();
+        let (tarball, manifest) = release(td.path(), "0.9.0");
+        let url = file_url(&manifest);
+        let hb = match how {
+            "online" => json!({"ok": true, "desired_agent_version": "0.9.0", "update_url": url}),
+            _ => json!({"ok": true}),
+        }
+        .to_string();
+
+        let (arrived, arrived_rx) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel();
+        let hold = Arc::new(Hold {
+            first: AtomicBool::new(true),
+            arrived,
+            go: Mutex::new(go),
+        });
+        let api_hold = hold.clone();
+        let srv = http_stub::serve(move |req, stream| {
+            if req.path.ends_with("/whoami") {
+                if held_in == HeldIn::Whoami {
+                    api_hold.here();
+                }
+                respond(stream, 200, &[], br#"{"node_id":"n1"}"#);
+            } else {
+                respond(stream, 200, &[], hb.as_bytes());
+            }
+        });
+        let base = deps(td.path(), &srv.base_url);
+        let d = Deps {
+            cfg: Config {
+                update_require_signature: false,
+                ..base.cfg
+            },
+            ..base
+        };
+        d.cfg.ensure_dirs().unwrap();
+        installed_slot(&d, "0.8.0");
+        let creds = auth::credentials_from_pair_response(
+            json!({"node_id": "n1", "device_token": "tok"})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        auth::save_credentials(&d.cfg.credentials_path(), &creds).unwrap();
+        let status_path = d.cfg.update_status_path();
+        // Left by the old agent's earlier cycles.
+        let idle = update::UpdateStatus {
+            current_version: "0.8.0".into(),
+            ..Default::default()
+        };
+        update::write_update_status(&status_path, &idle).unwrap();
+
+        let inventory_hold = hold.clone();
+        let old = slot_agent(
+            &d,
+            "0.8.0",
+            Arc::new(move || {
+                if held_in == HeldIn::Inventory {
+                    inventory_hold.here();
+                }
+                Some(Vec::new())
+            }),
+        );
+        let (t, m) = (tarball.to_str().unwrap(), manifest.to_str().unwrap());
+        let argv = match how {
+            "--file" => vec!["update", "apply", "--file", t, "--manifest", m, "--restart"],
+            "--manifest-url" => vec!["update", "apply", "--manifest-url", &url, "--restart"],
+            _ => vec!["update", "apply", "--restart"],
+        };
+        let cycle = thread::scope(|s| {
+            // Dropped on a panic below, which lets the held call go.
+            let go_tx = go_tx;
+            let cycle = s.spawn(|| old.run_once(false));
+            arrived_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|e| panic!("{ctx}: the agent never got there: {e}"));
+            let (r, out) = run_args(&d, &argv);
+            assert_eq!(r.unwrap(), 0, "{ctx}: {out}");
+            go_tx.send(()).unwrap();
+            cycle.join().unwrap()
+        });
+
+        assert_eq!(cycle.last_error, None, "{ctx}");
+        let root = &d.update_env.install_root;
+        assert_eq!(
+            update::current_release_version(root).as_deref(),
+            Some("0.9.0"),
+            "{ctx}: the old agent rolled the activation back"
+        );
+        let st = update::read_update_status(&status_path).expect("status");
+        assert_eq!(st.status, update::STATUS_PENDING_HEALTH, "{ctx}: {st:?}");
+        assert_eq!(st.target_version.as_deref(), Some("0.9.0"), "{ctx}");
+        assert_eq!(st.previous_version.as_deref(), Some("0.8.0"), "{ctx}");
+
+        // After the restart.
+        let new = slot_agent(&d, "0.9.0", Arc::new(|| Some(Vec::new())));
+        assert_eq!(new.run_once(false).last_error, None, "{ctx}");
+        let st = update::read_update_status(&status_path).expect("status");
+        assert_eq!(st.status, update::STATUS_IDLE, "{ctx}: {st:?}");
+        assert_eq!(st.current_version, "0.9.0", "{ctx}");
+        assert_eq!(
+            update::current_release_version(root).as_deref(),
+            Some("0.9.0"),
+            "{ctx}"
+        );
+    }
+
+    #[test]
+    fn update_apply_file_restart_survives_the_replaced_agent() {
+        apply_while_replaced_agent_is_mid_cycle("--file", HeldIn::Whoami);
+        apply_while_replaced_agent_is_mid_cycle("--file", HeldIn::Inventory);
+    }
+
+    #[test]
+    fn update_apply_manifest_url_restart_survives_the_replaced_agent() {
+        apply_while_replaced_agent_is_mid_cycle("--manifest-url", HeldIn::Whoami);
+        apply_while_replaced_agent_is_mid_cycle("--manifest-url", HeldIn::Inventory);
+    }
+
+    /// The online `update apply` (heartbeat desired version) had the same race.
+    #[test]
+    fn update_apply_online_survives_the_replaced_agent() {
+        apply_while_replaced_agent_is_mid_cycle("online", HeldIn::Whoami);
+        apply_while_replaced_agent_is_mid_cycle("online", HeldIn::Inventory);
     }
 
     #[test]
