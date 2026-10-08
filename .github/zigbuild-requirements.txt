@@ -1,0 +1,14 @@
+# cargo-zigbuild and the zig it drives, for the aarch64 release binary
+# (scripts/build-release.sh). Build tooling only: nothing from it ships.
+#
+# Exact versions, with the binary-wheel hashes for x86_64 and aarch64
+# runners. The release build (release.yml) and the pull-request build
+# (rust.yml) both install from this file, so they cannot drift apart:
+#   pip install --require-hashes --only-binary :all: -r .github/zigbuild-requirements.txt
+# Bump it deliberately.
+ziglang==0.17.0 \
+  --hash=sha256:97079827064a7492cce5541ceb438ae8003ce1e54e399676da2d62fb7a5dc08b \
+  --hash=sha256:d2804f94f54f7fcf8169f4b212a619ad688a4e2e6592e976f0cf2e58e2cd8af3
+cargo-zigbuild==0.23.4 \
+  --hash=sha256:0a149a2a07b9513d422efa9cc23e1add9741f08abe86845fa418eaeb4cca7931 \
+  --hash=sha256:9f848addf9ca16e8df52b4a86eb41f7555bb4205aea117ad521f501a307129f5

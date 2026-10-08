@@ -1,12 +1,15 @@
 //! `scripts/build-release.sh`: one-shot build+sign, the split CI modes
-//! (BUILD_ONLY / SIGN_ONLY / VERIFY_ONLY), the allowlisted tarball, and
-//! manifests that devices accept (`update::verify_manifest`).
+//! (BUILD_ONLY / SIGN_ONLY / VERIFY_ONLY), the allowlisted tarball, a binary
+//! that runs on the glibc floor, versions as devices judge them, and
+//! manifests that devices accept (`update::verify_manifest`); and the
+//! workflows that run it pin their actions and tools.
 //!
 //! The script runs from a throwaway copy of a small repo with a fake `cargo`
 //! (`metadata` reports the target dir as cargo would; `zigbuild` records its
-//! environment and writes a stand-in binary that prints
-//! `vesyl-print <version>`), a fake `qemu-aarch64`, tripwires that fail the
-//! test if Python ever runs, and throwaway Ed25519 keys made with openssl.
+//! environment and arguments and writes a stand-in binary that prints
+//! `vesyl-print <version>`), a fake `qemu-aarch64`, a fake `readelf` that
+//! lists the glibc versions a test asks for, tripwires that fail the test if
+//! Python ever runs, and throwaway Ed25519 keys made with openssl.
 
 mod common;
 
@@ -17,7 +20,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use vesyl_print::update::{sha256_file, verify_manifest, ReleaseManifest};
+use vesyl_print::update::{is_version, sha256_file, verify_manifest, ReleaseManifest};
 use vesyl_print::JsonObject;
 
 use common::{
@@ -38,6 +41,7 @@ case "$1" in
     ;;
   zigbuild)
     env > "$FAKE_CARGO_ENV"
+    printf '%s\n' "$@" > "$FAKE_CARGO_ENV.args"
     [ -n "${FAKE_CARGO_NO_OUTPUT:-}" ] && exit 0
     out="${CARGO_TARGET_DIR:-$PWD/target}/aarch64-unknown-linux-gnu/release"
     mkdir -p "$out"
@@ -54,6 +58,26 @@ esac
 
 /// `qemu-aarch64 -L <sysroot> <binary> [args]`: run the (shell script) binary.
 const FAKE_QEMU: &str = "#!/bin/sh\n[ \"$1\" = \"-L\" ] || exit 98\nshift 2\nexec \"$@\"\n";
+
+/// The glibc versions the real aarch64 release binary needs, as `readelf -V`
+/// lists them (cargo-zigbuild for `aarch64-unknown-linux-gnu.2.31`).
+const REAL_GLIBC_NEEDS: &str = "2.17 2.18 2.25 2.28 2.29 2.30";
+
+/// `readelf -V <binary>`, in GNU readelf's layout: a version-needs entry for
+/// each glibc version in `$FAKE_GLIBC` (unset: [`REAL_GLIBC_NEEDS`]; empty:
+/// none).
+const FAKE_READELF: &str = r#"#!/bin/sh
+[ "$1" = "-V" ] && [ -f "$2" ] || { echo "fake readelf: unexpected: $*" >&2; exit 99; }
+echo "Version needs section '.gnu.version_r' contains 2 entries:"
+echo "  000000: Version: 1  File: libgcc_s.so.1  Cnt: 1"
+echo "  0x0010:   Name: GCC_4.2.0  Flags: none  Version: 2"
+echo "  0x0020: Version: 1  File: libc.so.6  Cnt: 6"
+n=3
+for v in ${FAKE_GLIBC-__REAL__}; do
+  echo "  0x00${n}0:   Name: GLIBC_$v  Flags: none  Version: $n"
+  n=$((n + 1))
+done
+"#;
 
 /// Everything SIGN_ONLY / VERIFY_ONLY may run (besides bash builtins).
 const SIGN_TOOLS: &[&str] = &[
@@ -82,6 +106,7 @@ const TRIPWIRES: &[&str] = &[
     "pip",
     "pip3",
     "uname",
+    "readelf",
     "python3",
     "python",
 ];
@@ -224,6 +249,10 @@ impl Fixture {
         write_exe(&fakebin.join("cargo"), FAKE_CARGO);
         write_exe(&fakebin.join("cargo-zigbuild"), "#!/bin/sh\nexit 0\n");
         write_exe(&fakebin.join("qemu-aarch64"), FAKE_QEMU);
+        write_exe(
+            &fakebin.join("readelf"),
+            &FAKE_READELF.replace("__REAL__", REAL_GLIBC_NEEDS),
+        );
         let tripwire_log = tmp.join("tripwire.log");
         for python in ["python3", "python"] {
             write_exe(
@@ -337,6 +366,10 @@ impl Fixture {
 
     fn verify_only(&self, extra: &[(&str, &str)]) -> Run {
         self.run_sandboxed("VERIFY_ONLY", &[VERSION], extra)
+    }
+
+    fn verify_only_version(&self, version: &str) -> Run {
+        self.run_sandboxed("VERIFY_ONLY", &[version], &[])
     }
 
     fn assert_no_tripwire(&self) {
@@ -461,6 +494,16 @@ impl Fixture {
             .unwrap()
             .lines()
             .find_map(|l| l.strip_prefix(&format!("{name}=")).map(str::to_string))
+    }
+
+    /// The arguments the (fake) cargo build ran with.
+    fn cargo_args(&self) -> Vec<String> {
+        let args = format!("{}.args", path_str(&self.cargo_env));
+        fs::read_to_string(args)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     fn assert_key_never_reached_cargo(&self) {
@@ -884,6 +927,89 @@ fn release_below_min_agent_version_is_refused() {
     }
 }
 
+/// The refusal never suggests bumping `VERSION`: bumped before the tag, a
+/// build numbered like the release would block it (OTA_UPDATES.md §4.8).
+/// A checkout's VERSION below the floor points at the argument instead.
+#[test]
+fn version_below_the_floor_says_how_to_number_the_build() {
+    let f = fixture!();
+    write(&f.repo.join("VERSION"), "0.3.17\n");
+    let r = f.run(&[], &[("BUILD_ONLY", "1")]);
+    assert_eq!(r.code, Some(1), "{}", r.log());
+    for want in [
+        "version 0.3.17 from the VERSION file is below MIN_AGENT_VERSION 0.4.0",
+        "Give the version to build as the argument (see OTA_UPDATES.md §4.8)",
+    ] {
+        assert!(r.stderr.contains(want), "{want}\n{}", r.log());
+    }
+    let r2 = f.run(&["0.3.18"], &[("BUILD_ONLY", "1")]);
+    assert_eq!(r2.code, Some(1), "{}", r2.log());
+    assert!(
+        r2.stderr
+            .contains("version 0.3.18 is below MIN_AGENT_VERSION 0.4.0")
+            && r2.stderr.contains("OTA_UPDATES.md §4.8")
+            && !r2.stderr.contains("VERSION file"),
+        "{}",
+        r2.log()
+    );
+    for r in [&r, &r2] {
+        assert!(!r.stderr.contains("bump VERSION"), "{}", r.log());
+    }
+    assert!(!f.cargo_env.exists(), "built below the floor");
+}
+
+/// Names the version check must judge as update.rs `is_version` does
+/// (ASCII only: the script runs in the C locale).
+const VERSION_CANDIDATES: &[&str] = &[
+    "0.9.1",
+    "10.20.30",
+    "0.9.1-rc.1",
+    "0.9.1.lab",
+    "0.9.1-staging",
+    "0.9.1.staging",
+    "0.9.1-rc.staging",
+    "0.9.1-rc.1.staging",
+    "0.9.1.staging.2",
+    "0.9.1..",
+    "0.9.1.",
+    "0.9.1-",
+    "0.9",
+    "0.9.1+build.5",
+    "0.9.1/x",
+    "../0.9.1",
+    "a.b.c",
+];
+
+/// The script accepts exactly the versions devices accept: a release named
+/// `X.Y.Z.staging` would be rejected by every device's manifest check
+/// (`ReleaseManifest::from_dict`), and its slot would be another
+/// version's staging dir.
+#[test]
+fn version_check_matches_update_rs_is_version() {
+    let f = fixture!();
+    for &v in VERSION_CANDIDATES {
+        // VERIFY_ONLY with nothing built: a valid version gets as far as
+        // looking for its tarball.
+        let r = f.verify_only_version(v);
+        assert_eq!(r.code, Some(1), "{v:?}: {}", r.log());
+        let refused = r.stderr.contains(&format!("invalid version: {v}\n"));
+        let looked = r.stderr.contains("VERIFY_ONLY=1: missing");
+        assert!(refused != looked, "{v:?}: {}", r.log());
+        assert_eq!(refused, !is_version(v), "{v:?}: {}", r.log());
+    }
+    let r = f.run(
+        &[VERSION],
+        &[("BUILD_ONLY", "1"), ("MIN_AGENT_VERSION", "0.4.0.staging")],
+    );
+    assert!(
+        r.stderr
+            .contains("invalid MIN_AGENT_VERSION: 0.4.0.staging"),
+        "{}",
+        r.log()
+    );
+    assert!(!f.cargo_env.exists());
+}
+
 /// Non-ASCII and escapes in a signed field: jq's canonical bytes (signer)
 /// must equal update.rs ReleaseManifest::canonical_bytes (device).
 const TRICKY: &str = "Caf\u{e9} \u{2014} \u{201c}quotes\u{201d} \u{1f680} \\ \" / \
@@ -1024,6 +1150,124 @@ fn without_qemu_the_version_string_must_be_in_the_binary() {
         "{}",
         r.log()
     );
+}
+
+/// CI installs qemu-user and the aarch64 sysroot: there, a binary the
+/// script could not run fails the build instead of passing on a grep.
+#[test]
+fn in_ci_the_packaged_binary_must_run() {
+    if std::env::consts::ARCH == "aarch64" {
+        return; // aarch64 hosts run the binary
+    }
+    let f = fixture!();
+    let no_sysroot = path_str(&f.tmp.join("no-sysroot")).to_string();
+    let r = f.run(
+        &[VERSION],
+        &[
+            ("BUILD_ONLY", "1"),
+            ("CI", "true"),
+            ("AARCH64_SYSROOT", &no_sysroot),
+        ],
+    );
+    assert_eq!(r.code, Some(1), "{}", r.log());
+    assert!(
+        r.stderr
+            .contains("cannot run the packaged binary: CI needs qemu-aarch64"),
+        "{}",
+        r.log()
+    );
+    assert!(!f.tarball().exists());
+    let r = f.run(&[VERSION], &[("BUILD_ONLY", "1"), ("CI", "true")]);
+    assert!(r.ok(), "{}", r.log());
+    assert!(
+        r.stdout
+            .contains(&format!("version: vesyl-print {VERSION}\n")),
+        "{}",
+        r.log()
+    );
+}
+
+/// The binary is linked for the glibc floor, and a binary that needs a newer
+/// glibc symbol (which the build host's newer sysroot would still run) is
+/// never packaged: a device on the floor could not start it.
+#[test]
+fn binary_must_not_need_a_glibc_newer_than_the_floor() {
+    let f = fixture!();
+    f.build_only();
+    let args = f.cargo_args();
+    assert!(
+        args.windows(2)
+            .any(|w| w == ["--target", "aarch64-unknown-linux-gnu.2.31"]),
+        "{args:?}"
+    );
+    for (needs, newest) in [
+        (REAL_GLIBC_NEEDS, "2.30"),
+        ("2.17 2.31", "2.31"),
+        // Numeric, not lexicographic: 2.4 is older than 2.31.
+        ("2.17 2.4 2.31 2.9", "2.31"),
+        ("2.3.4 2.17", "2.17"),
+    ] {
+        let r = f.run(&[VERSION], &[("BUILD_ONLY", "1"), ("FAKE_GLIBC", needs)]);
+        assert!(r.ok(), "{needs}: {}", r.log());
+        assert!(
+            r.stdout
+                .contains(&format!("glibc:   needs at most {newest} (floor 2.31)\n")),
+            "{needs}: {}",
+            r.log()
+        );
+    }
+    for (needs, want) in [
+        (
+            "2.17 2.32",
+            "needs glibc 2.32, newer than the 2.31 floor (not built for aarch64-unknown-linux-gnu.2.31?)",
+        ),
+        ("2.17 2.34 2.28", "needs glibc 2.34, newer than the 2.31 floor"),
+        ("2.17 3.0", "needs glibc 3.0, newer than the 2.31 floor"),
+        ("", "needs no GLIBC_ symbol version"),
+    ] {
+        let r = f.run(
+            &[VERSION],
+            &[("BUILD_ONLY", "1"), ("FAKE_GLIBC", needs)],
+        );
+        assert_eq!(r.code, Some(1), "{needs:?}: {}", r.log());
+        assert!(r.stderr.contains(want), "{needs:?}: {}", r.log());
+        assert!(!f.tarball().exists(), "{needs:?}: packaged anyway");
+    }
+}
+
+/// The floor check needs readelf (binutils): a machine without it is told
+/// before the build, which takes minutes, not after it.
+#[test]
+fn without_readelf_the_build_never_starts() {
+    let f = fixture!();
+    // The fake toolchain and the host tools the script runs, but no readelf.
+    let bin = f.tmp.join("no-binutils");
+    fs::create_dir(&bin).unwrap();
+    for tool in BUILD_TOOLS.iter().chain(SIGN_TOOLS).chain(&["chmod"]) {
+        symlink(which(tool).unwrap(), bin.join(tool)).unwrap();
+    }
+    for entry in fs::read_dir(&f.fakebin).unwrap() {
+        let name = entry.unwrap().file_name();
+        if name != "readelf" {
+            symlink(f.fakebin.join(&name), bin.join(&name)).unwrap();
+        }
+    }
+    let script = f.repo.join("scripts/build-release.sh");
+    let r = run(
+        &which("bash").unwrap(),
+        &f.script_args(path_str(&script), &[VERSION]),
+        &f.env(path_str(&bin).to_string(), &[("BUILD_ONLY", "1")]),
+    );
+    f.assert_no_tripwire();
+    assert_eq!(r.code, Some(1), "{}", r.log());
+    assert!(
+        r.stderr
+            .contains("readelf not found (binutils): it checks the binary's glibc floor"),
+        "{}",
+        r.log()
+    );
+    assert!(!f.cargo_env.exists(), "cargo zigbuild ran: {}", r.log());
+    assert!(!f.tarball().exists());
 }
 
 // --- split CI modes ---------------------------------------------------------------
@@ -1356,4 +1600,77 @@ fn shipped_scripts_are_executable() {
             .mode();
         assert_ne!(mode & 0o111, 0, "{rel} must be executable");
     }
+}
+
+// --- the workflows that run it ----------------------------------------------------
+
+/// The release (release.yml) and pull-request (rust.yml, lcd.yml) workflows
+/// pin every action to a commit SHA, the same one in all of them; keep the
+/// default token read-only and out of .git/config, where build scripts and
+/// proc-macros could read it; and install cargo-zigbuild only from the one
+/// hash-pinned requirements file, so the release build and the pull-request
+/// build cannot drift apart.
+#[test]
+fn workflows_pin_their_tools_and_keep_the_token_read_only() {
+    let workflows = repo_root().join(".github/workflows");
+    let uses = regex::Regex::new(r"^\s*(?:- )?uses:\s*([^@\s]+)@(\S+)").unwrap();
+    let sha = regex::Regex::new(r"^[0-9a-f]{40}$").unwrap();
+    let mut pins: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut zigbuild_installs = BTreeSet::new();
+    for entry in fs::read_dir(&workflows).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "yml") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\npermissions:\n  contents: read\n"),
+            "{name}: no top-level `permissions: contents: read`"
+        );
+        assert!(!text.contains("ziglang=="), "{name} pins zig itself");
+        if text.contains("-r .github/zigbuild-requirements.txt") {
+            zigbuild_installs.insert(name.clone());
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(c) = uses.captures(line) else {
+                continue;
+            };
+            let (action, rev) = (c[1].to_string(), c[2].to_string());
+            assert!(
+                sha.is_match(&rev),
+                "{name}: {action}@{rev} is not a commit SHA"
+            );
+            if action == "actions/checkout" {
+                // The rest of the step: up to the next one.
+                let mut step = lines[i + 1..]
+                    .iter()
+                    .take_while(|l| !l.trim_start().starts_with("- "));
+                assert!(
+                    step.any(|l| l.trim() == "persist-credentials: false"),
+                    "{name}:{}: checkout keeps the token in .git/config",
+                    i + 1
+                );
+            }
+            pins.entry(action).or_default().insert(rev);
+        }
+    }
+    for (action, revs) in &pins {
+        assert_eq!(revs.len(), 1, "{action} pinned to different SHAs: {revs:?}");
+    }
+    assert!(pins.contains_key("actions/checkout"), "{pins:?}");
+    assert_eq!(
+        zigbuild_installs,
+        BTreeSet::from(["release.yml".to_string(), "rust.yml".to_string()])
+    );
+    let requirements =
+        fs::read_to_string(repo_root().join(".github/zigbuild-requirements.txt")).unwrap();
+    for pin in ["ziglang==", "cargo-zigbuild=="] {
+        assert!(requirements.contains(pin), "{pin}\n{requirements}");
+    }
+    assert!(
+        requirements.matches("--hash=sha256:").count() >= 4,
+        "{requirements}"
+    );
 }

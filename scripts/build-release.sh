@@ -37,16 +37,19 @@
 #   OUT_DIR                  output directory (default: dist)
 #   AARCH64_SYSROOT          aarch64 glibc root for qemu-aarch64
 #                            (default: /usr/aarch64-linux-gnu)
+#   CI                       set on CI runners: the packaged binary must run
+#                            (no fallback to finding the version string)
 #
 # The tarball holds the vesyl-print binary (Rust agent + CLI) at its root, the
 # Python LCD display (*.py), assets, and the files setup.sh needs to provision
 # a device from the extracted tree. It never holds rust/, tests/ or secrets.
 # The binary is cross-compiled for aarch64 (glibc >= 2.31) with cargo-zigbuild
 # from cargo's own target directory (CARGO_TARGET_DIR and build.target-dir are
-# honoured), after any previous build there is deleted, and it must report
-# $VERSION: it is run on an aarch64 host, or under qemu-aarch64 when an aarch64
-# sysroot is installed (Debian/Ubuntu: qemu-user + libc6-arm64-cross);
-# elsewhere the version string must at least be in it.
+# honoured), after any previous build there is deleted. It must need no glibc
+# symbol version newer than 2.31 (readelf -V, from binutils), and it must
+# report $VERSION: it is run on an aarch64 host, or under qemu-aarch64 when an
+# aarch64 sysroot is installed (Debian/Ubuntu: qemu-user + libc6-arm64-cross);
+# elsewhere, outside CI, the version string must at least be in it.
 #
 # The signature is Ed25519 over the manifest's canonical JSON: every field but
 # "signature" and nulls, keys sorted, compact, non-ASCII escaped as \uXXXX
@@ -68,13 +71,21 @@ die() {
 }
 
 VERSION="${1:-}"
+VERSION_FROM="argument"
 if [[ -z "$VERSION" ]]; then
   VERSION="$(tr -d '[:space:]' < VERSION)"
+  VERSION_FROM="VERSION file"
 fi
 VERSION="${VERSION#v}"
-# Same pattern as update.rs is_version and scripts/apply-update.
+# A release version, checked as update.rs is_version (and scripts/apply-update,
+# setup.sh) checks it: this pattern, with a last dot-component of "staging"
+# refused, since <version>.staging is the directory an interrupted extract
+# leaves beside its slot.
 VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'
-[[ "$VERSION" =~ $VERSION_RE ]] || die "invalid version: $VERSION"
+is_version() {
+  [[ "$1" =~ $VERSION_RE && "$1" != *.staging ]]
+}
+is_version "$VERSION" || die "invalid version: $VERSION"
 
 BUILD_ONLY="${BUILD_ONLY:-}"
 SIGN_ONLY="${SIGN_ONLY:-}"
@@ -121,13 +132,20 @@ version_core_ge() {
 }
 
 if [[ "$VERIFY_ONLY" != "1" ]]; then
-  [[ "$MIN_AGENT_VERSION" =~ $VERSION_RE ]] ||
+  is_version "$MIN_AGENT_VERSION" ||
     die "invalid MIN_AGENT_VERSION: $MIN_AGENT_VERSION"
   # A device running this release must be able to install the next one.
-  version_core_ge "$VERSION" "$MIN_AGENT_VERSION" ||
-    die "version $VERSION is below MIN_AGENT_VERSION $MIN_AGENT_VERSION: devices" \
-      "running it could never update over OTA again (bump VERSION, or set" \
-      "MIN_AGENT_VERSION to the first Rust-only release)"
+  # Never suggest bumping VERSION: done before the release is tagged, that is
+  # a trap of its own (OTA_UPDATES.md §4.8).
+  if ! version_core_ge "$VERSION" "$MIN_AGENT_VERSION"; then
+    [[ "$VERSION_FROM" == "VERSION file" ]] ||
+      die "version $VERSION is below MIN_AGENT_VERSION $MIN_AGENT_VERSION: devices" \
+        "running it could never update over OTA again (see OTA_UPDATES.md §4.8" \
+        "for how to number a build)"
+    die "version $VERSION from the VERSION file is below MIN_AGENT_VERSION" \
+      "$MIN_AGENT_VERSION: devices running it could never update over OTA again." \
+      "Give the version to build as the argument (see OTA_UPDATES.md §4.8)"
+  fi
 fi
 
 mkdir -p "$OUT_DIR"
@@ -216,6 +234,10 @@ if [[ -n "$KEY_FILE" && -n "${UPDATE_PUBLIC_KEY_FILE:-}" && ! -f "$UPDATE_PUBLIC
 fi
 
 RUST_TARGET="aarch64-unknown-linux-gnu"
+# The newest glibc the binary may need (Debian bullseye's): cargo-zigbuild
+# links against this version's symbols, and the packaged binary is checked
+# against it.
+GLIBC_FLOOR="2.31"
 
 # Runtime files, relative to the repo root (rsync filter rules, first match
 # wins). Everything else stays out: rust/, tests/, .github/, keys other than
@@ -278,16 +300,59 @@ check_binary_version() {
       die "packaged binary reports '$out', expected '$want' (stale build?)"
     echo "   version: $out"
   else
+    # CI runners install both, so there a binary that was not run fails.
+    [[ -z "${CI:-}" ]] ||
+      die "cannot run the packaged binary: CI needs qemu-aarch64 and an aarch64" \
+        "sysroot at $sysroot (Debian/Ubuntu: qemu-user + libc6-arm64-cross)"
     grep -aqF -- "$VERSION" "$bin" ||
       die "packaged binary does not contain version $VERSION (stale build?)"
     echo "   version: contains $VERSION (not run: needs an aarch64 host, or qemu-aarch64 + $sysroot)"
   fi
 }
 
+# glibc_le A B: glibc version A (2.17, 2.3.4, ...) is not newer than B.
+glibc_le() {
+  local -a a b
+  local i
+  IFS=. read -r -a a <<<"$1"
+  IFS=. read -r -a b <<<"$2"
+  for i in 0 1 2; do
+    if ((10#${a[i]:-0} != 10#${b[i]:-0})); then
+      ((10#${a[i]:-0} < 10#${b[i]:-0}))
+      return
+    fi
+  done
+}
+
+# The packaged binary must need no glibc symbol version newer than
+# $GLIBC_FLOOR. The qemu run cannot show that: the build host's aarch64
+# sysroot is usually newer than the oldest supported device.
+check_glibc_floor() {
+  local bin="$1" needs v newest=""
+  needs="$(readelf -V "$bin")" || die "readelf -V $bin failed"
+  while read -r v; do
+    v="${v#GLIBC_}"
+    if [[ -z "$newest" ]] || ! glibc_le "$v" "$newest"; then
+      newest="$v"
+    fi
+  done < <(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' <<<"$needs")
+  [[ -n "$newest" ]] ||
+    die "packaged binary needs no GLIBC_ symbol version (not linked against glibc?)"
+  glibc_le "$newest" "$GLIBC_FLOOR" ||
+    die "packaged binary needs glibc $newest, newer than the $GLIBC_FLOOR floor" \
+      "(not built for ${RUST_TARGET}.${GLIBC_FLOOR}?)"
+  echo "   glibc:   needs at most $newest (floor $GLIBC_FLOOR)"
+}
+
 build_rust_binary() {
   command -v cargo-zigbuild >/dev/null 2>&1 ||
-    die "cargo-zigbuild not found: install it with zig (pip install ziglang" \
-      "cargo-zigbuild, or cargo install --locked cargo-zigbuild plus zig on PATH)"
+    die "cargo-zigbuild not found: install it with zig (the versions CI pins:" \
+      "pip install --require-hashes -r .github/zigbuild-requirements.txt; or" \
+      "cargo install --locked cargo-zigbuild plus zig on PATH)"
+  # Needed only once the binary is built, but checked before the build,
+  # which takes minutes.
+  command -v readelf >/dev/null 2>&1 ||
+    die "readelf not found (binutils): it checks the binary's glibc floor"
   # Package exactly what this build produces: ask cargo where its target dir
   # is, pin that for the build, and delete the previous artifact there.
   local target_dir built
@@ -297,15 +362,16 @@ build_rust_binary() {
   export CARGO_TARGET_DIR="$target_dir"
   built="$CARGO_TARGET_DIR/$RUST_TARGET/release/vesyl-print"
   rm -f "$built"
-  echo "==> Building vesyl-print binary ($RUST_TARGET, glibc 2.31) in $CARGO_TARGET_DIR"
+  echo "==> Building vesyl-print binary ($RUST_TARGET, glibc $GLIBC_FLOOR) in $CARGO_TARGET_DIR"
   (
     cd "$REPO_ROOT/rust"
     VESYL_PRINT_VERSION="$VERSION" cargo zigbuild --release --locked \
-      --target "${RUST_TARGET}.2.31"
+      --target "${RUST_TARGET}.${GLIBC_FLOOR}"
   )
   [[ -f "$built" ]] || die "cargo did not produce $built"
   install -m 0755 "$built" "$STAGE_TREE/vesyl-print"
   echo "   binary: $(du -h "$STAGE_TREE/vesyl-print" | cut -f1)"
+  check_glibc_floor "$STAGE_TREE/vesyl-print"
   check_binary_version "$STAGE_TREE/vesyl-print"
 }
 

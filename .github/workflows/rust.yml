@@ -2,11 +2,17 @@
 # changes to what the tests read: the scripts they drive
 # (scripts/build-release.sh, scripts/apply-update, setup.sh's preflight with
 # the helpers it installs), the files a release tarball must carry, the
-# ActionCable fixtures and the release public key. The script tests use bash,
-# grep, sed, jq, rsync and openssl from the runner image.
+# ActionCable fixtures, the release public key and the workflows. The script
+# tests use bash, grep, sed, jq, rsync and openssl from the runner image; the
+# PDF rendering tests need pdftoppm and gs, installed below.
 #
-# Actions are pinned to the same commit SHAs as release.yml; bump them
-# together.
+# The aarch64 job builds what a release ships, on every change: the binary
+# for the Pi, linked for glibc 2.31 and run under qemu-user, so an
+# aarch64-only compile error or a newer glibc symbol fails here and not at
+# the release tag.
+#
+# Actions are pinned to the same commit SHAs as release.yml, and cargo-zigbuild
+# to the same wheels (.github/zigbuild-requirements.txt); bump them together.
 name: Rust
 
 on:
@@ -24,7 +30,8 @@ on:
       - "VERSION"
       - "keys/update_public.pem"
       - "tests/fixtures/**"
-      - ".github/workflows/rust.yml"
+      - ".github/workflows/**"
+      - ".github/zigbuild-requirements.txt"
   pull_request:
     paths:
       - "rust/**"
@@ -38,7 +45,8 @@ on:
       - "VERSION"
       - "keys/update_public.pem"
       - "tests/fixtures/**"
-      - ".github/workflows/rust.yml"
+      - ".github/workflows/**"
+      - ".github/zigbuild-requirements.txt"
 
 permissions:
   contents: read
@@ -53,6 +61,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      # zpl.rs's PDF tests run against every rasterizer on PATH and skip
+      # without one: install both (pdfinfo comes with poppler-utils).
+      - name: Install PDF renderers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils ghostscript
+          pdftoppm -v 2>&1 | head -1
+          gs --version
 
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
@@ -71,3 +88,70 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  aarch64:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # As in release.yml: qemu-user + the aarch64 glibc run the binary,
+      # binutils' readelf checks its glibc floor.
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq rsync binutils qemu-user libc6-arm64-cross
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust
+
+      # Build tooling only, as in release.yml: exact versions and wheel
+      # hashes, in a venv (the runner's system Python is externally managed).
+      - name: Install cargo-zigbuild
+        working-directory: .
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet --require-hashes --only-binary :all: \
+            -r .github/zigbuild-requirements.txt
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+
+      # Every target, tests included (they are not part of the release
+      # build); zig compiles ring's C code for aarch64.
+      - name: Clippy (aarch64)
+        run: cargo-zigbuild clippy --all-targets --locked --target aarch64-unknown-linux-gnu -- -D warnings
+
+      # The tag's build job, unsigned and with a throwaway version: the
+      # binary is linked for glibc 2.31, must need no newer glibc symbol and
+      # must print its version under qemu-aarch64 (CI is set, so a binary
+      # that cannot run fails), and the tarball gets every runtime file. The
+      # MIN_AGENT_VERSION floor is the tag's concern; build_release.rs tests it.
+      - name: Build the release tarball (aarch64, unsigned)
+        working-directory: .
+        env:
+          BUILD_ONLY: "1"
+          MIN_AGENT_VERSION: "0.0.0"
+          OUT_DIR: ${{ runner.temp }}/dist
+        run: ./scripts/build-release.sh 0.0.0-ci
+
+      # The library's unit tests on aarch64, under qemu-user with the
+      # aarch64 glibc. Two tests re-run the test binary itself, which needs
+      # binfmt_misc on the runner; they gain nothing on aarch64 and are
+      # skipped.
+      - name: Unit tests (aarch64, qemu)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+        run: |
+          cargo-zigbuild test --lib --locked --target aarch64-unknown-linux-gnu.2.31 -- \
+            --skip cloud::tests::proxy_env_rules_match_urllib \
+            --skip net::tests::requests_start_no_threads

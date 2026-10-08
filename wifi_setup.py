@@ -461,16 +461,33 @@ def stop_portal() -> None:
             pass
 
 
+def portal_script() -> Path | None:
+    """The ``wifi_portal.py`` of this module's own release.
+
+    The root helper imports this module from ``<install root>/current``, so
+    the portal beside it is the same release's, whatever the install root.
+    Fallback: the directory it was imported through (``current``), should
+    the slot it resolves to have lost it. Never a fixed path, which could be
+    a stale tree under another install root.
+    """
+    here = Path(__file__)
+    for script in (
+        here.resolve().parent / "wifi_portal.py",
+        here.absolute().parent / "wifi_portal.py",
+    ):
+        if script.is_file():
+            return script
+    return None
+
+
 def spawn_portal(ap_ip: str, *, port: int = 80) -> None:
     """Launch wifi_portal.py on the AP address (root / helper path)."""
     stop_portal()
     ip = (ap_ip or "").strip()
     if not ip or ip in ("0.0.0.0", "::"):
         return
-    script = Path("/opt/vesyl-print/current/wifi_portal.py")
-    if not script.is_file():
-        script = Path(__file__).resolve().parent / "wifi_portal.py"
-    if not script.is_file():
+    script = portal_script()
+    if script is None:
         log.warning("wifi_portal.py missing — LCD QR still works")
         return
     try:
