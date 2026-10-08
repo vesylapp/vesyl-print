@@ -1,10 +1,16 @@
-"""Wi-Fi setup policy, QR payload, helper CLI, portal parse."""
+"""Wi-Fi setup policy, QR payload, helper CLI, portal parse and spawn."""
 
 from __future__ import annotations
 
+import importlib.util
 import io
+import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,7 +23,122 @@ import wifi_portal
 import wifi_setup
 
 
-class PayloadTests(unittest.TestCase):
+def _no_command(*args, **kwargs):
+    argv = args[0] if args else kwargs.get("args")
+    raise AssertionError(f"a test ran a real command: {argv!r}")
+
+
+def _subprocess_stand_in(**overrides):
+    """``subprocess`` as wifi_setup and wifi_portal see it in a test: running
+    anything fails the test, unless the test brings its own ``Popen``."""
+    fields = {
+        "run": _no_command,
+        "Popen": _no_command,
+        "DEVNULL": subprocess.DEVNULL,
+        "SubprocessError": subprocess.SubprocessError,
+        "TimeoutExpired": subprocess.TimeoutExpired,
+    }
+    fields.update(overrides)
+    return types.SimpleNamespace(**fields)
+
+
+class Sandboxed(unittest.TestCase):
+    """Base of every test here: nothing reaches the machine's network setup.
+
+    Run as root (sudo on a Pi, a root CI container), the helper's code would
+    write the captive-portal snippet into the real NetworkManager config (a
+    DNS sinkhole for the whole host), the setup state and portal pid under
+    /run, and iptables NAT rules. Here those files live in a temp dir, set
+    both in the environment and as the module defaults (so a test that
+    clears the environment is covered too), iptables calls are recorded,
+    and running any other command fails the test.
+    """
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.sandbox = Path(tmp.name)
+        self.captive_dns = self.sandbox / "vesyl-captive.conf"
+        self.state_file = self.sandbox / "wifi-setup.json"
+        self.portal_pid = self.sandbox / "wifi-portal.pid"
+        self.iptables: list[list[str]] = []
+
+        def iptables(args):
+            self.iptables.append(args)
+            return 1  # as for a rule that is not there: ends the -D loops
+
+        env = {
+            "VESYL_CAPTIVE_DNS": str(self.captive_dns),
+            "VESYL_WIFI_STATE": str(self.state_file),
+            "VESYL_WIFI_PORTAL_PID": str(self.portal_pid),
+        }
+        for patcher in (
+            mock.patch.dict(os.environ, env),
+            mock.patch.multiple(
+                wifi_setup,
+                CAPTIVE_DNS_FILE=self.captive_dns,
+                SETUP_STATE_FILE=self.state_file,
+                PORTAL_PID=self.portal_pid,
+                _iptables=iptables,
+                subprocess=_subprocess_stand_in(),
+            ),
+            mock.patch.object(wifi_portal, "subprocess", _subprocess_stand_in()),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def nat_rules_added(self) -> list[list[str]]:
+        return [a for a in self.iptables if "-A" in a]
+
+
+# Captured before any test patches them.
+REAL_FILES = (
+    wifi_setup.CAPTIVE_DNS_FILE,
+    wifi_setup.SETUP_STATE_FILE,
+    wifi_setup.PORTAL_PID,
+)
+
+
+class IsolationTests(Sandboxed):
+    def test_every_test_class_here_is_sandboxed(self):
+        for name, obj in vars(sys.modules[__name__]).items():
+            if (
+                isinstance(obj, type)
+                and issubclass(obj, unittest.TestCase)
+                and obj.__module__ == __name__
+            ):
+                self.assertTrue(issubclass(obj, Sandboxed), name)
+
+    def test_the_defaults_point_into_the_sandbox_without_the_environment(self):
+        self.assertEqual(
+            [str(p) for p in REAL_FILES],
+            [
+                "/etc/NetworkManager/dnsmasq-shared.d/vesyl-captive.conf",
+                "/run/vesyl-print-wifi-setup.json",
+                "/run/vesyl-print-wifi-portal.pid",
+            ],
+        )
+        with mock.patch.dict(os.environ):
+            for key in ("VESYL_CAPTIVE_DNS", "VESYL_WIFI_STATE", "VESYL_WIFI_PORTAL_PID"):
+                del os.environ[key]
+            dest = wifi_setup.write_captive_dns(wifi_setup.DEFAULT_AP_IP)
+            wifi_setup.save_setup_state(ssid="VESYL-X")
+            wifi_setup.stop_portal()
+        self.assertEqual(dest, self.captive_dns)
+        self.assertIn("address=/#/10.42.0.1", dest.read_text(encoding="ascii"))
+        self.assertEqual(json.loads(self.state_file.read_text())["ssid"], "VESYL-X")
+
+    def test_a_test_that_forgets_its_fakes_runs_nothing(self):
+        with self.assertRaisesRegex(AssertionError, "ran a real command: .*nmcli"):
+            wifi_setup.first_wifi_device()
+        with self.assertRaisesRegex(AssertionError, "ran a real command: .*sudo"):
+            wifi_setup.WifiSetupController().tick(now_mono=1.0)
+        wifi_setup.clear_captive_redirects("wlan0")
+        self.assertEqual(len(self.iptables), 3)
+
+
+class PayloadTests(Sandboxed):
     def test_ssid_from_hostname(self):
         self.assertEqual(
             wifi_setup.setup_ssid("VESYL-PRINT-D2D071"), "VESYL-D2D071"
@@ -41,7 +162,7 @@ class PayloadTests(unittest.TestCase):
         )
 
 
-class PolicyTests(unittest.TestCase):
+class PolicyTests(Sandboxed):
     def test_enter_only_when_no_uplink(self):
         self.assertFalse(
             wifi_setup.should_enter_setup(eth_up=True, wifi_site=False)
@@ -66,7 +187,7 @@ class PolicyTests(unittest.TestCase):
         )
 
 
-class HelperCliTests(unittest.TestCase):
+class HelperCliTests(Sandboxed):
     def test_status_and_start(self):
         calls: list[list[str]] = []
 
@@ -100,6 +221,14 @@ class HelperCliTests(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(data["ap_ip"], "10.42.0.1")
         self.assertTrue(any("hotspot" in c for c in calls))
+        # The captive-portal DNS snippet, NAT rules and setup state went to
+        # the sandbox, not to NetworkManager, iptables and /run.
+        self.assertEqual(
+            self.captive_dns.read_text(encoding="ascii"),
+            wifi_setup.captive_dns_config("10.42.0.1"),
+        )
+        self.assertEqual(len(self.nat_rules_added()), 3)
+        self.assertEqual(json.loads(self.state_file.read_text())["ssid"], "VESYL-X")
 
     def test_unknown_command(self):
         buf = io.StringIO()
@@ -108,7 +237,7 @@ class HelperCliTests(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
-class ControllerTests(unittest.TestCase):
+class ControllerTests(Sandboxed):
     def test_starts_when_no_uplink(self):
         calls: list[list[str]] = []
 
@@ -286,6 +415,10 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("Wrong password", out["error"])
         self.assertTrue(any("hotspot" in c for c in calls))
         self.assertIn("Wrong password", saved_err)
+        # Restoring the setup AP rewrote the captive-portal snippet and NAT
+        # rules: in the sandbox.
+        self.assertIn("address=/#/10.42.0.1", self.captive_dns.read_text(encoding="ascii"))
+        self.assertEqual(len(self.nat_rules_added()), 3)
 
     def test_connect_forgets_stale_profile_then_joins(self):
         import tempfile
@@ -346,7 +479,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(wifi_setup.connections_for_ssid(nm, "Cafe"), ["Cafe"])
 
 
-class CaptiveDetectTests(unittest.TestCase):
+class CaptiveDetectTests(Sandboxed):
     def test_dns_config_sinkholes_and_rfc8910(self):
         cfg = wifi_setup.captive_dns_config("10.42.0.1")
         self.assertIn("address=/#/10.42.0.1", cfg)
@@ -362,7 +495,7 @@ class CaptiveDetectTests(unittest.TestCase):
             self.assertIn("10.9.0.1", text)
 
 
-class PortalTests(unittest.TestCase):
+class PortalTests(Sandboxed):
     def test_parse_prefers_typed_ssid(self):
         body = b"ssid=Visible&ssid_other=Hidden+Net&password=s3cret"
         ssid, pw = wifi_portal.parse_connect_body(body)
@@ -487,6 +620,84 @@ class PortalTests(unittest.TestCase):
         finally:
             httpd.server_close()
             t.join(timeout=1)
+
+
+class PortalSpawnTests(Sandboxed):
+    """The root helper runs the portal of the release it imported
+    wifi_setup.py from, never a fixed path under the default install root."""
+
+    # Written to the sandbox pid file; stop_portal may signal it, so it must
+    # never be a real process.
+    FAKE_PID = 2**31 - 1
+
+    def record_spawns(self, module) -> list[list[str]]:
+        spawned: list[list[str]] = []
+
+        def popen(argv, **kwargs):
+            spawned.append(argv)
+            return types.SimpleNamespace(pid=self.FAKE_PID)
+
+        patcher = mock.patch.object(module, "subprocess", _subprocess_stand_in(Popen=popen))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return spawned
+
+    def load_copy(self, path: Path):
+        """wifi_setup loaded again from ``path``, as the helper imports it."""
+        name = f"wifi_setup_from_{path.parent.name}_{id(self)}"
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module  # dataclasses look the module up
+        self.addCleanup(sys.modules.pop, name, None)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_spawns_the_portal_beside_wifi_setup(self):
+        spawned = self.record_spawns(wifi_setup)
+        # As on a device moved to another INSTALL_ROOT: a stale tree is left
+        # under /opt/vesyl-print, and must not be what root runs.
+        real_is_file = Path.is_file
+
+        def is_file(path):
+            return str(path).startswith("/opt/vesyl-print/") or real_is_file(path)
+
+        with mock.patch.object(Path, "is_file", is_file):
+            wifi_setup.spawn_portal("10.42.0.1")
+        portal = str(ROOT / "wifi_portal.py")
+        self.assertEqual(
+            spawned,
+            [[sys.executable, portal, "--bind", "10.42.0.1", "--port", "80"]],
+        )
+        self.assertEqual(self.portal_pid.read_text(encoding="ascii"), str(self.FAKE_PID))
+
+    def test_falls_back_to_the_tree_it_was_imported_through(self):
+        # current/wifi_setup.py resolves into a slot that lacks the portal.
+        slot = self.sandbox / "releases" / "1.0.0"
+        current = self.sandbox / "current"
+        slot.mkdir(parents=True)
+        current.mkdir()
+        shutil.copy(ROOT / "wifi_setup.py", slot / "wifi_setup.py")
+        (current / "wifi_setup.py").symlink_to(slot / "wifi_setup.py")
+        (current / "wifi_portal.py").write_text("# portal\n", encoding="ascii")
+        copy = self.load_copy(current / "wifi_setup.py")
+        spawned = self.record_spawns(copy)
+        copy.spawn_portal("10.42.0.1", port=8088)
+        self.assertEqual(
+            spawned,
+            [[sys.executable, str(current / "wifi_portal.py"), "--bind", "10.42.0.1", "--port", "8088"]],
+        )
+
+    def test_without_a_portal_beside_it_nothing_is_spawned(self):
+        lone = self.sandbox / "lone"
+        lone.mkdir()
+        shutil.copy(ROOT / "wifi_setup.py", lone / "wifi_setup.py")
+        copy = self.load_copy(lone / "wifi_setup.py")
+        spawned = self.record_spawns(copy)
+        with self.assertLogs("vesyl-print.wifi", level="WARNING") as logs:
+            copy.spawn_portal("10.42.0.1")
+        self.assertEqual(spawned, [])
+        self.assertIn("wifi_portal.py missing", logs.output[0])
+        self.assertFalse(self.portal_pid.exists())
 
 
 if __name__ == "__main__":
