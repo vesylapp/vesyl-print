@@ -4,7 +4,8 @@
 //! rules). Redirects are handled here rather than by ureq: ureq drops
 //! `Authorization` on every hop, and the unauthenticated follow-up's 401 would
 //! make the agent delete its credentials. A URL in an error message is
-//! [`net::redact_url`]'s: no userinfo, query or fragment.
+//! [`net::redact_url`]'s: no userinfo, query or fragment; a redirect target
+//! is also cut to 200 characters, as a non-JSON error body is.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -26,6 +27,9 @@ const MAX_REDIRECTS: usize = net::MAX_REDIRECTS as usize;
 /// Times one redirect target is followed per request (urllib's
 /// `max_repeats`): a redirect loop stops after five requests.
 const MAX_REPEATS: usize = 4;
+/// Most characters of server-chosen text (a non-JSON error body, a
+/// redirect target) that an error message carries.
+const SHOWN_CHARS: usize = 200;
 
 /// API or transport error. `status` is the HTTP code or 0 for network failure.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -83,7 +87,10 @@ fn parse_error_body(raw: &[u8], status: u16) -> CloudError {
             err.body = Some(body);
         }
         Err(_) if !raw.is_empty() => {
-            err.message = String::from_utf8_lossy(raw).chars().take(200).collect();
+            err.message = String::from_utf8_lossy(raw)
+                .chars()
+                .take(SHOWN_CHARS)
+                .collect();
         }
         Err(_) => {}
     }
@@ -153,16 +160,24 @@ fn follow_target(current: &Url, resp: &Response<Body>) -> Option<Url> {
     same_host_redirect(current, &to).then_some(to)
 }
 
+/// A redirect target as an error message names it: [`net::redact_url`]'s
+/// form, cut to [`SHOWN_CHARS`] (the server picks how long it is).
+fn shown_url(url: &Url) -> String {
+    net::redact_url(url.as_str())
+        .chars()
+        .take(SHOWN_CHARS)
+        .collect()
+}
+
 /// A 3xx we did not follow, for the request to `at`. Its status stays 3xx so
 /// it can never read as a rejected token (401), whatever the redirect target
-/// would have answered. The target is named as [`net::redact_url`] shows it.
+/// would have answered. The target is named as [`shown_url`] shows it.
 fn redirect_error(at: &Url, resp: &Response<Body>) -> CloudError {
     let status = resp.status().as_u16();
     match location(resp).map(|loc| at.join(loc)) {
-        Some(Ok(to)) => CloudError::new(
-            format!("unexpected redirect to {}", net::redact_url(to.as_str())),
-            status,
-        ),
+        Some(Ok(to)) => {
+            CloudError::new(format!("unexpected redirect to {}", shown_url(&to)), status)
+        }
         Some(Err(_)) => CloudError::new(format!("unexpected HTTP {status} redirect"), status),
         None => CloudError::new(format!("unexpected HTTP {status}"), status),
     }
@@ -235,10 +250,7 @@ impl CloudClient {
             let seen = visited.get(next.as_str()).copied().unwrap_or(0);
             if seen >= MAX_REPEATS || visited.len() >= MAX_REDIRECTS {
                 return Err(CloudError::new(
-                    format!(
-                        "too many redirects (last to {})",
-                        net::redact_url(next.as_str())
-                    ),
+                    format!("too many redirects (last to {})", shown_url(&next)),
                     status,
                 ));
             }
@@ -814,15 +826,45 @@ mod tests {
         let client = CloudClient::new(&srv.base_url);
         let err = client.whoami("tok").unwrap_err();
         assert_eq!(err.status, 302);
-        assert!(err.message.starts_with("too many redirects"), "{err}");
-        // urllib's loop detection: one target is followed 4 times.
-        assert_eq!(srv.requests().len(), 1 + MAX_REPEATS);
+        assert_eq!(
+            err.message,
+            format!("too many redirects (last to {}/loop)", srv.base_url)
+        );
+        // urllib's loop detection: /loop is followed 4 times, so the 5th
+        // request's redirect fails, after as many requests as CPython's
+        // urlopen makes.
+        assert_eq!(srv.requests().len(), 5);
 
         let err = client.ack_job("tok", "j1").unwrap_err();
         assert_eq!(
             (err.status, err.message.as_str()),
             (302, "unexpected HTTP 302")
         );
+    }
+
+    /// Repeats are counted per target, as urllib counts them: a cycle
+    /// through /a and /b fails when /a would be followed a 5th time, after
+    /// the same 9 requests CPython's urlopen makes.
+    #[test]
+    fn redirect_cycle_counts_repeats_per_target() {
+        let srv = http_stub::serve(|req, s| {
+            let to = match req.path.as_str() {
+                "/a" => "/b",
+                _ => "/a",
+            };
+            respond(s, 302, &[("Location", to)], b"")
+        });
+        let err = CloudClient::new(&srv.base_url).whoami("tok").unwrap_err();
+        assert_eq!(err.status, 302);
+        assert_eq!(
+            err.message,
+            format!("too many redirects (last to {}/a)", srv.base_url)
+        );
+        let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths.len(), 9);
+        let mut want = vec!["/print/v1/whoami"];
+        want.extend(["/a", "/b"].repeat(4));
+        assert_eq!(paths, want);
     }
 
     /// A stub that redirects /print/v1/whoami → /r1 → … → /r`hops` (each
@@ -915,6 +957,31 @@ mod tests {
             "{err}"
         );
         assert_eq!(srv.requests().len(), 1, "followed");
+        // A long target, cross-host or looping, is cut to 200 characters,
+        // as a non-JSON error body is: the server picks its length.
+        let long = format!("/{}", "p".repeat(5000));
+        let cut = |url: String| url.chars().take(200).collect::<String>();
+        let to = format!("http://other.example.test{long}");
+        let srv = http_stub::serve({
+            let to = to.clone();
+            move |_, s| respond(s, 302, &[("Location", &to)], b"")
+        });
+        let err = CloudClient::new(&srv.base_url).whoami("tok").unwrap_err();
+        let shown = format!("unexpected redirect to {}", cut(to));
+        assert_eq!(err.message.len(), shown.len());
+        assert_eq!(err.message, shown);
+        let srv = http_stub::serve({
+            let long = long.clone();
+            move |_, s| respond(s, 302, &[("Location", &long)], b"")
+        });
+        let err = CloudClient::new(&srv.base_url).whoami("tok").unwrap_err();
+        let shown = format!(
+            "too many redirects (last to {})",
+            cut(format!("{}{long}", srv.base_url))
+        );
+        assert_eq!(err.message.len(), shown.len());
+        assert_eq!(err.message, shown);
+        assert_eq!(srv.requests().len(), 5);
     }
 
     #[test]
