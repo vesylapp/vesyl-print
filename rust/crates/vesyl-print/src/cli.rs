@@ -1,6 +1,7 @@
 //! vesyl-print CLI: claim, enroll, status, queues, unpair, agent, version,
-//! update, print-test.
+//! update, print-test, test-print.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,8 +15,10 @@ use serde_json::{json, Value};
 use crate::agent::{status_from_creds, Agent};
 use crate::auth::{self, Credentials};
 use crate::cloud::{CloudClient, CloudError, HeartbeatBody};
-use crate::config::{agent_version, default_platform, load_config, write_default_config, Config};
-use crate::jobs::{self, JobStore, Pipeline};
+use crate::config::{
+    agent_version, default_platform, load_config, write_default_config, Config, WaitCups,
+};
+use crate::jobs::{self, JobError, JobOutcome, JobStore, Pipeline};
 use crate::statusio::{self, CloudState, PairingState};
 use crate::update::{self, ReleaseManifest, UpdateEnv};
 use crate::{printers, sysinfo, JsonObject};
@@ -27,7 +30,7 @@ use crate::{printers, sysinfo, JsonObject};
 #[command(
     name = "vesyl-print",
     version = agent_version(),
-    about = "VESYL print node — claim, enroll, status, queues, agent, print-test, update",
+    about = "VESYL print node — claim, enroll, status, queues, agent, print-test, test-print, update",
     infer_long_args = true,
     args_override_self = true
 )]
@@ -46,6 +49,9 @@ pub enum Command {
         /// Optional display name for this node
         #[arg(long)]
         name: Option<String>,
+        /// Print the result (or the failure) as one JSON object
+        #[arg(long)]
+        json: bool,
     },
     /// Pair with a headless enrollment token
     Enroll {
@@ -83,6 +89,8 @@ pub enum Command {
     },
     /// Print a local file via durable queue + CUPS (no cloud)
     PrintTest(PrintTestArgs),
+    /// Print the built-in VESYL test label (the LCD's Test button)
+    TestPrint(TestPrintArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -136,6 +144,19 @@ pub struct PrintTestArgs {
     raw: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct TestPrintArgs {
+    /// CUPS queue name (see `vesyl-print queues`)
+    #[arg(long)]
+    queue: String,
+    /// Label format: pdf (any queue) or zpl (raw / Zebra queues)
+    #[arg(long)]
+    format: String,
+    /// Print the result (or the failure) as one JSON object
+    #[arg(long)]
+    json: bool,
+}
+
 /// Fatal CLI error: printed to stderr, exit status 1 (Python `_die`).
 #[derive(Debug)]
 pub struct Die(pub String);
@@ -169,6 +190,12 @@ pub struct Deps {
     pub cfg: Config,
     pub update_env: UpdateEnv,
     pub inventory: Box<dyn Fn() -> Result<Vec<Value>, String>>,
+    /// The job pipeline `test-print` runs (with `wait_cups` off).
+    pub pipeline: Pipeline,
+    /// Holds `test-labels/` (see [`default_assets_dir`]).
+    pub assets_dir: PathBuf,
+    /// Where `test-print` makes its private job store.
+    pub temp_dir: PathBuf,
 }
 
 impl Deps {
@@ -177,6 +204,9 @@ impl Deps {
         Deps {
             update_env: UpdateEnv::detect(&cfg),
             inventory: Box::new(|| Ok(printers::inventory_payload())),
+            pipeline: Pipeline::default(),
+            assets_dir: default_assets_dir(),
+            temp_dir: std::env::temp_dir(),
             cfg,
         }
     }
@@ -203,7 +233,7 @@ pub fn main() -> ExitCode {
 
 pub fn run(cmd: Command, deps: &Deps, out: &mut dyn Write) -> CmdResult {
     match cmd {
-        Command::Claim { code, name } => cmd_claim(deps, out, &code, name.as_deref()),
+        Command::Claim { code, name, json } => cmd_claim(deps, out, &code, name.as_deref(), json),
         Command::Enroll { token, name } => cmd_enroll(deps, out, &token, name.as_deref()),
         Command::Status { check } => cmd_status(deps, out, check),
         Command::Queues { json } => cmd_queues(deps, out, json),
@@ -212,7 +242,14 @@ pub fn run(cmd: Command, deps: &Deps, out: &mut dyn Write) -> CmdResult {
         Command::Version => cmd_version(deps, out),
         Command::Update { action } => cmd_update(deps, out, action),
         Command::PrintTest(args) => cmd_print_test(deps, out, args),
+        Command::TestPrint(args) => cmd_test_print(deps, out, args),
     }
+}
+
+/// `--json` output: one JSON object on one line.
+fn write_json(out: &mut dyn Write, body: &Value) -> Result<(), Die> {
+    writeln!(out, "{}", serde_json::to_string(body)?)?;
+    Ok(())
 }
 
 /// Save credentials and mark the LCD paired/offline until the first heartbeat.
@@ -243,12 +280,59 @@ pub fn normalize_claim_code(code: &str) -> String {
     code.trim().replace(['-', ' '], "").to_uppercase()
 }
 
-fn cmd_claim(deps: &Deps, out: &mut dyn Write, code: &str, name: Option<&str>) -> CmdResult {
+/// Why a claim failed, for plain and `--json` output.
+#[derive(Debug)]
+struct ClaimFailure {
+    /// The `error` of `claim --json`.
+    message: String,
+    /// HTTP status of the cloud's answer; 400 for a malformed code, 0 for a
+    /// transport error or a local failure.
+    status: u16,
+    /// The cloud's error code, if it sent one.
+    code: Option<String>,
+    /// What plain `claim` prints to stderr.
+    plain: String,
+}
+
+impl ClaimFailure {
+    fn local(Die(message): Die, status: u16) -> Self {
+        ClaimFailure {
+            plain: message.clone(),
+            message,
+            status,
+            code: None,
+        }
+    }
+
+    fn cloud(e: &CloudError) -> Self {
+        ClaimFailure {
+            message: if e.message.is_empty() {
+                "claim failed".into()
+            } else {
+                e.message.clone()
+            },
+            status: e.status,
+            code: e.code.clone(),
+            plain: cloud_msg("claim failed", e),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({"ok": false, "error": self.message, "status": self.status, "code": self.code})
+    }
+}
+
+/// Claim this node with `code`: save the credentials and mark the LCD
+/// paired (offline until the agent's first heartbeat).
+fn claim_node(deps: &Deps, code: &str, name: Option<&str>) -> Result<Credentials, ClaimFailure> {
     let cfg = &deps.cfg;
-    prepare_dirs(cfg)?;
+    prepare_dirs(cfg).map_err(|e| ClaimFailure::local(e, 0))?;
     let code = normalize_claim_code(code);
     if code.len() < 6 {
-        return die("claim code looks too short");
+        return Err(ClaimFailure::local(
+            Die("claim code looks too short".into()),
+            400,
+        ));
     }
     let data = deps
         .client()
@@ -259,8 +343,37 @@ fn cmd_claim(deps: &Deps, out: &mut dyn Write, code: &str, name: Option<&str>) -
             &default_platform(),
             name,
         )
-        .map_err(|e| Die(cloud_msg("claim failed", &e)))?;
-    let creds = save_pairing(cfg, &data, "claim")?;
+        .map_err(|e| ClaimFailure::cloud(&e))?;
+    save_pairing(cfg, &data, "claim").map_err(|e| ClaimFailure::local(e, 0))
+}
+
+/// Public fields of a fresh pairing (never the device token).
+fn claim_json(creds: &Credentials) -> Value {
+    json!({
+        "ok": true,
+        "node_id": creds.node_id,
+        "name": creds.name,
+        "organization_name": creds.organization_name,
+        "warehouse_name": creds.warehouse_label(),
+    })
+}
+
+fn cmd_claim(
+    deps: &Deps,
+    out: &mut dyn Write,
+    code: &str,
+    name: Option<&str>,
+    as_json: bool,
+) -> CmdResult {
+    let claimed = claim_node(deps, code, name);
+    if as_json {
+        return match claimed {
+            Ok(creds) => write_json(out, &claim_json(&creds)).map(|()| 0),
+            Err(f) => write_json(out, &f.to_json()).map(|()| 1),
+        };
+    }
+    let creds = claimed.map_err(|f| Die(f.plain))?;
+    let cfg = &deps.cfg;
     let mode = auth::credentials_mode(&cfg.credentials_path()).unwrap_or(0);
     writeln!(out, "Paired successfully.")?;
     writeln!(out, "  node_id:      {}", creds.node_id)?;
@@ -885,6 +998,118 @@ fn cmd_print_test(deps: &Deps, out: &mut dyn Write, args: PrintTestArgs) -> CmdR
     Ok(0)
 }
 
+/// Tracking number printed on the built-in test label.
+pub const TEST_LABEL_TRACKING: &str = "1Z999VES014200042";
+
+/// Where `test-print` finds `test-labels/`: `$VESYL_PRINT_ASSETS_DIR`, else
+/// `assets/` next to the running executable (the release slot).
+pub fn default_assets_dir() -> PathBuf {
+    assets_dir_from(
+        std::env::var_os("VESYL_PRINT_ASSETS_DIR"),
+        std::env::current_exe().ok(),
+    )
+}
+
+fn assets_dir_from(env_dir: Option<OsString>, exe: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = env_dir.filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    exe.as_deref()
+        .and_then(Path::parent)
+        .map(|slot| slot.join("assets"))
+        .unwrap_or_else(|| PathBuf::from("/opt/vesyl-print/current/assets"))
+}
+
+/// The built-in test label in `format` (`pdf` or `zpl`).
+pub fn test_label_path(assets_dir: &Path, format: &str) -> PathBuf {
+    assets_dir
+        .join("test-labels")
+        .join(format!("vesyl-roadrunner-4x6.{format}"))
+}
+
+/// A test label `lp` accepted.
+#[derive(Debug)]
+struct AcceptedTestLabel {
+    job_id: String,
+    queue: String,
+    format: String,
+    file: PathBuf,
+    outcome: JobOutcome,
+}
+
+/// Print the built-in test label (Python `test_label.submit_test_label(
+/// cups, fmt, wait_cups=False)`). The job runs through a private job store,
+/// removed afterwards, so it never touches the agent's queue, and returns
+/// once `lp` has it.
+fn submit_test_label(
+    deps: &Deps,
+    queue: &str,
+    format: &str,
+) -> Result<AcceptedTestLabel, JobError> {
+    let kind = format.trim().to_lowercase();
+    if kind != "pdf" && kind != "zpl" {
+        return Err(JobError::new(
+            format!("unsupported test format: {format}"),
+            "invalid_job",
+        ));
+    }
+    let queue = queue.trim();
+    if queue.is_empty() {
+        return Err(JobError::new("missing cups_name", "invalid_job"));
+    }
+    let file = test_label_path(&deps.assets_dir, &kind);
+    let title = format!("VESYL test {} {TEST_LABEL_TRACKING}", kind.to_uppercase());
+    let job = jobs::job_from_local_file(&file, queue, None, Some(&title), 1, kind == "zpl")?;
+    let private = tempfile::Builder::new()
+        .prefix("vesyl-test-print-")
+        .tempdir_in(&deps.temp_dir)
+        .map_err(|e| JobError::new(format!("private job store: {e}"), "job_error"))?;
+    let store = JobStore::new(private.path().join("q"), private.path().join("p"));
+    let pipeline = Pipeline {
+        wait_cups: WaitCups::Off,
+        ..deps.pipeline.clone()
+    };
+    let outcome = pipeline.process(&job, &store)?;
+    Ok(AcceptedTestLabel {
+        job_id: job.id,
+        queue: queue.to_string(),
+        format: kind,
+        file,
+        outcome,
+    })
+}
+
+fn cmd_test_print(deps: &Deps, out: &mut dyn Write, args: TestPrintArgs) -> CmdResult {
+    let printed = submit_test_label(deps, &args.queue, &args.format);
+    if args.json {
+        return match printed {
+            Ok(t) => write_json(
+                out,
+                &json!({
+                    "ok": true,
+                    "state": t.outcome.as_str(),
+                    "job_id": t.job_id,
+                    "queue": t.queue,
+                    "format": t.format,
+                }),
+            )
+            .map(|()| 0),
+            Err(e) => write_json(
+                out,
+                &json!({"ok": false, "error": e.message, "code": e.code}),
+            )
+            .map(|()| 1),
+        };
+    }
+    let t = printed.map_err(|e| Die(format!("test print failed: {} ({})", e.message, e.code)))?;
+    writeln!(out, "job_id:     {}", t.job_id)?;
+    writeln!(out, "file:       {}", t.file.display())?;
+    writeln!(out, "cups_name:  {}", t.queue)?;
+    writeln!(out, "format:     {}", t.format)?;
+    writeln!(out, "result:     {}", t.outcome.as_str())?;
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,6 +1153,8 @@ mod tests {
             ..Config::default()
         }
         .normalized();
+        let temp_dir = td.join("tmp");
+        fs::create_dir_all(&temp_dir).unwrap();
         Deps {
             update_env: UpdateEnv {
                 install_root: td.join("install"),
@@ -937,8 +1164,23 @@ mod tests {
                 restart: false,
             },
             inventory: Box::new(|| Ok(sample())),
+            // Never real CUPS from a test (see `FakeCups`).
+            pipeline: Pipeline {
+                lp: Arc::new(|_, _, _| Err(JobError::new("no lp in tests", "lp_error"))),
+                supports_raw: Arc::new(|_| Err("no CUPS in tests".into())),
+                ..Pipeline::default()
+            },
+            assets_dir: td.join("assets"),
+            temp_dir,
             cfg,
         }
+    }
+
+    /// The one JSON object a `--json` run printed, on one line.
+    fn json_line(out: &str) -> Value {
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        assert!(out.ends_with('\n'), "{out:?}");
+        serde_json::from_str(out).unwrap()
     }
 
     fn run_args(deps: &Deps, argv: &[&str]) -> (CmdResult, String) {
@@ -1060,6 +1302,446 @@ mod tests {
         assert_eq!(
             run_args(&d, &["claim", "ZZZZZZZZ"]).0.unwrap_err().0,
             "claim failed: Unknown claim code (invalid_code)"
+        );
+    }
+
+    const CLAIMED: &str = r#"{"node_id":"n1","device_token":"secret-tok","name":"Pack 1",
+        "organization":{"name":"Acme"},"warehouse":{"name":"Main","code":"MAIN"}}"#;
+
+    /// `claim --json` prints the public pairing fields (never the token) and
+    /// leaves exactly the files a plain `claim` does.
+    #[test]
+    fn claim_json_reports_public_fields_and_saves_like_plain_claim() {
+        let td = tempfile::tempdir().unwrap();
+        let srv = serve(vec![(201, CLAIMED)]);
+        let d = deps(td.path(), &srv.base_url);
+        let (r, out) = run_args(&d, &["claim", "ab7k-2q9m", "--name", "Pack 1", "--json"]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert_eq!(
+            json_line(&out),
+            json!({"ok": true, "node_id": "n1", "name": "Pack 1",
+                   "organization_name": "Acme", "warehouse_name": "Main"})
+        );
+        assert!(!out.contains("secret-tok") && !out.contains("device_token"));
+        let body: Value = serde_json::from_slice(&srv.requests.lock().unwrap()[0].body).unwrap();
+        assert_eq!(body["code"], "AB7K2Q9M");
+        assert_eq!(body["name"], "Pack 1");
+
+        let plain_td = tempfile::tempdir().unwrap();
+        let srv = serve(vec![(201, CLAIMED)]);
+        let plain = deps(plain_td.path(), &srv.base_url);
+        let (r, out) = run_args(&plain, &["claim", "ab7k-2q9m", "--name", "Pack 1"]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert!(
+            out.starts_with("Paired successfully.\n"),
+            "plain output unchanged"
+        );
+
+        let creds = |d: &Deps| auth::load_credentials(&d.cfg.credentials_path()).unwrap();
+        assert_eq!(creds(&d), creds(&plain));
+        assert_eq!(creds(&d).device_token, "secret-tok");
+        let status = |d: &Deps| statusio::AgentStatus {
+            updated_at: None,
+            ..statusio::read_status(&d.cfg.status_path()).unwrap()
+        };
+        assert_eq!(status(&d), status(&plain));
+        assert_eq!(
+            (status(&d).pairing, status(&d).cloud),
+            (PairingState::Paired, CloudState::Offline)
+        );
+        for dd in [&d, &plain] {
+            assert_eq!(
+                auth::credentials_mode(&dd.cfg.credentials_path()),
+                Some(0o600)
+            );
+            assert!(
+                dd.cfg.config_path().is_file(),
+                "default config.json written"
+            );
+        }
+    }
+
+    /// A URL nothing listens on.
+    fn closed_port_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// Every failed `claim --json` prints one JSON object, exits 1 and
+    /// writes no credentials.
+    #[test]
+    fn claim_json_failures() {
+        let td = tempfile::tempdir().unwrap();
+        let failed = |d: &Deps, argv: &[&str]| -> Value {
+            let (r, out) = run_args(d, argv);
+            assert_eq!(r.unwrap(), 1, "{argv:?}: {out}");
+            assert!(auth::load_credentials(&d.cfg.credentials_path()).is_none());
+            json_line(&out)
+        };
+
+        // A short code never reaches the cloud.
+        let srv = serve(vec![(201, CLAIMED)]);
+        let d = deps(td.path(), &srv.base_url);
+        assert_eq!(
+            failed(&d, &["claim", "ab-1", "--json"]),
+            json!({"ok": false, "error": "claim code looks too short", "status": 400, "code": null})
+        );
+        assert!(srv.requests.lock().unwrap().is_empty());
+
+        for (status, body, expected) in [
+            (
+                422,
+                r#"{"error":{"code":"invalid_code","message":"Unknown claim code"}}"#,
+                json!({"ok": false, "error": "Unknown claim code", "status": 422, "code": "invalid_code"}),
+            ),
+            (
+                500,
+                r#"{"error":"boom"}"#,
+                json!({"ok": false, "error": "boom", "status": 500, "code": null}),
+            ),
+            // An answer without a device token is refused here: status 0.
+            (
+                201,
+                r#"{"node_id":"n1"}"#,
+                json!({"ok": false, "error": "claim response missing device_token",
+                       "status": 0, "code": null}),
+            ),
+        ] {
+            let srv = serve(vec![(status, body)]);
+            let d = deps(td.path(), &srv.base_url);
+            assert_eq!(failed(&d, &["claim", "AB7K2Q9M", "--json"]), expected);
+            assert_eq!(srv.requests.lock().unwrap().len(), 1);
+        }
+
+        // Transport errors are status 0 too.
+        let d = deps(td.path(), &closed_port_url());
+        let err = failed(&d, &["claim", "AB7K2Q9M", "--json"]);
+        assert_eq!(
+            (&err["ok"], &err["status"], &err["code"]),
+            (&json!(false), &json!(0), &Value::Null)
+        );
+        let message = err["error"].as_str().unwrap();
+        assert!(message.starts_with("network error"), "{err}");
+        // Plain claim: the same failure on stderr, as before.
+        assert_eq!(
+            run_args(&d, &["claim", "AB7K2Q9M"]).0.unwrap_err().0,
+            format!("claim failed: {message}")
+        );
+    }
+
+    // --- test-print ----------------------------------------------------------
+
+    /// One `lp` run of a test print.
+    #[derive(Debug, Clone)]
+    struct LpCall {
+        queue: String,
+        file: PathBuf,
+        title: Option<String>,
+        copies: i64,
+        raw: bool,
+        argv: Vec<String>,
+        /// Queue files in each private job store under `Deps::temp_dir`
+        /// while `lp` ran.
+        private_queues: Vec<Vec<String>>,
+    }
+
+    /// Stands in for CUPS in a test print: records each `lp` run and
+    /// whether the job waited on CUPS.
+    #[derive(Clone, Default)]
+    struct FakeCups {
+        lp: Arc<Mutex<Vec<LpCall>>>,
+        waited: Arc<AtomicBool>,
+    }
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    impl FakeCups {
+        /// A pipeline whose `lp` answers `answer`. Its `wait_cups` is the
+        /// default (sync): `test-print` must turn it off.
+        fn pipeline(&self, temp_dir: &Path, answer: Result<Option<String>, JobError>) -> Pipeline {
+            let (calls, waited) = (self.lp.clone(), self.waited.clone());
+            let temp_dir = temp_dir.to_path_buf();
+            Pipeline {
+                lp: Arc::new(move |queue, file, args| {
+                    let private_queues = file_names(&temp_dir)
+                        .iter()
+                        .filter(|n| n.starts_with("vesyl-test-print-"))
+                        .map(|n| file_names(&temp_dir.join(n).join("q")))
+                        .collect();
+                    calls.lock().unwrap().push(LpCall {
+                        queue: queue.into(),
+                        file: file.into(),
+                        title: args.title.map(String::from),
+                        copies: args.copies,
+                        raw: args.raw,
+                        argv: jobs::lp_args(queue, file, args),
+                        private_queues,
+                    });
+                    answer.clone()
+                }),
+                supports_raw: Arc::new(|_| Ok(false)),
+                wait_cups_job: Arc::new(move |_, _| {
+                    waited.store(true, Ordering::SeqCst);
+                    jobs::CupsOutcome::Printed
+                }),
+                ..Pipeline::default()
+            }
+        }
+
+        fn calls(&self) -> Vec<LpCall> {
+            self.lp.lock().unwrap().clone()
+        }
+    }
+
+    /// Deps with both test labels installed and the agent's own queue
+    /// directories in place, printing through `FakeCups`.
+    fn test_print_deps(td: &Path, answer: Result<Option<String>, JobError>) -> (Deps, FakeCups) {
+        let labels = td.join("assets/test-labels");
+        fs::create_dir_all(&labels).unwrap();
+        fs::write(labels.join("vesyl-roadrunner-4x6.pdf"), "%PDF-1.4\n%test\n").unwrap();
+        fs::write(
+            labels.join("vesyl-roadrunner-4x6.zpl"),
+            "^XA^FDtest^FS^XZ\n",
+        )
+        .unwrap();
+        let cups = FakeCups::default();
+        let mut d = deps(td, "http://127.0.0.1:9");
+        d.pipeline = cups.pipeline(&d.temp_dir, answer);
+        d.cfg.ensure_dirs().unwrap();
+        (d, cups)
+    }
+
+    /// The private job store is gone and the agent's queue untouched.
+    fn assert_no_trace(d: &Deps) {
+        assert_eq!(
+            file_names(&d.temp_dir),
+            Vec::<String>::new(),
+            "private job store left behind"
+        );
+        for dir in [d.cfg.queue_dir(), d.cfg.processed_dir()] {
+            assert_eq!(file_names(&dir), Vec::<String>::new(), "{}", dir.display());
+        }
+    }
+
+    #[test]
+    fn test_print_pdf_runs_through_a_private_store() {
+        let td = tempfile::tempdir().unwrap();
+        let (d, cups) = test_print_deps(td.path(), Ok(Some("Brother_HL-7".into())));
+        let (r, out) = run_args(
+            &d,
+            &[
+                "test-print",
+                "--queue",
+                " Brother_HL ",
+                "--format",
+                "PDF",
+                "--json",
+            ],
+        );
+        assert_eq!(r.unwrap(), 0, "{out}");
+        let got = json_line(&out);
+        let job_id = got["job_id"].as_str().unwrap().to_string();
+        assert!(uuid::Uuid::parse_str(&job_id).is_ok(), "{got}");
+        assert_eq!(
+            got,
+            json!({"ok": true, "state": "delivered", "job_id": job_id,
+                   "queue": "Brother_HL", "format": "pdf"})
+        );
+
+        let calls = cups.calls();
+        assert_eq!(calls.len(), 1);
+        let lp = &calls[0];
+        let file = fs::canonicalize(
+            td.path()
+                .join("assets/test-labels/vesyl-roadrunner-4x6.pdf"),
+        )
+        .unwrap();
+        assert_eq!((lp.queue.as_str(), &lp.file), ("Brother_HL", &file));
+        let title = "VESYL test PDF 1Z999VES014200042";
+        assert_eq!(
+            (lp.title.as_deref(), lp.copies, lp.raw),
+            (Some(title), 1, false)
+        );
+        assert_eq!(
+            lp.argv,
+            ["-d", "Brother_HL", "-t", title, file.to_str().unwrap()]
+        );
+        // Queued durably in its own store, not the agent's...
+        assert_eq!(lp.private_queues, [[format!("{job_id}.json")]]);
+        // ...returned once lp had it, without waiting on CUPS...
+        assert!(!cups.waited.load(Ordering::SeqCst));
+        assert_eq!(d.pipeline.cups_watcher.pending(), 0);
+        // ...and cleaned up.
+        assert_no_trace(&d);
+    }
+
+    #[test]
+    fn test_print_zpl_is_sent_raw() {
+        let td = tempfile::tempdir().unwrap();
+        let (d, cups) = test_print_deps(td.path(), Ok(None));
+        let (r, out) = run_args(
+            &d,
+            &[
+                "test-print",
+                "--queue",
+                "Zebra_ZD220",
+                "--format",
+                "zpl",
+                "--json",
+            ],
+        );
+        assert_eq!(r.unwrap(), 0, "{out}");
+        let got = json_line(&out);
+        assert_eq!(
+            (&got["ok"], &got["state"], &got["queue"], &got["format"]),
+            (
+                &json!(true),
+                &json!("delivered"),
+                &json!("Zebra_ZD220"),
+                &json!("zpl")
+            )
+        );
+        let lp = &cups.calls()[0];
+        let file = fs::canonicalize(
+            td.path()
+                .join("assets/test-labels/vesyl-roadrunner-4x6.zpl"),
+        )
+        .unwrap();
+        let title = "VESYL test ZPL 1Z999VES014200042";
+        assert_eq!(
+            lp.argv,
+            [
+                "-d",
+                "Zebra_ZD220",
+                "-t",
+                title,
+                "-o",
+                "raw",
+                file.to_str().unwrap()
+            ]
+        );
+        assert_no_trace(&d);
+    }
+
+    #[test]
+    fn test_print_rejects_bad_requests_with_job_error_codes() {
+        let td = tempfile::tempdir().unwrap();
+        let (d, cups) = test_print_deps(td.path(), Ok(None));
+        let missing = td
+            .path()
+            .join("assets/test-labels/vesyl-roadrunner-4x6.zpl");
+        fs::remove_file(&missing).unwrap();
+        let not_found = format!("file not found: {}", missing.display());
+        for (queue, format, error, code) in [
+            (
+                "Zebra",
+                "png",
+                "unsupported test format: png",
+                "invalid_job",
+            ),
+            // The format is checked first, as in Python.
+            ("", " EPL ", "unsupported test format:  EPL ", "invalid_job"),
+            ("  ", "pdf", "missing cups_name", "invalid_job"),
+            ("Zebra", "zpl", not_found.as_str(), "content_missing"),
+        ] {
+            let argv = ["test-print", "--queue", queue, "--format", format, "--json"];
+            let (r, out) = run_args(&d, &argv);
+            assert_eq!(r.unwrap(), 1, "{argv:?}: {out}");
+            assert_eq!(
+                json_line(&out),
+                json!({"ok": false, "error": error, "code": code}),
+                "{argv:?}"
+            );
+        }
+        assert!(cups.calls().is_empty(), "nothing printed");
+        assert_no_trace(&d);
+    }
+
+    #[test]
+    fn test_print_reports_lp_failures() {
+        let td = tempfile::tempdir().unwrap();
+        let refused = JobError::new(
+            "lp: Error - The printer or class does not exist.",
+            "unknown_queue",
+        );
+        let (d, cups) = test_print_deps(td.path(), Err(refused));
+        let (r, out) = run_args(
+            &d,
+            &["test-print", "--queue", "Gone", "--format", "pdf", "--json"],
+        );
+        assert_eq!(r.unwrap(), 1, "{out}");
+        assert_eq!(
+            json_line(&out),
+            json!({"ok": false, "error": "lp: Error - The printer or class does not exist.",
+                   "code": "unknown_queue"})
+        );
+        assert_eq!(cups.calls().len(), 1);
+        // The failed job's queue file went with the private store.
+        assert_no_trace(&d);
+    }
+
+    #[test]
+    fn test_print_plain_output() {
+        let td = tempfile::tempdir().unwrap();
+        let (d, _) = test_print_deps(td.path(), Ok(Some("Brother_HL-8".into())));
+        let (r, out) = run_args(
+            &d,
+            &["test-print", "--queue", "Brother_HL", "--format", "pdf"],
+        );
+        assert_eq!(r.unwrap(), 0, "{out}");
+        for needle in [
+            "job_id:     ",
+            "vesyl-roadrunner-4x6.pdf\n",
+            "cups_name:  Brother_HL\n",
+            "format:     pdf\n",
+            "result:     delivered\n",
+        ] {
+            assert!(out.contains(needle), "missing {needle:?} in\n{out}");
+        }
+        assert!(!out.contains('{'), "no JSON without --json");
+        let (r, out) = run_args(
+            &d,
+            &["test-print", "--queue", "Brother_HL", "--format", "png"],
+        );
+        assert_eq!(
+            r.unwrap_err().0,
+            "test print failed: unsupported test format: png (invalid_job)"
+        );
+        assert_eq!(out, "");
+        assert_no_trace(&d);
+    }
+
+    #[test]
+    fn test_label_location() {
+        let exe = PathBuf::from("/opt/vesyl-print/releases/0.4.0/vesyl-print");
+        assert_eq!(
+            assets_dir_from(Some("/srv/assets".into()), Some(exe.clone())),
+            Path::new("/srv/assets")
+        );
+        assert_eq!(
+            assets_dir_from(Some("".into()), Some(exe)),
+            Path::new("/opt/vesyl-print/releases/0.4.0/assets")
+        );
+        assert_eq!(
+            assets_dir_from(None, None),
+            Path::new("/opt/vesyl-print/current/assets")
+        );
+        assert_eq!(
+            test_label_path(Path::new("/a"), "zpl"),
+            Path::new("/a/test-labels/vesyl-roadrunner-4x6.zpl")
         );
     }
 
@@ -1671,9 +2353,23 @@ mod tests {
             other => panic!("{other:?}"),
         }
         match cmd(&["claim", "AB7K2Q9M", "--na", "Pack 1", "--name", "Pack 2"]) {
-            Command::Claim { code, name } => {
+            Command::Claim { code, name, json } => {
                 assert_eq!(code, "AB7K2Q9M");
                 assert_eq!(name.as_deref(), Some("Pack 2"));
+                assert!(!json);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            cmd(&["claim", "--js", "AB7K2Q9M"]),
+            Command::Claim { json: true, .. }
+        ));
+        match cmd(&["test-print", "--q", "Zebra", "--f", "zpl", "--j"]) {
+            Command::TestPrint(a) => {
+                assert_eq!(
+                    (a.queue.as_str(), a.format.as_str(), a.json),
+                    ("Zebra", "zpl", true)
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -1697,6 +2393,9 @@ mod tests {
             &["claim", "AB7K2Q9M", "EXTRA"],
             &["status", "--bogus"],
             &["update", "apply", "--version"],
+            // test-print needs both a queue and a format.
+            &["test-print", "--format", "pdf"],
+            &["test-print", "--queue", "Zebra"],
         ] {
             let err = parse(bad).unwrap_err();
             assert_eq!(err.exit_code(), 2, "{bad:?}: {err}");
@@ -1721,6 +2420,15 @@ mod tests {
             vec!["update", "apply", "--version", "0.4.0", "--restart"],
             vec!["agent", "-v"],
             vec!["enroll", "tok", "--name", "n"],
+            vec!["claim", "AB7K2Q9M", "--name", "n", "--json"],
+            vec![
+                "test-print",
+                "--queue",
+                "Zebra",
+                "--format",
+                "pdf",
+                "--json",
+            ],
         ] {
             Cli::try_parse_from(std::iter::once("vesyl-print").chain(argv)).unwrap();
         }
