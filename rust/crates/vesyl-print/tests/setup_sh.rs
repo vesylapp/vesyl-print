@@ -1195,6 +1195,11 @@ fn root_a_distro_without_segno_still_gets_the_required_packages() {
         "{}",
         r.log()
     );
+    assert!(
+        !r.stdout.contains("keeping the installed one"),
+        "{}",
+        r.log()
+    );
     let installed = installed_packages(&sb);
     for pkg in REQUIRED_PACKAGES {
         assert!(installed.iter().any(|p| p == pkg), "{pkg}: {installed:?}");
@@ -1255,8 +1260,15 @@ fn root_offline_reprovision_carries_on_with_the_installed_packages() {
     for out in [
         "   (apt-get update failed — continuing with cached lists)\n",
         "   (apt-get install failed — every required package is already installed, continuing)\n",
+        "   (apt-get install python3-segno failed — keeping the installed one)\n",
         "==> Done.\n",
     ] {
         assert!(r.stdout.contains(out), "{out}\n{}", r.log());
     }
+    // The installed segno still draws the QR code: no warning that it is gone.
+    assert!(
+        !r.stderr.contains("python3-segno not installed"),
+        "{}",
+        r.log()
+    );
 }

@@ -200,14 +200,18 @@ echo "==> Run as user:  $RUN_USER"
 # it is given when one of them is missing, so the optional one goes alone.
 REQUIRED_PACKAGES=(cups poppler-utils network-manager rsync
     python3 python3-pil python3-numpy fonts-dejavu-core)
+# pkg_installed PKG: dpkg has PKG installed. A failed apt-get does not say:
+# offline, with the mirror blocked or the dpkg lock held, a device set up
+# before still has its packages.
+pkg_installed() {
+    [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" == "installed" ]]
+}
 echo "==> Installing packages (CUPS, poppler-utils, NetworkManager, python3 + Pillow/numpy, fonts)..."
 apt-get update || echo "   (apt-get update failed — continuing with cached lists)"
 if ! apt-get install -y "${REQUIRED_PACKAGES[@]}"; then
-    # Offline, or the mirror blocked: a device set up before has them all.
     missing=()
     for pkg in "${REQUIRED_PACKAGES[@]}"; do
-        [[ "$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null)" == "installed" ]] ||
-            missing+=("$pkg")
+        pkg_installed "$pkg" || missing+=("$pkg")
     done
     ((${#missing[@]} == 0)) ||
         die "apt-get could not install required packages: ${missing[*]} (see its errors above)"
@@ -215,9 +219,14 @@ if ! apt-get install -y "${REQUIRED_PACKAGES[@]}"; then
 fi
 # segno draws the Wi-Fi setup QR code; without it the LCD shows the network
 # name and PIN as text. Not packaged everywhere, so best effort.
-apt-get install -y python3-segno ||
-    echo "   WARNING: python3-segno not installed: the Wi-Fi setup screen shows" \
-        "text instead of a QR code" >&2
+if ! apt-get install -y python3-segno; then
+    if pkg_installed python3-segno; then
+        echo "   (apt-get install python3-segno failed — keeping the installed one)"
+    else
+        echo "   WARNING: python3-segno not installed: the Wi-Fi setup screen shows" \
+            "text instead of a QR code" >&2
+    fi
+fi
 
 # The service user must be in 'video' to write /dev/fb1, 'lpadmin' to
 # discover and add network printers to CUPS without sudo, and 'input' to
