@@ -46,7 +46,8 @@ pub enum WaitCups {
 }
 
 impl WaitCups {
-    /// Same normalization as `config._apply_file` / `jobs.normalize_wait_cups`.
+    /// config.json's `wait_cups`: `true` / "sync" / "1" block, `false` /
+    /// "off" / "0" do not watch, anything else watches in the background.
     pub fn from_json(raw: &Value) -> Self {
         match raw {
             Value::Bool(true) => return WaitCups::Sync,
@@ -184,7 +185,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Python `__post_init__`: trim trailing slashes, derive cable_url if empty.
+    /// Trim trailing slashes, derive cable_url if empty.
     pub fn normalized(mut self) -> Self {
         self.api_base_url = self.api_base_url.trim_end_matches('/').to_string();
         self.releases_base_url = self.releases_base_url.trim_end_matches('/').to_string();
@@ -234,8 +235,9 @@ impl Config {
         create_dir_all_owned(&self.processed_dir())
     }
 
-    /// Apply config.json keys. Like Python, a bad value stops processing at
-    /// that key (earlier keys stay applied).
+    /// Apply config.json keys. A bad value stops processing at that key
+    /// (earlier keys stay applied), as existing devices' files have always
+    /// been read.
     fn apply_file(&mut self, data: &JsonObject) -> Result<(), ()> {
         let get = |k: &str| data.get(k);
         if let Some(url) = get("api_base_url").filter(|v| truthy(v)) {

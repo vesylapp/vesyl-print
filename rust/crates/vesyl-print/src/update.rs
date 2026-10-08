@@ -54,8 +54,9 @@ const HEALTH_FAILED: &str = "health failed";
 const RESTART_MISSED: &str = "restart never happened";
 
 /// `last_error` prefix written when `current` was switched away from the
-/// gate's version by hand (`update rollback`) while the gate was open.
-const MANUAL_ROLLBACK: &str = "manual rollback";
+/// gate's version by hand while the gate was open: `update rollback`, or an
+/// `update apply` without --restart, which may well be a newer version.
+const CURRENT_CHANGED: &str = "current changed";
 
 /// Public key shipped with this build (rotated by shipping a new release).
 const BUNDLED_PUBLIC_KEY_PEM: &str = include_str!("../../../../keys/update_public.pem");
@@ -255,8 +256,9 @@ impl ReleaseManifest {
 
     /// Stable JSON for signing: all fields except signature, sorted keys.
     ///
-    /// Must match `scripts/build-release.sh` (Python `json.dumps(sort_keys=True,
-    /// separators=(",", ":"))`, which also escapes non-ASCII).
+    /// Must stay byte-identical to what `scripts/build-release.sh` signs,
+    /// `jq -S -c -a` of the manifest without `signature` and nulls (see
+    /// `canonical_json`); `tests/build_release.rs` checks the two agree.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let body: JsonObject = if !self.raw.is_empty() {
             self.raw
@@ -285,15 +287,18 @@ impl ReleaseManifest {
             b
         };
         let mut out = String::new();
-        python_json(&Value::Object(body), &mut out);
+        canonical_json(&Value::Object(body), &mut out);
         out.into_bytes()
     }
 }
 
-/// Serialize like Python `json.dumps(v, sort_keys=True, separators=(",", ":"))`
-/// (default `ensure_ascii=True`). serde_json's Map is a BTreeMap, so keys sort
-/// by code point as Python does.
-fn python_json(v: &Value, out: &mut String) {
+/// Serialize as `jq -S -c -a` does: keys sorted by code point (serde_json's
+/// Map is a BTreeMap), no whitespace, `\"` `\\` `\n` `\r` `\t` `\b` `\f`,
+/// and every other character outside printable ASCII as `\uXXXX` (a UTF-16
+/// surrogate pair above U+FFFF). Manifests signed before build-release.sh
+/// used jq got the same bytes from Python's `json.dumps(…, sort_keys=True,
+/// separators=(",", ":"))`.
+fn canonical_json(v: &Value, out: &mut String) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -326,7 +331,7 @@ fn python_json(v: &Value, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                python_json(item, out);
+                canonical_json(item, out);
             }
             out.push(']');
         }
@@ -336,9 +341,9 @@ fn python_json(v: &Value, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                python_json(&Value::String(k.clone()), out);
+                canonical_json(&Value::String(k.clone()), out);
                 out.push(':');
-                python_json(val, out);
+                canonical_json(val, out);
             }
             out.push('}');
         }
@@ -583,7 +588,7 @@ fn open_url(
     Ok(Box::new(resp.into_body().into_reader()))
 }
 
-/// GET `url` (the release manifest) into memory, Python's timeout=120.
+/// GET `url` (the release manifest) into memory ([`Timeouts::MANIFEST`]).
 pub fn http_get_bytes(url: &str) -> Result<Vec<u8>, UpdateError> {
     let mut out = Vec::new();
     open_url(url, Timeouts::MANIFEST, &format!("fetching {url}"))?
@@ -1162,7 +1167,7 @@ pub fn restart_services(helper: Option<&Path>) {
 pub struct UpdateEnv {
     pub install_root: PathBuf,
     pub apply_helper: Option<PathBuf>,
-    /// Version of the running binary (`package_version()` in Python).
+    /// Version of the running binary ([`package_version`]).
     pub running_version: String,
     /// True when this process was started from `install_root/current`.
     pub running_from_slot: bool,
@@ -1538,9 +1543,9 @@ fn started_before_gate(
 /// passes while it still runs means the restart never came: it rolls back,
 /// without holding a version that never ran (see [`failed_health_gate`]).
 ///
-/// A gate whose `current` was switched to another version by hand
-/// (`update rollback`) is closed as `rolled_back` at once, with nothing
-/// flipped or restarted again.
+/// A gate whose `current` was switched to another version by hand (`update
+/// rollback`, or `update apply` without --restart) is closed as
+/// `rolled_back` at once, with nothing flipped or restarted again.
 pub fn process_pending_health(
     st: UpdateStatus,
     cfg: &Config,
@@ -1587,10 +1592,11 @@ fn judge_pending_health(
 
     // `current` was switched off the gate's version by hand while the gate
     // was open: `update rollback`, the documented way out of a bad slot (or
-    // another `update apply` without --restart). That is the rollback, so
-    // the gate closes as one, holding the version like any other; it has
-    // nothing left to flip or restart. A missing `current` is no such
-    // choice: the gate judges it below and rolls back to repair it.
+    // another `update apply` without --restart). Either way the gate's
+    // version is out, so the gate closes as rolled back, holding the version
+    // like any other; it has nothing left to flip or restart. A missing
+    // `current` is no such choice: the gate judges it below and rolls back
+    // to repair it.
     if let Some(cur) = Slot::current(&env.install_root).filter(|s| !s.is(&expected)) {
         log::warn!(
             target: LOG,
@@ -1605,7 +1611,7 @@ fn judge_pending_health(
         st.armed_at = None;
         st.last_checked_at = Some(now);
         st.last_error = Some(format!(
-            "{MANUAL_ROLLBACK} to {} during the health gate",
+            "{CURRENT_CHANGED} to {} during the health gate",
             cur.version
         ));
         return st;
@@ -1627,10 +1633,12 @@ fn judge_pending_health(
     if replaced {
         // Still the agent being replaced at the deadline: the restart into
         // `expected` never happened (the restart helper failed, say). Roll
-        // back so `current` matches what runs, but `expected` never ran:
-        // this says nothing about it, and an agent started since may retry
-        // it. `armed_at` stays to tell that one from this process, which
-        // does not (see `restart_missed_here`).
+        // back to the slot the activation replaced: usually the one this
+        // process runs from, but one staged after it started, without a
+        // restart, if there was one. `expected` never ran: this says nothing
+        // about it, and an agent started since may retry it. `armed_at`
+        // stays to tell that one from this process, which does not (see
+        // `restart_missed_here`).
         let armed_at = st.armed_at.clone();
         let why = format!("{RESTART_MISSED} (still running {})", env.running_version);
         let mut st = close_failed_gate(st, env, &expected, &why);
@@ -2056,35 +2064,13 @@ pub fn maybe_update_from_heartbeat(
     st
 }
 
+/// The CLI often runs as root (`update apply … --restart` arms the gate here)
+/// while the agent runs as the service user that owns the state dir:
+/// [`write_durable`] leaves the file that user's, not root's.
 pub fn write_update_status(path: &Path, status: &UpdateStatus) -> std::io::Result<()> {
     let mut raw = serde_json::to_string_pretty(&status.to_dict()).map_err(std::io::Error::other)?;
     raw.push('\n');
-    write_durable(path, raw.as_bytes(), 0o644, false)?;
-    give_to_dir_owner(path);
-    Ok(())
-}
-
-/// The CLI often runs as root while the agent runs as the service user that
-/// owns the state dir. A root-owned status file cannot be rewritten in place
-/// by a rolled-back Python agent, which would leave `pending_health` (and the
-/// job pause) stuck, so hand the file to the directory's owner.
-fn give_to_dir_owner(path: &Path) {
-    use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    if unsafe { libc::geteuid() } != 0 {
-        return;
-    }
-    let Some(dir_meta) = path.parent().and_then(|d| fs::metadata(d).ok()) else {
-        return;
-    };
-    if dir_meta.uid() == 0 {
-        return;
-    }
-    // lchown: the directory's owner could swap in a symlink after the rename,
-    // and root must never chown whatever such a link points at.
-    if let Err(e) = std::os::unix::fs::lchown(path, Some(dir_meta.uid()), Some(dir_meta.gid())) {
-        log::warn!(target: LOG, "chown {}: {e}", path.display());
-    }
+    write_durable(path, raw.as_bytes(), 0o644, false)
 }
 
 pub fn read_update_status(path: &Path) -> Option<UpdateStatus> {
@@ -2273,7 +2259,7 @@ mod tests {
         let raw = String::from_utf8(m.canonical_bytes()).unwrap();
         assert!(!raw.contains("signature"));
         assert!(!raw.contains("min_agent_version"));
-        // Exactly what Python json.dumps(sort_keys=True, separators=(",", ":")) emits.
+        // Exactly what `jq -S -c -a` (build-release.sh) signs.
         assert_eq!(
             raw,
             format!(
@@ -3446,8 +3432,8 @@ mod tests {
             ..cfg(td.path())
         };
         assert_eq!(manifest_public_key(&off).unwrap(), None);
-        // A configured path that does not exist falls back to the bundled key
-        // (Python does the same): verification still happens.
+        // A configured path that does not exist falls back to the bundled
+        // key: verification still happens.
         let missing = Config {
             update_public_key_path: td.path().join("nope.pem").display().to_string(),
             ..cfg(td.path())
@@ -3531,6 +3517,30 @@ mod tests {
         // Reinstalling the same version leaves nothing to roll back to.
         let st = arm_health_gate(&cfg(td.path()), &path, "0.5.0", Some("0.5.0".into())).unwrap();
         assert!(st.previous_version.is_none());
+    }
+
+    /// `update apply … --restart` run as root arms the gate in the service
+    /// user's state dir: the status file is that user's, even replacing a
+    /// root-owned one an older root run left. Needs root (or a user
+    /// namespace).
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_update_status_goes_to_the_state_dir_owner() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        let path = td.path().join("update_status.json");
+        fs::write(&path, "{}").unwrap();
+        arm_health_gate(&cfg(td.path()), &path, "0.5.0", Some("0.4.0".into())).unwrap();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (meta.uid(), meta.gid(), meta.mode() & 0o777),
+            (1000, 1000, 0o644)
+        );
     }
 
     #[test]
@@ -3692,11 +3702,12 @@ mod tests {
     }
 
     /// Still the agent being replaced at the deadline: the restart into 0.4.0
-    /// never happened. It rolls back so `current` matches what runs (and
-    /// restarts), but 0.4.0 never ran, so that does not hold it: an agent
-    /// started since installs it again when the server still asks for it.
-    /// The process whose restart failed does not, or it would download and
-    /// pause jobs for a gate on every retry while its restarts keep failing.
+    /// never happened. It rolls back to the slot the activation replaced,
+    /// the 0.3.0 it runs (and restarts), but 0.4.0 never ran, so that does
+    /// not hold it: an agent started since installs it again when the server
+    /// still asks for it. The process whose restart failed does not, or it
+    /// would download and pause jobs for a gate on every retry while its
+    /// restarts keep failing.
     #[test]
     fn missed_restart_rolls_back_without_holding_the_version() {
         let td = tempfile::tempdir().unwrap();
@@ -3797,7 +3808,7 @@ mod tests {
             assert_eq!(out.status, STATUS_ROLLED_BACK, "{ctx}");
             assert_eq!(
                 out.last_error.as_deref(),
-                Some("manual rollback to 0.3.0 during the health gate"),
+                Some("current changed to 0.3.0 during the health gate"),
                 "{ctx}"
             );
             assert_eq!(out.target_version.as_deref(), Some("0.4.0"), "{ctx}");
@@ -3822,6 +3833,29 @@ mod tests {
         );
         assert_eq!(st.status, STATUS_ROLLED_BACK);
         assert_eq!(current_name(&root), "0.3.0");
+    }
+
+    /// `update apply --file 0.5.0` without --restart while the gate for 0.4.0
+    /// is open moves `current` forward, not back: the gate closes the same
+    /// way, under a label that does not call it a rollback.
+    #[test]
+    fn newer_apply_during_the_gate_is_not_called_a_rollback() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let gate = armed_gate(td.path(), &c);
+        let tarball = build_release(&td.path().join("0.5.0"), "0.5.0");
+        let m = manifest_for(&tarball, "0.5.0");
+        apply_local_release(&m, &env(&root), &tarball, None, false).unwrap();
+        let old = slot_agent(&root, "0.3.0");
+        let out = process_pending_health(gate, &c, &old, WhoamiResult::Ok, None, None);
+        assert_eq!(out.status, STATUS_ROLLED_BACK);
+        assert_eq!(
+            out.last_error.as_deref(),
+            Some("current changed to 0.5.0 during the health gate")
+        );
+        assert_eq!(out.target_version.as_deref(), Some("0.4.0"));
+        assert_eq!(current_name(&root), "0.5.0");
     }
 
     /// The activate helper flipped `current`, then reported failure (a

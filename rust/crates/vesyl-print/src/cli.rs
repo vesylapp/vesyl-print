@@ -23,9 +23,10 @@ use crate::statusio::{self, CloudState, PairingState};
 use crate::update::{self, ReleaseManifest, UpdateEnv};
 use crate::{printers, sysinfo, JsonObject};
 
-/// Parsing follows Python's argparse, which this CLI replaces: unambiguous
-/// prefixes of long options are accepted (`--ch` for `--check`) and a
-/// repeated option keeps its last value. Both settings reach every subcommand.
+/// Parsing follows Python's argparse, as the Python CLI this replaced did, so
+/// existing invocations keep working: unambiguous prefixes of long options
+/// are accepted (`--ch` for `--check`) and a repeated option keeps its last
+/// value. Both settings reach every subcommand.
 #[derive(Parser, Debug)]
 #[command(
     name = "vesyl-print",
@@ -157,7 +158,7 @@ pub struct TestPrintArgs {
     json: bool,
 }
 
-/// Fatal CLI error: printed to stderr, exit status 1 (Python `_die`).
+/// Fatal CLI error: printed to stderr, exit status 1.
 #[derive(Debug)]
 pub struct Die(pub String);
 
@@ -180,7 +181,7 @@ fn cloud_msg(prefix: &str, e: &CloudError) -> String {
     }
 }
 
-/// Python `oct(mode)`.
+/// A file mode as `claim` and `status` print it: `0o600`.
 fn oct(mode: u32) -> String {
     format!("0o{mode:o}")
 }
@@ -1036,10 +1037,9 @@ struct AcceptedTestLabel {
     outcome: JobOutcome,
 }
 
-/// Print the built-in test label (Python `test_label.submit_test_label(
-/// cups, fmt, wait_cups=False)`). The job runs through a private job store,
+/// Print the built-in test label. The job runs through a private job store,
 /// removed afterwards, so it never touches the agent's queue, and returns
-/// once `lp` has it.
+/// once `lp` has it (CUPS is not watched).
 fn submit_test_label(
     deps: &Deps,
     queue: &str,
@@ -1687,7 +1687,7 @@ mod tests {
                 "unsupported test format: png",
                 "invalid_job",
             ),
-            // The format is checked first, as in Python.
+            // The format is checked first.
             ("", " EPL ", "unsupported test format:  EPL ", "invalid_job"),
             ("  ", "pdf", "missing cups_name", "invalid_job"),
             ("Zebra", "zpl", not_found.as_str(), "content_missing"),

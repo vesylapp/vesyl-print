@@ -78,9 +78,9 @@ pub fn py_int(v: &Value) -> Option<i64> {
 ///
 /// When root writes (an operator running the CLI), the new file keeps the
 /// owner of the file it replaces, or of the directory for a new file, so the
-/// non-root service can still read it, and a rolled-back Python agent, which
-/// rewrites some files in place, can still write it. Directories created on
-/// the way get the owner of the closest existing one.
+/// non-root service can still read it (credentials.json is 0600), and no
+/// root-owned file is left in the service user's trees. Directories created
+/// on the way get the owner of the closest existing one.
 pub fn write_durable(path: &Path, data: &[u8], mode: u32, sync_dir: bool) -> io::Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
