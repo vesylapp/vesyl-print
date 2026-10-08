@@ -62,16 +62,22 @@ against local HTTP/WebSocket servers.
 
 `crates/vesyl-print/tests/` drives the release tooling in temp dirs:
 `build_release.rs` runs `scripts/build-release.sh` (all modes, with a fake
-cargo/qemu and throwaway Ed25519 keys) and checks that its manifests verify
-with `update::verify_manifest`, including a non-ASCII changelog;
-`apply_update.rs` runs a copy of the root helper against a fake install root;
-`setup_sh.rs` runs `setup.sh`'s preflight unprivileged (with `sudo` stubbed),
-and its `root_*` tests run all of `setup.sh` in a chroot inside a private
-mount namespace (host `/usr` read-only; apt-get, systemctl, usermod, visudo,
+cargo/qemu/readelf and throwaway Ed25519 keys) and checks that its manifests
+verify with `update::verify_manifest`, including a non-ASCII changelog, that
+it refuses a binary above the glibc floor and takes exactly the versions
+`update::is_version` takes, and that the workflows pin their actions and
+tools; `apply_update.rs` runs a copy of the root helper against a fake
+install root; `setup_sh.rs` runs `setup.sh`'s preflight unprivileged (with
+`sudo` stubbed: the install root in plain form, versions as `is_version`
+judges them, and `apply-update`'s version check too), and its `root_*` tests
+run all of `setup.sh` in a chroot inside a private mount namespace (host
+`/usr` read-only; apt-get, dpkg-query, systemctl, usermod, visudo,
 tailscale, curl and sudo stubbed): a custom `INSTALL_ROOT` written into both
-root helpers and activated through the installed `apply-update`, the service
-account (`SUDO_USER`, else the tree's owner, never root), re-provisioning
-without a Tailscale key, and the source-tree cleanup.
+root helpers and activated through the installed `apply-update` (also with
+trailing slashes, as the agent's OTA paths), the service account
+(`SUDO_USER`, else the tree's owner, never root), required packages
+installed without the optional one, re-provisioning without a Tailscale key,
+and the source-tree cleanup.
 They need bash, jq, rsync, openssl and GNU coreutils; when one is missing they
 skip locally and fail in CI.
 
@@ -84,7 +90,14 @@ binaries with `cargo test --locked --no-run --message-format=json`).
 
 `scripts/build-release.sh` cross-compiles for `aarch64-unknown-linux-gnu.2.31`
 with cargo-zigbuild (Debian bullseye and newer) and sets `VESYL_PRINT_VERSION`
-from the release tag. See [OTA_UPDATES.md](../OTA_UPDATES.md) §4.2.
+from the release tag. It refuses a binary that needs a glibc symbol newer
+than 2.31 (`readelf -V`), and in CI one that does not run under
+qemu-aarch64. Wherever the Rust tests run in CI, the `aarch64` job of
+`.github/workflows/rust.yml` runs that build too (`BUILD_ONLY=1`, a
+throwaway version), with clippy for aarch64 and the unit tests under qemu,
+so code that only breaks on the Pi fails before a tag. Both workflows
+install cargo-zigbuild and zig from `.github/zigbuild-requirements.txt`
+(pinned versions and hashes). See [OTA_UPDATES.md](../OTA_UPDATES.md) §4.2.
 
 The first Rust-only release is tagged `v0.5.0`, with `VERSION` bumped to
 0.5.0 in the same commit: the lab Pi already ran lab builds 0.4.0 and 0.4.1
@@ -121,5 +134,16 @@ agent on purpose):
   README). `printers::test_image()` also looks for it, but nothing calls that
   (or `print_test_page()`) at present.
 - `status --check` and `queues --json` print JSON keys sorted.
-- `update apply --manifest-url` and `update rollback` use the installed
-  `apply-update` sudo helper when present.
+- Every activation (an OTA install, `update apply --file` /
+  `--manifest-url`, `update rollback`, the health gate's rollback) goes
+  through the installed `apply-update` sudo helper when present, and its
+  refusal is final; `update::flip_current` runs only without a helper (lab,
+  tests). A rollback takes the newest other slot that can run and refuses an
+  explicit one that cannot.
+- `vesyl-print agent` refuses to run as root: run it as the service user
+  (`sudo -u <service user> vesyl-print agent`). On SIGTERM it finishes the
+  request in flight, so a stop takes up to systemd's `TimeoutStopSec`
+  (default 90 s).
+- `update apply` (online, or `--version`) installs even with
+  `auto_update_enabled: false`; `--version X` uses the heartbeat's
+  `update_url` only when the server wants exactly X.

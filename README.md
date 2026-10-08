@@ -55,10 +55,14 @@ sudo ./vesyl-print-$V/setup.sh
 ```
 
 This installs the packages (CUPS, poppler-utils, NetworkManager; python3,
-Pillow, numpy, segno and DejaVu fonts for the LCD), the display overlay, config
+Pillow, numpy and DejaVu fonts for the LCD), the display overlay, config
 dirs, the root helpers + sudoers, the release, the CLI wrapper and both systemd
 units, then deletes the extracted `vesyl-print-$V/` (`SKIP_SOURCE_CLEANUP=1`
 keeps it; a git checkout or a directory with another name is never deleted).
+A required package that apt cannot install, and that is not installed
+already, stops `setup.sh`, naming it, before any later step runs.
+`python3-segno` (the Wi-Fi setup QR code) is installed on its own, best
+effort: without it the LCD shows the network name and PIN as text.
 Options go after `sudo`, which drops the caller's environment:
 `sudo SKIP_TAILSCALE=1 ./setup.sh` (see the header of `setup.sh`).
 
@@ -74,7 +78,9 @@ does `setup.sh` fall back to the owner of the extracted tree, and it stops,
 before changing anything, if that owner is root; `chown -R` the tree to the
 service account first. A custom install root
 (`sudo INSTALL_ROOT=/srv/vesyl-print ./setup.sh`) is written into the units,
-the CLI wrapper and both root helpers.
+the CLI wrapper and both root helpers. It must be an absolute path whose
+components are letters, digits and `._-` (no `.` or `..`); trailing slashes
+are dropped.
 
 A git checkout has no binary, so `setup.sh` stops before changing anything.
 Build a release from a checkout (needs cargo-zigbuild) with
@@ -263,6 +269,15 @@ vesyl-print version
 vesyl-print update check|apply|rollback
 ```
 
+`vesyl-print agent` runs as the service account (the units' `User=`, the
+owner of `/var/lib/vesyl-print`) and refuses to run as root, which would
+leave root-owned files in the state dir and follow links that account can
+plant there. To run it in the foreground, stop the service and use
+`sudo -u <service user> vesyl-print agent` (e.g. `sudo -u vesyl`). On
+SIGTERM or Ctrl-C it finishes the request in flight, then exits; a second
+signal quits at once. Under systemd a stop waits for that at most the
+default `TimeoutStopSec` (90 s) before the agent is killed.
+
 The LCD and its stream page use the `--json` forms (the stream page's claim
 form runs `vesyl-print claim CODE [--name N] --json`, the LCD's Test button
 `vesyl-print test-print --queue Q --format F --json`):
@@ -362,6 +377,13 @@ journalctl -u vesyl-print-agent -f
 Agent logs never include `device_token`. `VESYL_PRINT_LOG=debug` raises the
 agent's log level.
 
+The agent unit sets `OOMPolicy=continue` and `MemoryMax=50%`: a PDF renderer
+(`pdftoppm`, `gs`) the kernel kills for memory fails its print job while the
+agent keeps running, and the agent with its renderers never takes more than
+half the RAM, so a runaway render cannot push the LCD into the kernel's OOM
+killer. Both need the kernel's memory cgroup controller. Units are installed
+by `setup.sh` only; OTA does not rewrite them.
+
 ## OTA updates (app)
 
 Long-term plan (app + OS layers, control plane, roadmap): **[OTA_UPDATES.md](./OTA_UPDATES.md)**.
@@ -439,12 +461,23 @@ vesyl-print update rollback [--version 0.5.0] --restart
 
 `update apply` without a source takes the cloud's desired version (or
 `--version`) and goes the heartbeat way: install, `pending_health`, restart,
-health gate. `--manifest-url` and `--file` install and activate only. Add
-`--restart` to also arm the health gate (`pending_health` until
-`update_health_gate_seconds`, rollback to the slot that was active) and
-restart the services. Without it nothing restarts and no gate is armed: the
-running agent carries on, and the new slot starts, unchecked, on the next
-service restart.
+health gate. It installs even with `auto_update_enabled: false`, which only
+stops the agent from installing on its own (the Python CLI installed nothing
+then). `--version X` fetches X's manifest from `releases_base_url`; the
+heartbeat's `update_url` is used only when the cloud's desired version is
+exactly `X`. `--manifest-url` and `--file` install and activate only, with
+the same checks as an online install (`min_agent_version`, signature,
+SHA-256, an executable `vesyl-print` in the slot) and through `apply-update`
+when it is installed. Add `--restart` to also arm the health gate
+(`pending_health` until `update_health_gate_seconds`, rollback to the slot
+that was active) and restart the services. Without it nothing restarts and no
+gate is armed: the running agent carries on, and the new slot starts,
+unchecked, on the next service restart.
+
+`update rollback` activates the newest other release whose slot holds an
+executable `vesyl-print` (or `--version X`, refused if X's slot cannot run).
+Every activation goes through `apply-update` where it is installed; if the
+helper refuses, `current` stays where it was.
 
 ### Config (`/etc/vesyl-print/config.json`)
 
@@ -521,7 +554,9 @@ cargo test --locked                        # agent, CLI, and the release scripts
 cd .. && python3 -m unittest discover -s tests   # LCD display (Python)
 ```
 
-Unit tests mock HTTP; no network or real tokens required. The Rust integration
+Unit tests mock HTTP; no network or real tokens required. The PDF rendering
+tests run against `pdftoppm` (poppler-utils) and `gs` (ghostscript) when they
+are installed, and skip without them. The Rust integration
 tests (`rust/crates/vesyl-print/tests/`) run `scripts/build-release.sh`,
 `scripts/apply-update` and `setup.sh`'s preflight in temp dirs with a fake
 cargo and throwaway keys; they need bash, jq, rsync, openssl and GNU
@@ -536,9 +571,16 @@ cargo test --locked --no-run --message-format=json \
 unshare --map-root-user --map-auto <test binary> --include-ignored
 ```
 
-CI: `.github/workflows/rust.yml` (format, clippy, Rust and script tests) and
-`.github/workflows/lcd.yml` (the Python LCD tests, with Pillow, numpy and the
-DejaVu fonts from apt as on devices; segno too where the runner packages it).
+CI: `.github/workflows/rust.yml` (format, clippy, Rust and script tests, with
+both PDF renderers installed; and an aarch64 job that runs clippy for
+aarch64, builds the release tarball as the tag's build job does, glibc 2.31
+floor and `--version` under qemu included, and runs the unit tests for
+aarch64 under qemu) and `.github/workflows/lcd.yml` (the Python LCD tests,
+with Pillow, numpy and the DejaVu fonts from apt as on devices; segno too
+where the runner packages it). The LCD tests never touch the machine's
+network setup: the Wi-Fi tests keep the captive-portal snippet, setup state
+and portal pid in a temp dir, record iptables calls, and fail if anything
+else would run.
 
 ## LCD views
 
