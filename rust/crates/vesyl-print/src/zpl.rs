@@ -245,9 +245,10 @@ impl PdfInfo {
         out.success.then(|| PdfInfo::parse(&out.stdout, first))
     }
 
-    /// The renderers draw the MediaBox: the "Page size" line is the CropBox,
-    /// which can be far smaller. One page's box line has no page number (it
-    /// is `first`, or page 1 below that).
+    /// The renderers draw the MediaBox: the page "size" line is the CropBox,
+    /// which can be far smaller. The box lines are numbered
+    /// (`Page    2 MediaBox: …`) unless `-l` is 0, as for render_page's page
+    /// 0: unnumbered, they are page `first`, or page 1 below that.
     ///
     /// Only lines after the last `Pages:` count: the ones before it are the
     /// document's own metadata (title, author …), which could fake a box.
@@ -1774,20 +1775,32 @@ pub(crate) mod tests {
 
     #[test]
     fn pdfinfo_media_boxes_are_parsed_after_the_metadata() {
-        // One page (`-f 2 -l 2`): no page number on the box lines, and the
-        // "Page size" is the CropBox, not what is rendered.
-        let one = "Title:           x\nPages:           3\nPage size:       288 x 432 pts\n\
-                   Page rot:        0\nMediaBox:            0.00     0.00  9000.00  9000.00\n\
-                   CropBox:             0.00     0.00   288.00   432.00\n";
+        // One page (`-f 2 -l 2`): its lines are numbered, and its "size" is
+        // the CropBox, not what is rendered.
+        let numbered = "Title:           x\nPages:           3\nPage    2 size:  288 x 432 pts\n\
+                        Page    2 rot:   0\n\
+                        Page    2 MediaBox:      0.00     0.00  9000.00  9000.00\n\
+                        Page    2 CropBox:       0.00     0.00   288.00   432.00\n";
         assert_eq!(
-            PdfInfo::parse(one, 2),
+            PdfInfo::parse(numbered, 2),
             PdfInfo {
                 pages: Some(3),
                 media_boxes: vec![(2, 9000.0, 9000.0)],
             }
         );
-        // A page below 1 is rendered as page 1.
-        assert_eq!(PdfInfo::parse(one, 0).media_boxes[0].0, 1);
+        // Page 0 (`-f 0 -l 0`): no page numbers, and the box is page 1's,
+        // the page pdftoppm draws for it. (`-f 2 -l 0` would list page 2's.)
+        let unnumbered = "Title:           x\nPages:           3\nPage size:       288 x 432 pts\n\
+                          Page rot:        0\nMediaBox:            0.00     0.00  9000.00  9000.00\n\
+                          CropBox:             0.00     0.00   288.00   432.00\n";
+        assert_eq!(
+            PdfInfo::parse(unnumbered, 0),
+            PdfInfo {
+                pages: Some(3),
+                media_boxes: vec![(1, 9000.0, 9000.0)],
+            }
+        );
+        assert_eq!(PdfInfo::parse(unnumbered, 2).media_boxes[0].0, 2);
         // Several pages, with an offset origin; a title faking a box and a
         // page count is ignored (it comes before the real `Pages:`).
         let many = "Title:           x\nPages:           1\nMediaBox: 0 0 1 1\nAuthor: y\n\
@@ -1966,7 +1979,8 @@ pub(crate) mod tests {
         fs::write(
             &script,
             format!(
-                "for last; do :; done\n\
+                "#!/bin/sh\n\
+                 for last; do :; done\n\
                  case \" $* \" in *' -singlefile '*) out=\"$last.png\" ;; *) out=\"$last-1.png\" ;; esac\n\
                  cp '{}' \"$out\"\n\
                  echo 'Out of memory' >&2\n",
@@ -2158,17 +2172,43 @@ pub(crate) mod tests {
             );
             assert!(is_permanent(&err));
         }
-        // A box past ZPL's 32000 dots on one side only is clamped: the label
-        // is what that side allows (here, all of the height).
+        // A huge box on one side only changes nothing for a normal label: the
+        // other side still bounds it.
         let default = image_path_to_zpl(&label, &JsonObject::new()).unwrap();
         let wide = image_path_to_zpl(&label, &opts(json!({"label_width_dots": 200000}))).unwrap();
         assert_eq!(wide, default);
         let tall = json!({"zpl_fit": "width", "zpl_max_height_dots": 200000});
-        let clamped = json!({"zpl_fit": "width", "zpl_max_height_dots": 32000});
+        let bounded = json!({"zpl_fit": "width", "zpl_max_height_dots": 32000});
         assert_eq!(
             image_path_to_zpl(&label, &opts(tall)).unwrap(),
-            image_path_to_zpl(&label, &opts(clamped)).unwrap()
+            image_path_to_zpl(&label, &opts(bounded)).unwrap()
         );
+
+        // A box past ZPL's 32000 dots is clamped to them: a bar fitted to the
+        // width makes a label the full 32000 dots long or wide, as in a
+        // 32000-dot box. Unclamped, either bar would be 80 M dots
+        // (label_too_large).
+        let bar = |name: &str, w: u32, h: u32| {
+            let p = td.path().join(name);
+            GrayImage::from_pixel(w, h, Luma([0])).save(&p).unwrap();
+            p
+        };
+        let huge = opts(json!({
+            "zpl_fit": "width", "zpl_max_width_dots": 200000, "zpl_max_height_dots": 200000
+        }));
+        let full = opts(json!({
+            "zpl_fit": "width", "zpl_max_width_dots": 32000, "zpl_max_height_dots": 32000
+        }));
+        let wide_bar = bar("wide.png", 500, 1);
+        let zpl = image_path_to_zpl(&wide_bar, &huge).unwrap();
+        assert_eq!(zpl, image_path_to_zpl(&wide_bar, &full).unwrap());
+        assert_eq!(label_widths(&zpl), [32000]);
+        // 31968 dots of bar below the 32-dot top margin.
+        let tall_bar = bar("tall.png", 1, 500);
+        let zpl = image_path_to_zpl(&tall_bar, &huge).unwrap();
+        assert_eq!(zpl, image_path_to_zpl(&tall_bar, &full).unwrap());
+        assert_eq!(label_lengths(&zpl), [32000]);
+        assert_eq!(label_fields(&zpl), [(0, 32, 8)]);
     }
 
     #[test]
@@ -2295,6 +2335,14 @@ pub(crate) mod tests {
             row * 8
         );
         assert!(pw <= 812, "^PW{pw} wider than the 4\" media");
+
+        // A negative offset leaves the box alone, as it always has: a dot
+        // fitted to the width fills the same 812 dots, and only ^FO moves.
+        let dot = tiny_png(td.path());
+        let fitted = |x: i64| {
+            image_path_to_zpl(&dot, &opts(json!({"zpl_fit": "width", "zpl_x": x}))).unwrap()
+        };
+        assert_eq!(fitted(-5), fitted(0).replace("^FO0,32^", "^FO-5,32^"));
     }
 
     /// The repository's real 4×6 test label (`assets/test-labels/`).
