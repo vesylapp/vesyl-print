@@ -1265,6 +1265,76 @@ mod tests {
         }
     }
 
+    /// A slot the service user can already change (an archive without one
+    /// top directory is unpacked straight into the staging dir, which was
+    /// handed to it) has a directory swapped for a link to a root-owned
+    /// victim after the hand-over opened it, before its names are listed.
+    /// The names then come from the victim, but only entries of the
+    /// directory that was opened change: the victim's file of the same name
+    /// stays root's. Needs root (or a user namespace).
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_tree_handover_changes_only_the_opened_directory() {
+        if euid() != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let releases = td.path().join("releases");
+        let slot = releases.join("0.9.0");
+        let lib = slot.join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        fs::write(lib.join("a.py"), b"py").unwrap();
+        for dir in [&releases, &slot] {
+            std::os::unix::fs::chown(dir, Some(1000), Some(1000)).unwrap();
+        }
+        let victim = tempfile::tempdir().unwrap();
+        fs::write(victim.path().join("a.py"), b"root's").unwrap();
+
+        let swapped = Cell::new(false);
+        let before_entries = |dir: &Path| {
+            if dir == lib.as_path() {
+                swap_dir_for_link(&lib, victim.path());
+                swapped.set(true);
+            }
+        };
+        hand_tree_with(&slot, Some(ROOT), &before_entries).unwrap();
+        assert!(swapped.get());
+        for p in [victim.path().to_path_buf(), victim.path().join("a.py")] {
+            assert_eq!(fs::metadata(&p).unwrap().uid(), 0, "{}", p.display());
+        }
+        for p in [slot.join("lib.moved"), slot.join("lib.moved/a.py")] {
+            assert_eq!(fs::metadata(&p).unwrap().uid(), 1000, "{}", p.display());
+        }
+    }
+
+    /// The tree's parent is reached as [`create_dir_all_owned`] reaches it:
+    /// a symlink the service user owns on the way is refused, and nothing
+    /// is handed over, not even to the owner of where it points. Needs root
+    /// (or a user namespace).
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_tree_handover_refuses_a_link_to_the_parent() {
+        if euid() != 0 {
+            return;
+        }
+        let install = service_tree();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let releases = elsewhere.path().join("releases");
+        let slot = releases.join("0.9.0");
+        fs::create_dir_all(slot.join("bin")).unwrap();
+        fs::write(slot.join("bin/vesyl-print"), b"bin").unwrap();
+        std::os::unix::fs::chown(&releases, Some(1000), Some(1000)).unwrap();
+        let link = install.path().join("releases");
+        std::os::unix::fs::symlink(&releases, &link).unwrap();
+        std::os::unix::fs::lchown(&link, Some(1000), Some(1000)).unwrap();
+
+        let err = hand_tree_to_parent_owner(&link.join("0.9.0")).unwrap_err();
+        assert!(refused_link(&err), "{err}");
+        for p in [slot.clone(), slot.join("bin"), slot.join("bin/vesyl-print")] {
+            assert_eq!(fs::metadata(&p).unwrap().uid(), 0, "{}", p.display());
+        }
+    }
+
     #[test]
     #[ignore = "needs root (or a user namespace) to chown"]
     fn root_write_hands_files_to_the_directory_owner() {
