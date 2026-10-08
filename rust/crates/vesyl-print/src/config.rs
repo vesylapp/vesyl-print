@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::util::{py_int, py_str, truthy};
+use crate::util::{create_dir_all_owned, py_int, py_str, truthy, write_durable};
 use crate::JsonObject;
 
 /// Version baked in at build time: `VESYL_PRINT_VERSION` (set by
@@ -223,12 +223,15 @@ impl Config {
         self.state_dir.join("processed")
     }
 
-    /// Create config/state dirs used by agent and CLI (best-effort).
+    /// Create config/state dirs used by agent and CLI. Root (an operator
+    /// running the CLI) makes them the closest existing directory owner's,
+    /// so a `sudo vesyl-print …` on a fresh device leaves them to the
+    /// service user that owns the trees `setup.sh` made.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
-        fs::create_dir_all(&self.config_dir)?;
-        fs::create_dir_all(&self.state_dir)?;
-        fs::create_dir_all(self.queue_dir())?;
-        fs::create_dir_all(self.processed_dir())
+        create_dir_all_owned(&self.config_dir)?;
+        create_dir_all_owned(&self.state_dir)?;
+        create_dir_all_owned(&self.queue_dir())?;
+        create_dir_all_owned(&self.processed_dir())
     }
 
     /// Apply config.json keys. Like Python, a bad value stops processing at
@@ -326,14 +329,13 @@ pub(crate) fn load_config_with(
 }
 
 /// Write a starter config.json if missing. Returns path written/existing.
+/// Root (`sudo vesyl-print claim`) writes it as the config dir's owner,
+/// like every file [`write_durable`] writes.
 pub fn write_default_config(path: Option<&Path>) -> std::io::Result<PathBuf> {
     let cfg = load_config(None, None);
     let out = path
         .map(Path::to_path_buf)
         .unwrap_or_else(|| cfg.config_path());
-    if let Some(parent) = out.parent() {
-        fs::create_dir_all(parent)?;
-    }
     if out.is_file() {
         return Ok(out);
     }
@@ -351,7 +353,7 @@ pub fn write_default_config(path: Option<&Path>) -> std::io::Result<PathBuf> {
     });
     let mut raw = serde_json::to_string_pretty(&payload).expect("static json");
     raw.push('\n');
-    fs::write(&out, raw)?;
+    write_durable(&out, raw.as_bytes(), 0o644, false)?;
     Ok(out)
 }
 
@@ -432,5 +434,62 @@ mod tests {
         assert_eq!(WaitCups::from_json(&json!("OFF")), WaitCups::Off);
         assert_eq!(WaitCups::from_json(&json!(0)), WaitCups::Off);
         assert_eq!(WaitCups::from_json(&json!("whatever")), WaitCups::Async);
+    }
+
+    /// The starter config.json: 0644, its directory made if missing, and
+    /// never written over an existing one.
+    #[test]
+    fn default_config_is_written_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("etc/vesyl-print/config.json");
+        assert_eq!(write_default_config(Some(&path)).unwrap(), path);
+        let data: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(data["auto_update_enabled"], true);
+        assert_eq!(data["releases_base_url"], DEFAULT_RELEASES_BASE_URL);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let own = "{\"heartbeat_seconds\": 15}\n";
+        fs::write(&path, own).unwrap();
+        assert_eq!(write_default_config(Some(&path)).unwrap(), path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), own);
+    }
+
+    /// `sudo vesyl-print claim` (or test-print, update …) on a fresh device:
+    /// the dirs and the starter config.json it makes are the service user's,
+    /// as `setup.sh` would have made them. Needs root (or a user namespace):
+    /// `unshare --map-root-user --map-auto <test binary> --include-ignored`.
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_dirs_and_default_config_go_to_the_service_user() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        let cfg = Config {
+            config_dir: td.path().join("etc/vesyl-print"),
+            state_dir: td.path().join("var/lib/vesyl-print"),
+            ..Config::default()
+        };
+        cfg.ensure_dirs().unwrap();
+        let config = write_default_config(Some(&cfg.config_path())).unwrap();
+        for path in [
+            td.path().join("etc"),
+            cfg.config_dir.clone(),
+            td.path().join("var/lib"),
+            cfg.state_dir.clone(),
+            cfg.queue_dir(),
+            cfg.processed_dir(),
+            config.clone(),
+        ] {
+            let meta = fs::symlink_metadata(&path).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (1000, 1000), "{}", path.display());
+        }
+        assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o644);
     }
 }

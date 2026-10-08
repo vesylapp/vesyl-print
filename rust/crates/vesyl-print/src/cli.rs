@@ -1360,6 +1360,42 @@ mod tests {
         }
     }
 
+    /// `sudo vesyl-print claim` on a fresh device leaves everything it makes
+    /// (config, state, queue and processed dirs, config.json, credentials,
+    /// status.json) to the service user that owns the parent, as `setup.sh`
+    /// leaves it. Needs root (or a user namespace): `unshare --map-root-user
+    /// --map-auto <test binary> --include-ignored`.
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_claim_leaves_its_files_to_the_service_user() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        let srv = serve(vec![(201, CLAIMED)]);
+        let d = deps(td.path(), &srv.base_url);
+        let (r, out) = run_args(&d, &["claim", "AB7K2Q9M", "--json"]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        for path in [
+            d.cfg.config_path(),
+            d.cfg.credentials_path(),
+            d.cfg.status_path(),
+            d.cfg.queue_dir(),
+            d.cfg.processed_dir(),
+        ] {
+            assert!(path.exists(), "{}", path.display());
+        }
+        for dir in [&d.cfg.config_dir, &d.cfg.state_dir] {
+            assert_eq!(not_owned_by(dir, 1000), Vec::<PathBuf>::new());
+        }
+        assert_eq!(
+            auth::credentials_mode(&d.cfg.credentials_path()),
+            Some(0o600)
+        );
+    }
+
     /// A URL nothing listens on.
     fn closed_port_url() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

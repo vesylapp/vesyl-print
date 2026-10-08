@@ -604,7 +604,7 @@ pub fn http_download_to_file(
     let tmp = PathBuf::from(format!("{}.part", dest.display()));
     let result = (|| {
         let mut reader = open_url(url, Timeouts::ARTIFACT, "downloading artifact")?;
-        let mut out = File::create(&tmp).map_err(io_err("download_failed"))?;
+        let mut out = fresh_part_file(&tmp).map_err(io_err("download_failed"))?;
         let mut h = Sha256::new();
         let mut buf = vec![0u8; 1024 * 1024];
         loop {
@@ -632,6 +632,23 @@ pub fn http_download_to_file(
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// A new, empty download file at `path`. One an earlier download left is
+/// unlinked, never reopened: a crashed `sudo vesyl-print update apply`
+/// leaves it root's, which the agent could not open for writing again (it
+/// owns `update/`, so it can unlink it), and opening a symlink planted there
+/// would write through it. Root hands the new file to the directory's owner.
+fn fresh_part_file(path: &Path) -> std::io::Result<File> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let file = File::options().write(true).create_new(true).open(path)?;
+    if let Some(dir) = path.parent() {
+        crate::util::hand_new_file_to_dir_owner(&file, dir);
+    }
+    Ok(file)
 }
 
 pub fn fetch_manifest(url: &str) -> Result<ReleaseManifest, UpdateError> {
@@ -2564,6 +2581,64 @@ mod tests {
             http_download_to_file(&url, &td.path().join("bad.bin"), &"0".repeat(64)).unwrap_err();
         assert_eq!(err.code, "bad_checksum");
         assert!(!td.path().join("bad.bin.part").exists());
+    }
+
+    /// A `.part` file an earlier download left is replaced, never reopened:
+    /// one this user cannot write (root's, from a crashed `sudo vesyl-print
+    /// update apply`; read-only here) failed every later download, and a
+    /// symlink planted there was written through.
+    #[test]
+    fn download_replaces_a_leftover_part_file() {
+        let td = tempfile::tempdir().unwrap();
+        let src = td.path().join("a.bin");
+        fs::write(&src, b"hello-ota").unwrap();
+        let url = url::Url::from_file_path(&src).unwrap().to_string();
+        let sha = hex(&Sha256::digest(b"hello-ota"));
+        let update = td.path().join("update");
+        fs::create_dir(&update).unwrap();
+        let dest = update.join("a.tar.gz");
+        let part = update.join("a.tar.gz.part");
+
+        fs::write(&part, b"stale").unwrap();
+        crate::util::set_mode(&part, 0o444).unwrap();
+        http_download_to_file(&url, &dest, &sha).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"hello-ota");
+        assert!(fs::symlink_metadata(&part).is_err());
+
+        let victim = td.path().join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, &part).unwrap();
+        http_download_to_file(&url, &dest, &sha).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(fs::read(&dest).unwrap(), b"hello-ota");
+        assert!(fs::symlink_metadata(&part).is_err());
+    }
+
+    /// Root downloading into the service user's `update/` (a `sudo vesyl-print
+    /// update apply` whose install then fails, say) leaves the artifact to
+    /// that user, past a root-owned `.part` a crashed run left. Needs root
+    /// (or a user namespace).
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_download_leaves_the_artifact_to_the_update_dir_owner() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let src = td.path().join("a.bin");
+        fs::write(&src, b"hello-ota").unwrap();
+        let url = url::Url::from_file_path(&src).unwrap().to_string();
+        let update = td.path().join("update");
+        fs::create_dir(&update).unwrap();
+        std::os::unix::fs::chown(&update, Some(1000), Some(1000)).unwrap();
+        fs::write(update.join("a.tar.gz.part"), b"stale").unwrap();
+        let dest = update.join("a.tar.gz");
+        http_download_to_file(&url, &dest, &hex(&Sha256::digest(b"hello-ota"))).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"hello-ota");
+        let meta = fs::symlink_metadata(&dest).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (1000, 1000));
     }
 
     #[test]

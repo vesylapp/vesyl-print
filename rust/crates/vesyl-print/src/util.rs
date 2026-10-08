@@ -253,6 +253,28 @@ pub fn create_dir_all_owned(dir: &Path) -> io::Result<()> {
     create_dirs(dir)
 }
 
+/// Hand `file`, just created in `dir`, to `dir`'s owner when root created it
+/// (an operator running the CLI), as [`write_durable`] does with the files it
+/// writes. Through the open file, so nothing is resolved by path. Best
+/// effort: a failure is logged.
+pub fn hand_new_file_to_dir_owner(file: &File, dir: &Path) {
+    let euid = euid();
+    if euid != 0 {
+        return;
+    }
+    let dir_owner = fs::metadata(dir).ok().map(|m| owner(&m));
+    let Some((uid, gid)) = owner_for_rewrite(euid, None, dir_owner) else {
+        return;
+    };
+    if let Err(e) = std::os::unix::fs::fchown(file, Some(uid), Some(gid)) {
+        log::warn!(
+            target: LOG,
+            "could not hand a new file in {} to uid {uid} gid {gid}: {e}",
+            dir.display()
+        );
+    }
+}
+
 /// After root (an operator running the CLI) unpacked a tree into a directory
 /// the service user owns — a release slot under `releases/` — hand every
 /// entry to that directory's owner, so the non-root agent can later replace
