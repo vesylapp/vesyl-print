@@ -7,9 +7,9 @@ install layout, or OS strategy changes.
 | | |
 |--|--|
 | **Owner** | Print / device platform |
-| **Last reviewed** | 2026-07-16 |
+| **Last reviewed** | 2026-10-07 |
 | **Status** | App OTA client + GitHub Releases CI + wms-api heartbeat OTA directives (fleet/node pin) |
-| **Related code** | `update.py`, `scripts/build-release.sh`, `scripts/apply-update`, `.github/workflows/release.yml`, `agent.py`, `cli.py`, `config.py`, `setup.sh`, `keys/` |
+| **Related code** | `update.py`, `scripts/build-release.sh`, `scripts/apply-update`, `.github/workflows/release.yml`, `agent.py`, `cli.py`, `config.py`, `setup.sh`, `keys/`, `rust/` (`update.rs`, `agent.rs`, `cli.rs`) |
 
 ---
 
@@ -152,6 +152,27 @@ Build locally: `./scripts/build-release.sh [VERSION]` with
 4. Optional baked-in PEM in `update.py` (empty by default)
 
 Private key: CI secrets / HSM only — **never** on devices.
+
+### 4.2.1 Rust agent binary (from 0.4.0)
+
+The tarball root also carries `vesyl-print`, the Rust agent + CLI (source in
+`rust/`, not shipped). `build-release.sh` cross-compiles it with
+`cargo-zigbuild` for `aarch64-unknown-linux-gnu` against **glibc 2.31**
+(Debian bullseye and newer) and bakes the release version in via
+`VESYL_PRINT_VERSION`. `SKIP_RUST_BINARY=1` builds a Python-only tarball.
+
+Systemd units and the CLI wrapper are unchanged: `agent.py` and `cli.py`
+`exec` the slot's `vesyl-print` binary when it is present and executable, so
+
+- Python slot → Rust slot is an ordinary OTA (the old Python updater installs it),
+- rollback to a Python-only slot runs the Python agent again,
+- `VESYL_PRINT_PYTHON_AGENT=1` forces the Python agent for debugging.
+
+Slot health accepts either entrypoint (`agent.py`/`main.py` or
+`vesyl-print`). The LCD display (`main.py`) is still Python and only reads
+the shared status files. Verified end-to-end on arm64 bookworm: 0.3.17
+(Python) → 0.4.0 (Rust) via `cli.py update apply --file`, health gate
+`pending_health` → `idle`, then `vesyl-print update rollback` → 0.3.17.
 
 ### 4.3 Device-side flow
 

@@ -8,9 +8,13 @@ use serde_json::{json, Value};
 use crate::util::{py_int, py_str, truthy};
 use crate::JsonObject;
 
-/// Version baked in at build time from the repo-level `VERSION` file.
+/// Version baked in at build time: `VESYL_PRINT_VERSION` (set by
+/// `scripts/build-release.sh` from the release tag), else the repo `VERSION` file.
 pub fn agent_version() -> &'static str {
-    include_str!("../../../../VERSION").trim()
+    match option_env!("VESYL_PRINT_VERSION") {
+        Some(v) if !v.is_empty() => v,
+        _ => include_str!("../../../../VERSION").trim(),
+    }
 }
 
 /// Preferred for Pis: direct API host (paths are /print/v1/...).

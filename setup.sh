@@ -221,6 +221,7 @@ else
             --exclude='**/update_private.pem' \
             --exclude='keys/tailscale.key' \
             --exclude='**/tailscale.key' \
+            --exclude='rust/' \
             "$REPO_DIR/" "$RELEASE_DIR/"
     else
         # Fallback without rsync (still excludes .git / secrets)
@@ -232,6 +233,7 @@ else
             --exclude='dist' \
             --exclude='keys/update_private.pem' \
             --exclude='keys/tailscale.key' \
+            --exclude='rust' \
             -cf - . | tar -C "$RELEASE_DIR" -xf -
     fi
 

@@ -228,3 +228,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Rust binary at the release root (built by scripts/build-release.sh)
+/vesyl-print

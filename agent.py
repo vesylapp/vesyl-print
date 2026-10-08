@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import signal
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 import auth
@@ -813,7 +815,32 @@ def run_agent(cfg: Config | None = None) -> None:
             sess.stop()
 
 
+# Release slots that ship the Rust binary run it instead of this module. The
+# systemd unit still says ``python3 …/agent.py`` so a rollback to a
+# Python-only slot keeps working. Set VESYL_PRINT_PYTHON_AGENT=1 to force Python.
+RUST_BINARY = "vesyl-print"
+ENV_FORCE_PYTHON = "VESYL_PRINT_PYTHON_AGENT"
+
+
+def rust_binary(base_dir: Path | None = None) -> Path | None:
+    """The slot's Rust binary, if present, executable and not disabled."""
+    if os.environ.get(ENV_FORCE_PYTHON):
+        return None
+    candidate = (base_dir or Path(__file__).resolve().parent) / RUST_BINARY
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return candidate
+    return None
+
+
+def exec_rust(argv: list[str]) -> None:
+    """Replace this process with the Rust binary when the slot ships one."""
+    binary = rust_binary()
+    if binary is not None:
+        os.execv(str(binary), [str(binary), *argv])
+
+
 def main() -> None:
+    exec_rust(["agent"])
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

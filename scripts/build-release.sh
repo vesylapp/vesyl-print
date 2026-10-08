@@ -13,6 +13,11 @@
 #   GITHUB_REPOSITORY        owner/repo (default: vesylapp/vesyl-print)
 #   RELEASE_CHANNEL          stable|beta (default: stable)
 #   OUT_DIR                  output directory (default: dist)
+#   SKIP_RUST_BINARY=1       Python-only tarball (no vesyl-print binary)
+#
+# The Rust agent/CLI binary is cross-compiled for aarch64 (glibc >= 2.31) with
+# cargo-zigbuild and placed at the tarball root as ./vesyl-print. agent.py and
+# cli.py hand off to it when present, so existing systemd units keep working.
 #
 # Artifacts written to $OUT_DIR:
 #   vesyl-print-X.Y.Z-linux-aarch64.tar.gz
@@ -71,7 +76,30 @@ rsync -a \
   --exclude='**/update_private.pem' \
   --exclude='keys/tailscale.key' \
   --exclude='**/tailscale.key' \
+  --exclude='rust/' \
+  --exclude='/vesyl-print' \
   "$REPO_ROOT/" "$STAGE_TREE/"
+
+# Rust agent/CLI binary (version baked in from the release tag).
+RUST_TARGET="aarch64-unknown-linux-gnu"
+if [[ "${SKIP_RUST_BINARY:-}" == "1" ]]; then
+  echo "   SKIP_RUST_BINARY=1 — Python-only release"
+else
+  if ! command -v cargo-zigbuild >/dev/null 2>&1; then
+    echo "ERROR: cargo-zigbuild not found (pip install ziglang cargo-zigbuild)" >&2
+    echo "       or set SKIP_RUST_BINARY=1 for a Python-only release" >&2
+    exit 1
+  fi
+  echo "==> Building vesyl-print binary ($RUST_TARGET, glibc 2.31)"
+  (
+    cd "$REPO_ROOT/rust"
+    VESYL_PRINT_VERSION="$VERSION" cargo zigbuild --release --locked \
+      --target "${RUST_TARGET}.2.31"
+  )
+  install -m 0755 "$REPO_ROOT/rust/target/$RUST_TARGET/release/vesyl-print" \
+    "$STAGE_TREE/vesyl-print"
+  echo "   binary: $(du -h "$STAGE_TREE/vesyl-print" | cut -f1)"
+fi
 
 # Ensure VERSION matches release
 printf '%s\n' "$VERSION" >"$STAGE_TREE/VERSION"
