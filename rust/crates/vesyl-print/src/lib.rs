@@ -18,7 +18,7 @@
 //! | [`statusio`] | `status.json`, pairing and cloud state for the LCD         |
 //! | [`sysinfo`]  | host facts (hostname)                                      |
 //! | [`logging`]  | log lines on stderr (journald)                             |
-//! | [`util`]     | JSON coercion, durable writes that keep the service owner  |
+//! | [`util`]     | JSON coercion, home dirs, durable writes safe for root     |
 
 pub mod agent;
 pub mod auth;
