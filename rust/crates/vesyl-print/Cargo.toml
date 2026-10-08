@@ -12,7 +12,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 clap = { version = "4.6.7", features = ["derive"] }
 ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "pem"] }
 flate2 = "1.1.10"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tiff", "webp"] }
 libc = "0.2.190"
 log = { version = "0.4.34", features = ["std"] }
 regex = "1.13.1"
