@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use base64::Engine as _;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use regex::Regex;
@@ -44,6 +44,16 @@ const LOG: &str = "vesyl-print.update";
 
 /// `last_error` prefix written when the post-update health gate fails.
 const HEALTH_FAILED: &str = "health failed";
+
+/// `last_error` prefix written when the gate's deadline passed while the
+/// agent it replaces was still running: the restart into the new version
+/// never happened, so that version never ran and is not held (see
+/// [`failed_health_gate`]).
+const RESTART_MISSED: &str = "restart never happened";
+
+/// `last_error` prefix written when `current` was switched away from the
+/// gate's version by hand (`update rollback`) while the gate was open.
+const MANUAL_ROLLBACK: &str = "manual rollback";
 
 /// Public key shipped with this build (rotated by shipping a new release).
 const BUNDLED_PUBLIC_KEY_PEM: &str = include_str!("../../../../keys/update_public.pem");
@@ -113,6 +123,11 @@ pub struct UpdateStatus {
     pub previous_version: Option<String>,
     pub health_deadline_at: Option<String>,
     pub health_attempts: i64,
+    /// When the open health gate was armed (RFC 3339, to the microsecond).
+    /// The agent the activation replaces started before this; one started
+    /// after it is judged by the gate (see `replaced_by_gated_activation`).
+    /// Written to `update_status.json` only while set.
+    pub armed_at: Option<String>,
 }
 
 impl Default for UpdateStatus {
@@ -127,6 +142,7 @@ impl Default for UpdateStatus {
             previous_version: None,
             health_deadline_at: None,
             health_attempts: 0,
+            armed_at: None,
         }
     }
 }
@@ -151,7 +167,11 @@ impl UpdateStatus {
             "health_deadline_at": self.health_deadline_at,
             "health_attempts": self.health_attempts,
         });
-        v.as_object().cloned().expect("object")
+        let mut d = v.as_object().cloned().expect("object");
+        if let Some(armed) = &self.armed_at {
+            d.insert("armed_at".into(), armed.clone().into());
+        }
+        d
     }
 
     fn is(&self, status: &str) -> bool {
@@ -639,6 +659,99 @@ fn unsafe_archive_path(p: &Path) -> bool {
         || p.components().any(|c| matches!(c, Component::ParentDir))
 }
 
+/// Remove `dir` — a release slot about to be unpacked again, or a staging
+/// dir an extract left behind — so it can be unpacked afresh. One the agent
+/// cannot delete, because root unpacked it (an `update apply` run as root
+/// before slots were handed to the install owner, or one that died
+/// midway), is renamed aside to `.<name>.stale-<n>` in the same directory
+/// instead. That needs write access to that directory only, and the service
+/// user owns `releases/`. [`clean_stale`] deletes such leftovers once an
+/// install can. A missing `dir` is fine.
+pub fn clear_release_dir(dir: &Path) -> Result<(), UpdateError> {
+    // lstat: a symlink in its place is removed itself, never followed.
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return Ok(());
+    };
+    let removed = if meta.is_dir() {
+        fs::remove_dir_all(dir)
+    } else {
+        fs::remove_file(dir)
+    };
+    let Err(e) = removed else {
+        return Ok(());
+    };
+    match set_aside(dir) {
+        Ok(aside) => {
+            log::warn!(
+                target: LOG,
+                "cannot remove {} ({e}); moved it aside to {}",
+                dir.display(),
+                aside.display()
+            );
+            Ok(())
+        }
+        Err(e2) => Err(UpdateError::new(
+            format!(
+                "cannot remove {} ({e}) or move it aside ({e2})",
+                dir.display()
+            ),
+            "bad_archive",
+        )),
+    }
+}
+
+/// Rename `path` to the first free `.<name>.stale-<n>` beside it. A
+/// directory renamed within its parent needs no write access to itself.
+fn set_aside(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for n in 1..=100 {
+        let aside = parent.join(format!(".{name}.stale-{n}"));
+        if matches!(fs::symlink_metadata(&aside), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            fs::rename(path, &aside)?;
+            return Ok(aside);
+        }
+    }
+    Err(std::io::Error::other("too many stale copies beside it"))
+}
+
+/// A name [`set_aside`] gives: `.<name>.stale-<n>`. Never a version, so
+/// [`list_releases`] and the apply-update helper ignore it.
+fn is_stale_name(name: &str) -> bool {
+    name.starts_with('.')
+        && name
+            .rsplit_once(".stale-")
+            .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Best effort: delete what [`clear_release_dir`] moved aside in `dir`. A
+/// tree the agent cannot delete stays until an install that can (an
+/// `update apply` as root) comes along.
+fn clean_stale(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !is_stale_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let path = entry.path();
+        // file_type does not follow a symlink: a link is removed itself.
+        let removed = match entry.file_type() {
+            Ok(t) if t.is_dir() => fs::remove_dir_all(&path),
+            _ => fs::remove_file(&path),
+        };
+        match removed {
+            Ok(()) => log::info!(target: LOG, "removed stale {}", path.display()),
+            Err(e) => log::debug!(target: LOG, "cannot remove stale {} yet: {e}", path.display()),
+        }
+    }
+}
+
 /// Extract tarball into `dest_dir` (must not already exist). Rejects absolute
 /// paths, `..`, and links that point outside the archive.
 pub fn extract_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), UpdateError> {
@@ -650,11 +763,13 @@ pub fn extract_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), UpdateErro
     }
     let parent = dest_dir.parent().unwrap_or(Path::new("."));
     crate::util::create_dir_all_owned(parent).map_err(io_err("bad_archive"))?;
+    clean_stale(parent);
     let staging = PathBuf::from(format!("{}.staging", dest_dir.display()));
-    if staging.exists() {
-        let _ = fs::remove_dir_all(&staging);
-    }
-    fs::create_dir_all(&staging).map_err(io_err("bad_archive"))?;
+    // Left by an extract that died midway, perhaps one run as root.
+    clear_release_dir(&staging)?;
+    // Root hands it to the owner of `releases/`, so the agent can clear
+    // whatever a crash leaves in it.
+    crate::util::create_dir_all_owned(&staging).map_err(io_err("bad_archive"))?;
 
     let open = || -> Result<tar::Archive<flate2::read::GzDecoder<File>>, UpdateError> {
         let f = File::open(tarball)
@@ -704,8 +819,15 @@ pub fn extract_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), UpdateErro
     Ok(())
 }
 
+/// Root (the CLI) writes it as the slot's owner, like the rest of the slot.
+/// A `VERSION` symlink from the archive is replaced, never written through.
 pub fn write_version_file(release_dir: &Path, version: &str) -> std::io::Result<()> {
-    fs::write(release_dir.join("VERSION"), format!("{version}\n"))
+    write_durable(
+        &release_dir.join("VERSION"),
+        format!("{version}\n").as_bytes(),
+        0o644,
+        false,
+    )
 }
 
 fn absolute(p: &Path) -> PathBuf {
@@ -854,11 +976,25 @@ pub fn restart_commands(helper: Option<&Path>) -> Vec<Vec<String>> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// While a test sets this, restarts asked for on its thread are counted
+    /// here instead of run (see `tests::restarts_during`).
+    static RESTARTS_SEEN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 /// Restart display + agent. Best-effort and non-blocking: when the agent
 /// restarts *itself*, systemd SIGTERMs this process while the helper is still
 /// running, so launch it in its own process group and never wait on it.
 pub fn restart_services(helper: Option<&Path>) {
     use std::os::unix::process::CommandExt;
+    #[cfg(test)]
+    if RESTARTS_SEEN
+        .with(|n| n.get().map(|seen| n.set(Some(seen + 1))))
+        .is_some()
+    {
+        return;
+    }
     for argv in restart_commands(helper) {
         let spawned = Command::new(&argv[0])
             .args(&argv[1..])
@@ -940,9 +1076,10 @@ pub fn apply_release(
     http_download_to_file(&manifest.artifact_url, &tarball, &manifest.artifact_sha256)?;
 
     let release_dir = root.join("releases").join(&manifest.version);
-    if release_dir.exists() {
-        fs::remove_dir_all(&release_dir).map_err(io_err("bad_archive"))?;
-    }
+    // A slot of this version from an earlier install. If the agent cannot
+    // delete it (root unpacked it), it is moved aside: failing here would
+    // download the artifact again on every heartbeat, and never install.
+    clear_release_dir(&release_dir)?;
     log::info!(target: LOG, "extracting to {}", release_dir.display());
     extract_tarball(&tarball, &release_dir)?;
     write_version_file(&release_dir, &manifest.version).map_err(io_err("bad_archive"))?;
@@ -978,6 +1115,48 @@ pub fn utc_now_plus(seconds: i64) -> String {
     (Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
+fn parse_utc(iso: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(iso)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// When this process started, on the wall clock: now minus the process's
+/// age, which the kernel keeps on the boot clock (`starttime` in
+/// /proc/self/stat), so a clock step since the start does not move it. The
+/// start is rounded down to a clock tick (10 ms): early, never late. `None`
+/// if /proc cannot tell.
+fn process_started_at() -> Option<DateTime<Utc>> {
+    // Wall clock first: reading the boot clock after it only adds age.
+    let now = Utc::now();
+    let mut boot = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `boot` is a valid timespec for clock_gettime to fill.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut boot) } != 0 {
+        return None;
+    }
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    // Field 2 (comm) is parenthesized and may hold spaces or parentheses;
+    // field 22 (starttime, clock ticks after boot) is the 20th after it.
+    let ticks: i128 = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let hz = i128::from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) });
+    if hz <= 0 {
+        return None;
+    }
+    let boot_ns = i128::from(boot.tv_sec) * 1_000_000_000 + i128::from(boot.tv_nsec);
+    let age_ns = (boot_ns - ticks * 1_000_000_000 / hz).max(0);
+    Some(now - chrono::Duration::nanoseconds(i64::try_from(age_ns).ok()?))
+}
+
 /// Record that activate succeeded; health gate must pass before idle.
 pub fn mark_pending_health(
     st: &mut UpdateStatus,
@@ -994,8 +1173,40 @@ pub fn mark_pending_health(
     st.health_attempts = 0;
     st.last_error = None;
     st.last_checked_at = Some(utc_now());
+    // Compared with process start times, so to the microsecond: cut to the
+    // second, a gate armed just after a process started could look older.
+    st.armed_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Micros, false));
     if channel.is_some() {
         st.channel = channel;
+    }
+}
+
+/// A release slot: its directory and the version it holds.
+struct Slot {
+    /// Directory name under `releases/`.
+    name: String,
+    /// Its `VERSION` file, else its name.
+    version: String,
+}
+
+impl Slot {
+    fn at(dir: &Path) -> Slot {
+        let name = dir_name(dir);
+        let version = fs::read_to_string(dir.join("VERSION"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| name.clone());
+        Slot { name, version }
+    }
+
+    /// `None` when `current` is missing or broken.
+    fn current(install_root: &Path) -> Option<Slot> {
+        current_release_dir(install_root).map(|d| Slot::at(&d))
+    }
+
+    fn is(&self, version: &str) -> bool {
+        same_version(&self.version, version) || self.name == version
     }
 }
 
@@ -1006,15 +1217,11 @@ pub fn local_slot_healthy(env: &UpdateEnv, expected_version: Option<&str>) -> Re
         return Err("current slot missing the vesyl-print binary".into());
     }
     if let Some(expected) = expected_version.filter(|e| !e.is_empty()) {
-        let name = dir_name(&cur);
-        let slot_ver = fs::read_to_string(cur.join("VERSION"))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| name.clone());
-        if !same_version(&slot_ver, expected) && name != expected {
+        let slot = Slot::at(&cur);
+        if !slot.is(expected) {
             return Err(format!(
-                "slot version {slot_ver:?} != expected {expected:?}"
+                "slot version {:?} != expected {expected:?}",
+                slot.version
             ));
         }
         // After a real service restart, code is loaded from current — require match.
@@ -1083,19 +1290,45 @@ impl WhoamiResult {
     }
 }
 
-/// True when this process is the agent that the gated activation replaces:
-/// it was started from a release slot, it runs the version the gate would
-/// roll back to, and the gate is for another version. Activations arm the
+/// True when this process is the agent that the gated activation replaces,
+/// which must leave the gate to its successor: it was started from a
+/// release slot before the gate was armed, it does not run the gate's
+/// version, and `current` still points at that version. Activations arm the
 /// gate before the services restart (a heartbeat OTA in this very process,
 /// or `update apply … --restart` from the CLI), and `systemctl restart
-/// --no-block` lets this process finish its current cycle first.
-fn replaced_by_gated_activation(st: &UpdateStatus, env: &UpdateEnv, expected: &str) -> bool {
+/// --no-block` lets this process finish its current cycle first. Its start
+/// time is what sets it apart from a process started after the activation
+/// (a mislabeled build in the new slot, which the gate must judge): the
+/// slot the gate rolls back to need not be the one it runs from (another
+/// version staged without a restart).
+fn replaced_by_gated_activation(
+    st: &UpdateStatus,
+    env: &UpdateEnv,
+    expected: &str,
+    started_at: Option<DateTime<Utc>>,
+) -> bool {
     env.running_from_slot
         && !same_version(&env.running_version, expected)
-        && st
+        && Slot::current(&env.install_root).is_some_and(|s| s.is(expected))
+        && started_before_gate(st, env, started_at)
+}
+
+/// True when this process started before the gate in `st` was armed.
+/// Without both times (a gate armed by a build that did not record
+/// `armed_at`), the agent being replaced is recognized as it was before: it
+/// runs the version the gate rolls back to.
+fn started_before_gate(
+    st: &UpdateStatus,
+    env: &UpdateEnv,
+    started_at: Option<DateTime<Utc>>,
+) -> bool {
+    match (st.armed_at.as_deref().and_then(parse_utc), started_at) {
+        (Some(armed), Some(started)) => started < armed,
+        _ => st
             .previous_version
             .as_deref()
-            .is_some_and(|p| same_version(p, &env.running_version))
+            .is_some_and(|p| same_version(p, &env.running_version)),
+    }
 }
 
 /// Post-update health gate.
@@ -1107,7 +1340,12 @@ fn replaced_by_gated_activation(st: &UpdateStatus, env: &UpdateEnv, expected: &s
 /// The agent being replaced leaves the gate alone until the deadline: it can
 /// never pass the running-version check, so judging the new slot would roll
 /// back an activation whose restart is already on its way. A deadline that
-/// passes while it still runs means the restart never came; it rolls back.
+/// passes while it still runs means the restart never came: it rolls back,
+/// without holding a version that never ran (see [`failed_health_gate`]).
+///
+/// A gate whose `current` was switched to another version by hand
+/// (`update rollback`) is closed as `rolled_back` at once, with nothing
+/// flipped or restarted again.
 pub fn process_pending_health(
     st: UpdateStatus,
     cfg: &Config,
@@ -1115,6 +1353,27 @@ pub fn process_pending_health(
     whoami: WhoamiResult,
     whoami_error: Option<&str>,
     now_iso: Option<&str>,
+) -> UpdateStatus {
+    judge_pending_health(
+        st,
+        cfg,
+        env,
+        whoami,
+        whoami_error,
+        now_iso,
+        process_started_at(),
+    )
+}
+
+/// [`process_pending_health`] for a process started at `started_at`.
+fn judge_pending_health(
+    st: UpdateStatus,
+    cfg: &Config,
+    env: &UpdateEnv,
+    whoami: WhoamiResult,
+    whoami_error: Option<&str>,
+    now_iso: Option<&str>,
+    started_at: Option<DateTime<Utc>>,
 ) -> UpdateStatus {
     let mut st = if st.is(STATUS_FAILED) {
         recover_false_update_failure(st, cfg, env)
@@ -1130,9 +1389,35 @@ pub fn process_pending_health(
         .target_version
         .clone()
         .unwrap_or_else(|| st.current_version.clone());
-    if replaced_by_gated_activation(&st, env, &expected)
-        && !deadline_passed(st.health_deadline_at.as_deref(), &now)
-    {
+
+    // `current` was switched off the gate's version by hand while the gate
+    // was open: `update rollback`, the documented way out of a bad slot (or
+    // another `update apply` without --restart). That is the rollback, so
+    // the gate closes as one, holding the version like any other; it has
+    // nothing left to flip or restart. A missing `current` is no such
+    // choice: the gate judges it below and rolls back to repair it.
+    if let Some(cur) = Slot::current(&env.install_root).filter(|s| !s.is(&expected)) {
+        log::warn!(
+            target: LOG,
+            "pending_health for {expected}: current was switched to {} — closing the gate as rolled back",
+            cur.version
+        );
+        st.status = STATUS_ROLLED_BACK.into();
+        st.current_version = env.running_version.clone();
+        st.target_version = Some(expected);
+        st.previous_version = None;
+        st.health_deadline_at = None;
+        st.armed_at = None;
+        st.last_checked_at = Some(now);
+        st.last_error = Some(format!(
+            "{MANUAL_ROLLBACK} to {} during the health gate",
+            cur.version
+        ));
+        return st;
+    }
+
+    let replaced = replaced_by_gated_activation(&st, env, &expected, started_at);
+    if replaced && !deadline_passed(st.health_deadline_at.as_deref(), &now) {
         log::info!(
             target: LOG,
             "pending_health for {expected}: waiting for the restart (running {})",
@@ -1143,6 +1428,20 @@ pub fn process_pending_health(
 
     st.last_checked_at = Some(now.clone());
     st.health_attempts += 1;
+
+    if replaced {
+        // Still the agent being replaced at the deadline: the restart into
+        // `expected` never happened (the restart helper failed, say). Roll
+        // back so `current` matches what runs, but `expected` never ran:
+        // this says nothing about it, and an agent started since may retry
+        // it. `armed_at` stays to tell that one from this process, which
+        // does not (see `restart_missed_here`).
+        let armed_at = st.armed_at.clone();
+        let why = format!("{RESTART_MISSED} (still running {})", env.running_version);
+        let mut st = close_failed_gate(st, env, &expected, &why);
+        st.armed_at = armed_at;
+        return st;
+    }
 
     let local = local_slot_healthy(env, Some(&expected));
     let cloud_ok = whoami != WhoamiResult::Error;
@@ -1158,6 +1457,7 @@ pub fn process_pending_health(
         st.current_version = env.running_version.clone();
         st.previous_version = None;
         st.health_deadline_at = None;
+        st.armed_at = None;
         st.last_error = None;
         return st;
     }
@@ -1189,18 +1489,33 @@ pub fn process_pending_health(
     }
 
     // Deadline or hard local failure → rollback if we can.
-    if let Some(prev) = st.previous_version.clone().filter(|p| *p != expected) {
-        log::error!(target: LOG, "post-update health failed ({reason}) — rolling back to {prev}");
+    close_failed_gate(st, env, &expected, &format!("{HEALTH_FAILED}: {reason}"))
+}
+
+/// Close a gate for `expected` that did not pass: roll back to
+/// `previous_version` and restart the services, else mark it failed. `why`
+/// leads `last_error`, which [`failed_health_gate`] reads.
+fn close_failed_gate(
+    mut st: UpdateStatus,
+    env: &UpdateEnv,
+    expected: &str,
+    why: &str,
+) -> UpdateStatus {
+    st.armed_at = None;
+    if let Some(prev) = st
+        .previous_version
+        .clone()
+        .filter(|p| p.as_str() != expected)
+    {
+        log::error!(target: LOG, "{why} — rolling back to {prev}");
         return match rollback(&env.install_root, Some(&prev), env.apply_helper.as_deref()) {
             Ok(rolled) => {
                 st.status = STATUS_ROLLED_BACK.into();
                 st.current_version = rolled.clone();
-                st.target_version = Some(expected);
+                st.target_version = Some(expected.into());
                 st.previous_version = None;
                 st.health_deadline_at = None;
-                st.last_error = Some(format!(
-                    "{HEALTH_FAILED}: {reason}; rolled back to {rolled}"
-                ));
+                st.last_error = Some(format!("{why}; rolled back to {rolled}"));
                 if env.restart {
                     restart_services(env.apply_helper.as_deref());
                 }
@@ -1209,10 +1524,7 @@ pub fn process_pending_health(
             Err(e) => {
                 log::error!(target: LOG, "auto-rollback failed: {}", e.message);
                 st.status = STATUS_FAILED.into();
-                st.last_error = Some(format!(
-                    "{HEALTH_FAILED}: {reason}; rollback error: {}",
-                    e.message
-                ));
+                st.last_error = Some(format!("{why}; rollback error: {}", e.message));
                 st
             }
         };
@@ -1220,9 +1532,7 @@ pub fn process_pending_health(
 
     st.status = STATUS_FAILED.into();
     st.health_deadline_at = None;
-    st.last_error = Some(format!(
-        "{HEALTH_FAILED}: {reason} (no previous slot to roll back to)"
-    ));
+    st.last_error = Some(format!("{why} (no previous slot to roll back to)"));
     log::error!(target: LOG, "{}", st.last_error.as_deref().unwrap_or_default());
     st
 }
@@ -1268,14 +1578,32 @@ pub fn arm_health_gate(
 }
 
 /// True when this status records that its target failed the health gate on
-/// this node (rolled back, or failed with no way to roll back).
+/// this node: rolled back (by the gate, or by hand while it was open), or
+/// failed with no way to roll back. A rollback because the restart into the
+/// target never happened is not one: that version never ran.
 fn failed_health_gate(st: &UpdateStatus) -> bool {
-    st.is(STATUS_ROLLED_BACK)
-        || (st.is(STATUS_FAILED)
-            && st
-                .last_error
-                .as_deref()
-                .is_some_and(|e| e.starts_with(HEALTH_FAILED)))
+    let err = st.last_error.as_deref().unwrap_or_default();
+    (st.is(STATUS_ROLLED_BACK) && !err.starts_with(RESTART_MISSED))
+        || (st.is(STATUS_FAILED) && err.starts_with(HEALTH_FAILED))
+}
+
+/// True when `st` records a restart into its target that never came while
+/// this process (started at `started_at()`) ran: it started before that
+/// gate was armed. Its restart evidently fails, so a retry from it would
+/// only download again and pause jobs for a whole gate before rolling back
+/// once more. A process started since retries; so does any process when
+/// either time is unknown.
+fn restart_missed_here(
+    st: &UpdateStatus,
+    started_at: impl FnOnce() -> Option<DateTime<Utc>>,
+) -> bool {
+    st.last_error
+        .as_deref()
+        .is_some_and(|e| e.starts_with(RESTART_MISSED))
+        && match (st.armed_at.as_deref().and_then(parse_utc), started_at()) {
+            (Some(armed), Some(started)) => started < armed,
+            _ => false,
+        }
 }
 
 /// The status to start a heartbeat update from: `status` as the caller read
@@ -1307,8 +1635,10 @@ fn current_status(status: Option<UpdateStatus>, status_path: Option<&Path>) -> U
 /// the new process must call [`process_pending_health`] after restart. When
 /// `jobs_busy`, download/install is deferred so slots never flip mid-print.
 /// A version that already failed its health gate here is not re-applied for
-/// the same desired version (see below). With `status_path`, a gate armed
-/// there since `status` was read wins over `status` (see `current_status`).
+/// the same desired version (see below), nor is one the services never
+/// restarted into by the process that stayed (see `restart_missed_here`).
+/// With `status_path`, a gate armed there since `status` was read wins over
+/// `status` (see `current_status`).
 pub fn maybe_update_from_heartbeat(
     hb: &JsonObject,
     cfg: &Config,
@@ -1361,7 +1691,12 @@ pub fn maybe_update_from_heartbeat(
     // download → activate → restart → gate → rollback for as long as the
     // server asks for it. Hold until the desired version changes; a manual
     // `vesyl-print update apply` (which starts from a fresh status) still works.
-    if failed_health_gate(&st) && prev_target.is_some_and(|t| same_version(&t, &desired)) {
+    let held = failed_health_gate(&st);
+    let missed_here = restart_missed_here(&st, process_started_at);
+    let same_target = prev_target
+        .as_deref()
+        .is_some_and(|t| same_version(t, &desired));
+    if held && same_target {
         log::info!(
             target: LOG,
             "not re-applying {desired}: it failed its health gate on this node ({}); \
@@ -1370,13 +1705,30 @@ pub fn maybe_update_from_heartbeat(
         );
         return st;
     }
+    if missed_here && same_target {
+        log::info!(
+            target: LOG,
+            "not re-applying {desired} from this process: the restart into it never came; \
+             the agent tries again once restarted"
+        );
+        return st;
+    }
+    // A heartbeat that defers `desired` keeps a status that blocks a retry
+    // about the version it blocks. Recording `desired` in it would block
+    // `desired`, a version this node has not tried, once updates resume.
+    let defer = |mut st: UpdateStatus| {
+        if held || missed_here {
+            st.target_version = prev_target.clone();
+        }
+        st
+    };
 
     if !cfg.auto_update_enabled {
         if !sticky(&st) {
             st.status = STATUS_IDLE.into();
         }
         log::info!(target: LOG, "update available: {} → {desired} (auto_update disabled)", st.current_version);
-        return st;
+        return defer(st);
     }
 
     // Do not begin download/install while a job is mid-pipeline.
@@ -1396,7 +1748,7 @@ pub fn maybe_update_from_heartbeat(
             st.status = STATUS_IDLE.into();
         }
         log::info!(target: LOG, "update deferred: jobs in flight ({} → {desired})", st.current_version);
-        return st;
+        return defer(st);
     }
 
     let update_url = hb
@@ -1431,6 +1783,11 @@ pub fn maybe_update_from_heartbeat(
 
     let result = (|| -> Result<(), UpdateError> {
         st.status = STATUS_DOWNLOADING.into();
+        // The slot to roll back to, on disk before anything can flip
+        // `current`: an install cut off after the flip (power loss) comes
+        // back as a gate (see `recover_false_update_failure`), and that
+        // gate must still be able to roll back.
+        st.previous_version = previous.clone().filter(|p| !same_version(p, &desired));
         // Persist early so the LCD can show "Updating…" during the download.
         persist(&st);
         // With signatures required, an unreadable key fails here (closed).
@@ -1440,14 +1797,15 @@ pub fn maybe_update_from_heartbeat(
         if !same_version(&manifest.version, &desired) {
             log::info!(target: LOG, "manifest version {} (desired {desired})", manifest.version);
         }
+        let prev = previous
+            .clone()
+            .filter(|p| !same_version(p, &manifest.version));
         st.status = STATUS_INSTALLING.into();
+        st.previous_version = prev.clone();
         // Persist installing so a crash mid-apply is visible.
         persist(&st);
 
         apply_release(&manifest, env, pem.as_deref(), cfg.update_require_signature)?;
-        let prev = previous
-            .clone()
-            .filter(|p| !same_version(p, &manifest.version));
         let channel = st.channel.clone();
         mark_pending_health(
             &mut st,
@@ -1487,6 +1845,12 @@ pub fn maybe_update_from_heartbeat(
                 let channel = st.channel.clone();
                 mark_pending_health(&mut st, &t, prev, health_gate_seconds(cfg), channel);
                 persist(&st);
+                // As after a clean activation: the gate is for the new
+                // version, which runs only once the services restart. This
+                // process would otherwise wait out the gate, then roll back.
+                if env.restart {
+                    restart_services(env.apply_helper.as_deref());
+                }
                 return st;
             }
         }
@@ -1560,6 +1924,7 @@ pub fn read_update_status(path: &Path) -> Option<UpdateStatus> {
             .filter(|v| truthy(v))
             .and_then(py_int)
             .unwrap_or(0),
+        armed_at: s("armed_at"),
     })
 }
 
@@ -2567,56 +2932,658 @@ mod tests {
         assert_eq!(slot_before_activation(&lab).as_deref(), Some("0.3.9"));
     }
 
+    /// An agent at `version`, started from its slot.
+    fn slot_agent(root: &Path, version: &str) -> UpdateEnv {
+        UpdateEnv {
+            running_version: version.into(),
+            running_from_slot: true,
+            ..env(root)
+        }
+    }
+
+    /// A process start time `secs` from now.
+    fn started(secs: i64) -> Option<DateTime<Utc>> {
+        Some(Utc::now() + chrono::Duration::seconds(secs))
+    }
+
+    /// The gate `update apply … --restart` arms for 0.4.0 over 0.3.0.
+    fn armed_gate(td: &Path, c: &Config) -> UpdateStatus {
+        let path = td.join("update_status.json");
+        arm_health_gate(c, &path, "0.4.0", Some("0.3.0".into())).unwrap()
+    }
+
+    /// Count the restarts `f` asks for (on this thread) instead of running them.
+    fn restarts_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        RESTARTS_SEEN.with(|n| n.set(Some(0)));
+        let out = f();
+        (out, RESTARTS_SEEN.with(|n| n.take()).unwrap_or(0))
+    }
+
+    #[test]
+    fn process_start_time_is_in_the_recent_past() {
+        let started = process_started_at().expect("/proc/self/stat");
+        let now = Utc::now();
+        assert!(started <= now, "{started} > {now}");
+        assert!(now - started < chrono::Duration::hours(1), "{started}");
+    }
+
+    #[test]
+    fn armed_at_round_trips_and_is_written_only_while_set() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("update_status.json");
+        let st = armed_gate(td.path(), &cfg(td.path()));
+        let armed = parse_utc(st.armed_at.as_deref().unwrap()).unwrap();
+        assert!(armed <= Utc::now());
+        assert_eq!(read_update_status(&path).unwrap(), st);
+        write_update_status(&path, &UpdateStatus::default()).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("armed_at"));
+    }
+
     /// The 0.3.0 agent still runs from its slot after 0.4.0 was activated and
-    /// the gate armed (the restart is queued): it must not judge 0.4.0.
+    /// the gate armed (the restart is queued): it must not judge 0.4.0. A
+    /// process started after the gate was armed is judged as usual.
     #[test]
     fn replaced_agent_waits_for_the_restart() {
         let td = tempfile::tempdir().unwrap();
         let root = two_slots(td.path());
         let c = cfg(td.path());
-        let old = UpdateEnv {
-            running_version: "0.3.0".into(),
-            running_from_slot: true,
-            ..env(&root)
+        let gate = armed_gate(td.path(), &c);
+        let judge = |env: &UpdateEnv, whoami: WhoamiResult, at: Option<DateTime<Utc>>| {
+            judge_pending_health(gate.clone(), &c, env, whoami, Some("timeout"), None, at)
         };
-        let gate = pending(utc_now_plus(120));
+        let old = slot_agent(&root, "0.3.0");
         for whoami in [WhoamiResult::Ok, WhoamiResult::Error] {
-            let out = process_pending_health(gate.clone(), &c, &old, whoami, Some("timeout"), None);
             // Untouched: no attempt counted, no error, no rollback.
-            assert_eq!(out, gate, "{whoami:?}");
+            assert_eq!(judge(&old, whoami, started(-60)), gate, "{whoami:?}");
             assert_eq!(current_name(&root), "0.4.0");
         }
 
         // The restarted agent runs the gate as usual.
-        let new = UpdateEnv {
-            running_version: "0.4.0".into(),
-            ..old.clone()
-        };
-        let out = process_pending_health(gate.clone(), &c, &new, WhoamiResult::Ok, None, None);
+        let out = judge(&slot_agent(&root, "0.4.0"), WhoamiResult::Ok, started(1));
         assert_eq!(out.status, STATUS_IDLE);
-        // So does one that runs from the new slot but reports another version
-        // (a mislabeled build): it fails fast.
-        let mislabeled = UpdateEnv {
-            running_version: "0.4.1".into(),
-            ..old.clone()
-        };
-        let out =
-            process_pending_health(gate.clone(), &c, &mislabeled, WhoamiResult::Ok, None, None);
+        assert_eq!(out.armed_at, None);
+        // So does one started from the new slot after the gate was armed that
+        // reports another version (a mislabeled build): it fails fast.
+        let out = judge(&slot_agent(&root, "0.4.1"), WhoamiResult::Ok, started(1));
         assert_eq!(out.status, STATUS_ROLLED_BACK);
+        assert!(failed_health_gate(&out), "{:?}", out.last_error);
         assert_eq!(current_name(&root), "0.3.0");
         flip_current(&root, "0.4.0").unwrap();
 
-        // Still the old agent at the deadline: the restart never came.
-        let late = utc_now_plus(121);
-        let out = process_pending_health(gate, &c, &old, WhoamiResult::Ok, None, Some(&late));
+        // A gate armed before arm times were recorded: the agent being
+        // replaced is the one running the version it rolls back to.
+        let legacy = pending(utc_now_plus(120));
+        assert_eq!(legacy.armed_at, None);
+        let out = judge_pending_health(
+            legacy.clone(),
+            &c,
+            &old,
+            WhoamiResult::Ok,
+            None,
+            None,
+            started(1),
+        );
+        assert_eq!(out, legacy);
+        let mislabeled = slot_agent(&root, "0.4.1");
+        let out = judge_pending_health(
+            legacy,
+            &c,
+            &mislabeled,
+            WhoamiResult::Ok,
+            None,
+            None,
+            started(-60),
+        );
+        assert_eq!(out.status, STATUS_ROLLED_BACK);
+        assert_eq!(current_name(&root), "0.3.0");
+    }
+
+    /// `current` was not the running slot when the gate was armed: 0.3.5 had
+    /// been staged without a restart (`update apply --file` alone) before
+    /// `update apply … --restart` activated 0.4.0. The 0.3.0 agent finishing
+    /// its cycle is the one being replaced all the same: it must not roll
+    /// 0.4.0 back (to 0.3.5) under the restart's feet.
+    #[test]
+    fn replaced_agent_waits_when_another_slot_was_staged() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let staged = root.join("releases/0.3.5");
+        extract_tarball(&build_release(&td.path().join("0.3.5"), "0.3.5"), &staged).unwrap();
+        write_version_file(&staged, "0.3.5").unwrap();
+        // The agent started from 0.3.0; 0.3.5 was staged after that.
+        flip_current(&root, "0.3.0").unwrap();
+        let old = slot_agent(&root, "0.3.0");
+        flip_current(&root, "0.3.5").unwrap();
+        // What `update apply --file 0.4.0 … --restart` does, in order.
+        let previous = slot_before_activation(&old);
+        assert_eq!(previous.as_deref(), Some("0.3.5"));
+        flip_current(&root, "0.4.0").unwrap();
+        let c = cfg(td.path());
+        let path = td.path().join("update_status.json");
+        let gate = arm_health_gate(&c, &path, "0.4.0", previous).unwrap();
+
+        // This test process started before the gate, as that agent did.
+        for whoami in [WhoamiResult::Ok, WhoamiResult::Error] {
+            let out = process_pending_health(gate.clone(), &c, &old, whoami, Some("timeout"), None);
+            assert_eq!(out, gate, "{whoami:?}");
+            assert_eq!(current_name(&root), "0.4.0");
+        }
+        // The restarted agent passes the gate.
+        let new = slot_agent(&root, "0.4.0");
+        let out = process_pending_health(gate, &c, &new, WhoamiResult::Ok, None, None);
+        assert_eq!(out.status, STATUS_IDLE);
+        assert_eq!(current_name(&root), "0.4.0");
+    }
+
+    /// Still the agent being replaced at the deadline: the restart into 0.4.0
+    /// never happened. It rolls back so `current` matches what runs (and
+    /// restarts), but 0.4.0 never ran, so that does not hold it: an agent
+    /// started since installs it again when the server still asks for it.
+    /// The process whose restart failed does not, or it would download and
+    /// pause jobs for a gate on every retry while its restarts keep failing.
+    #[test]
+    fn missed_restart_rolls_back_without_holding_the_version() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let gate = armed_gate(td.path(), &c);
+        let armed_at = gate.armed_at.clone();
+        let old = UpdateEnv {
+            restart: true,
+            ..slot_agent(&root, "0.3.0")
+        };
+        let late = utc_now_plus(health_gate_seconds(&c) + 1);
+        let (out, restarts) = restarts_during(|| {
+            judge_pending_health(
+                gate,
+                &c,
+                &old,
+                WhoamiResult::Ok,
+                None,
+                Some(&late),
+                started(-60),
+            )
+        });
         assert_eq!(out.status, STATUS_ROLLED_BACK);
         assert_eq!(
             out.last_error.as_deref(),
-            Some(
-                "health failed: running version \"0.3.0\" != expected \"0.4.0\"; rolled back to 0.3.0"
-            )
+            Some("restart never happened (still running 0.3.0); rolled back to 0.3.0")
         );
+        assert_eq!(out.target_version.as_deref(), Some("0.4.0"));
+        assert_eq!(out.armed_at, armed_at, "kept: who missed the restart");
         assert_eq!(current_name(&root), "0.3.0");
+        assert_eq!(restarts, 1, "services restarted after the rollback");
+        assert!(!failed_health_gate(&out));
+        assert!(!should_pause_jobs(Some(&out)));
+        assert!(restart_missed_here(&out, || started(-60)));
+        assert!(!restart_missed_here(&out, || started(1)));
+        assert!(!restart_missed_here(&out, || None));
+
+        // This process (the test's, started before the gate) is the one whose
+        // restart never came: it does not retry.
+        let hb = desire(td.path(), "0.4.0");
+        let agent = slot_agent(&root, "0.3.0");
+        let st = maybe_update_from_heartbeat(&hb, &c, &agent, Some(out.clone()), None, false);
+        assert_eq!(st.status, STATUS_ROLLED_BACK);
+        assert_eq!(current_name(&root), "0.3.0");
+        // An agent started since (the restart after the rollback worked):
+        // to it, the gate was armed before it started.
+        let since = process_started_at().unwrap() - chrono::Duration::seconds(1);
+        let restarted_view = UpdateStatus {
+            armed_at: Some(since.to_rfc3339_opts(SecondsFormat::Micros, false)),
+            ..out
+        };
+        let st = maybe_update_from_heartbeat(&hb, &c, &agent, Some(restarted_view), None, false);
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(st.previous_version.as_deref(), Some("0.3.0"));
+        assert_eq!(current_name(&root), "0.4.0");
+    }
+
+    /// `update rollback --restart` while the gate for 0.4.0 is open, the
+    /// documented way out of a bad slot: whichever agent finds the gate next
+    /// closes it as rolled back at once, so jobs resume, without flipping
+    /// `current` or restarting again; and 0.4.0 is held while the server
+    /// still asks for it.
+    #[test]
+    fn manual_rollback_during_the_gate_closes_it() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let gate = armed_gate(td.path(), &c);
+        assert!(should_pause_jobs(Some(&gate)));
+        assert_eq!(rollback(&root, Some("0.3.0"), None).unwrap(), "0.3.0");
+
+        let with_restart = |version: &str| UpdateEnv {
+            restart: true,
+            ..slot_agent(&root, version)
+        };
+        // The 0.3.0 agent the rollback started; the 0.3.0 agent the gate was
+        // replacing, if its restart had not come yet; the 0.4.0 agent, when
+        // the rollback was not followed by a restart.
+        for (who, started_at) in [
+            ("0.3.0", started(1)),
+            ("0.3.0", started(-60)),
+            ("0.4.0", started(1)),
+        ] {
+            let agent = with_restart(who);
+            let (out, restarts) = restarts_during(|| {
+                judge_pending_health(
+                    gate.clone(),
+                    &c,
+                    &agent,
+                    WhoamiResult::Error,
+                    Some("timeout"),
+                    None,
+                    started_at,
+                )
+            });
+            let ctx = format!("{who} started {started_at:?}");
+            assert_eq!(out.status, STATUS_ROLLED_BACK, "{ctx}");
+            assert_eq!(
+                out.last_error.as_deref(),
+                Some("manual rollback to 0.3.0 during the health gate"),
+                "{ctx}"
+            );
+            assert_eq!(out.target_version.as_deref(), Some("0.4.0"), "{ctx}");
+            assert_eq!(out.previous_version, None, "{ctx}");
+            assert_eq!(out.health_deadline_at, None, "{ctx}");
+            assert_eq!(out.armed_at, None, "{ctx}");
+            assert!(!should_pause_jobs(Some(&out)), "{ctx}");
+            assert_eq!(restarts, 0, "{ctx}");
+            assert_eq!(current_name(&root), "0.3.0", "{ctx}");
+        }
+
+        let fresh = slot_agent(&root, "0.3.0");
+        let out = process_pending_health(gate, &c, &fresh, WhoamiResult::Ok, None, None);
+        assert_eq!(out.status, STATUS_ROLLED_BACK);
+        let st = maybe_update_from_heartbeat(
+            &desire(td.path(), "0.4.0"),
+            &c,
+            &fresh,
+            Some(out),
+            None,
+            false,
+        );
+        assert_eq!(st.status, STATUS_ROLLED_BACK);
+        assert_eq!(current_name(&root), "0.3.0");
+    }
+
+    /// The activate helper flipped `current`, then reported failure (a
+    /// timeout after its `mv`): the gate is armed for the new version and
+    /// the services restart, as after a clean activation. Without the
+    /// restart this agent would wait out the gate, then roll back.
+    #[test]
+    fn activate_error_after_the_flip_still_restarts() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        // The manifest comes through a FIFO, so the "helper" below runs once
+        // the update has recorded the slot it leaves (0.4.0) and before it
+        // activates: it flips `current` to 0.5.0, and leaves `current.new` a
+        // non-empty directory so the flip the update then makes fails.
+        let body = fs::read(
+            url::Url::parse(&local_manifest(td.path(), "0.5.0"))
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+        )
+        .unwrap();
+        let fifo = td.path().join("manifest.fifo");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+        let hb = obj(json!({
+            "desired_agent_version": "0.5.0",
+            "update_url": url::Url::from_file_path(&fifo).unwrap().to_string(),
+        }));
+        let helper = {
+            let (root, fifo) = (root.clone(), fifo.clone());
+            std::thread::spawn(move || {
+                // Opens (without blocking) once the update opens the manifest.
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                let mut manifest = loop {
+                    match fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo)
+                    {
+                        Ok(f) => break f,
+                        Err(e) if std::time::Instant::now() > deadline => {
+                            panic!("the update never read its manifest: {e}")
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                };
+                fs::create_dir_all(root.join("releases/0.5.0")).unwrap();
+                flip_current(&root, "0.5.0").unwrap();
+                fs::create_dir_all(root.join("current.new/busy")).unwrap();
+                manifest.write_all(&body).unwrap();
+            })
+        };
+        let agent = UpdateEnv {
+            restart: true,
+            ..slot_agent(&root, "0.4.0")
+        };
+        let (st, restarts) =
+            restarts_during(|| maybe_update_from_heartbeat(&hb, &c, &agent, None, None, false));
+        helper.join().unwrap();
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
+        assert_eq!(st.previous_version.as_deref(), Some("0.4.0"));
+        assert!(st.armed_at.is_some());
+        assert_eq!(current_name(&root), "0.5.0");
+        assert_eq!(restarts, 1, "services restarted into 0.5.0");
+    }
+
+    /// After 0.5.0 failed its gate, heartbeats that defer desired 0.5.1
+    /// (auto-update off, jobs in flight) must not move the hold onto 0.5.1,
+    /// a version this node never tried: once updates resume, 0.5.1 installs.
+    /// The same goes for a restart into 0.5.0 that this process missed.
+    #[test]
+    fn deferred_heartbeat_does_not_move_the_hold() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let off = Config {
+            auto_update_enabled: false,
+            ..c.clone()
+        };
+        let rolled = UpdateStatus {
+            status: STATUS_ROLLED_BACK.into(),
+            current_version: "0.4.0".into(),
+            target_version: Some("0.5.0".into()),
+            last_error: Some("health failed: timeout; rolled back to 0.4.0".into()),
+            ..Default::default()
+        };
+        // Armed after this (the test's) process started: it missed it.
+        let mut missed = UpdateStatus::default();
+        mark_pending_health(&mut missed, "0.5.0", None, 120, None);
+        let missed = UpdateStatus {
+            status: STATUS_ROLLED_BACK.into(),
+            current_version: "0.4.0".into(),
+            last_error: Some(
+                "restart never happened (still running 0.4.0); rolled back to 0.4.0".into(),
+            ),
+            ..missed
+        };
+        let fix = desire(td.path(), "0.5.1");
+        for blocked in [&rolled, &missed] {
+            for (how, cfg, jobs_busy) in [("auto_update off", &off, false), ("jobs busy", &c, true)]
+            {
+                let how = format!("{how} after {:?}", blocked.last_error);
+                flip_current(&root, "0.4.0").unwrap();
+                let deferred = maybe_update_from_heartbeat(
+                    &fix,
+                    cfg,
+                    &env(&root),
+                    Some(blocked.clone()),
+                    None,
+                    jobs_busy,
+                );
+                assert_eq!(deferred.status, STATUS_ROLLED_BACK, "{how}");
+                assert_eq!(deferred.target_version.as_deref(), Some("0.5.0"), "{how}");
+                assert_eq!(deferred.last_error, blocked.last_error, "{how}");
+                assert_eq!(current_name(&root), "0.4.0", "{how}");
+
+                let st =
+                    maybe_update_from_heartbeat(&fix, &c, &env(&root), Some(deferred), None, false);
+                assert_eq!(
+                    st.status, STATUS_PENDING_HEALTH,
+                    "{how}: {:?}",
+                    st.last_error
+                );
+                assert_eq!(st.target_version.as_deref(), Some("0.5.1"), "{how}");
+                assert_eq!(current_name(&root), "0.5.1", "{how}");
+            }
+        }
+
+        // The version that failed stays held through a deferral.
+        flip_current(&root, "0.4.0").unwrap();
+        let again = desire(td.path(), "0.5.0");
+        let deferred = maybe_update_from_heartbeat(
+            &again,
+            &off,
+            &env(&root),
+            Some(rolled.clone()),
+            None,
+            false,
+        );
+        let st = maybe_update_from_heartbeat(&again, &c, &env(&root), Some(deferred), None, false);
+        assert_eq!(st.status, STATUS_ROLLED_BACK);
+        assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
+        assert_eq!(current_name(&root), "0.4.0");
+    }
+
+    /// The slot to roll back to is on disk before anything can flip
+    /// `current`: an install cut off right after the flip (power loss) comes
+    /// back as a gate that can still roll back.
+    #[test]
+    fn interrupted_install_can_still_roll_back() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let path = td.path().join("update_status.json");
+        let url = |p: &Path| url::Url::from_file_path(p).unwrap().to_string();
+
+        // Stopped while downloading (no manifest there) ...
+        let hb = obj(json!({
+            "desired_agent_version": "0.5.0",
+            "update_url": url(&td.path().join("missing.json")),
+        }));
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, Some(&path), false);
+        assert_eq!(st.status, STATUS_FAILED);
+        let on_disk = read_update_status(&path).unwrap();
+        assert_eq!(on_disk.status, STATUS_DOWNLOADING);
+        assert_eq!(on_disk.previous_version.as_deref(), Some("0.4.0"));
+        // ... and while installing (no artifact there).
+        let manifest = td.path().join("m-noartifact.json");
+        fs::write(
+            &manifest,
+            json!({
+                "version": "0.5.0",
+                "artifact_url": url(&td.path().join("missing.tar.gz")),
+                "artifact_sha256": "0".repeat(64),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let hb = obj(json!({"desired_agent_version": "0.5.0", "update_url": url(&manifest)}));
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), None, Some(&path), false);
+        assert_eq!(st.status, STATUS_FAILED);
+        let on_disk = read_update_status(&path).unwrap();
+        assert_eq!(on_disk.status, STATUS_INSTALLING);
+        assert_eq!(on_disk.previous_version.as_deref(), Some("0.4.0"));
+
+        // Power lost right after the flip to 0.5.0. The restarted 0.5.0 agent
+        // finds the install interrupted (marked failed at start, as the agent
+        // does) and recovers it into the gate.
+        let slot = root.join("releases/0.5.0");
+        extract_tarball(&build_release(&td.path().join("0.5.0"), "0.5.0"), &slot).unwrap();
+        write_version_file(&slot, "0.5.0").unwrap();
+        flip_current(&root, "0.5.0").unwrap();
+        let interrupted = UpdateStatus {
+            status: STATUS_FAILED.into(),
+            last_error: Some(crate::agent::UPDATE_INTERRUPTED.into()),
+            ..on_disk
+        };
+        let new = slot_agent(&root, "0.5.0");
+        let gate = process_pending_health(
+            interrupted,
+            &c,
+            &new,
+            WhoamiResult::Error,
+            Some("HTTP 503"),
+            None,
+        );
+        assert_eq!(gate.status, STATUS_PENDING_HEALTH);
+        assert_eq!(gate.previous_version.as_deref(), Some("0.4.0"));
+        // 0.5.0 never reaches the API: at the deadline it rolls back.
+        let late = utc_now_plus(health_gate_seconds(&c) + 1);
+        let out = process_pending_health(
+            gate,
+            &c,
+            &new,
+            WhoamiResult::Error,
+            Some("HTTP 503"),
+            Some(&late),
+        );
+        assert_eq!(out.status, STATUS_ROLLED_BACK, "{:?}", out.last_error);
+        assert_eq!(current_name(&root), "0.4.0");
+    }
+
+    /// A slot of the version being installed that the agent cannot delete
+    /// (root unpacked it), and a staging dir a crashed extract left, are
+    /// moved aside instead of failing the install on every heartbeat. An
+    /// install that can delete them later does.
+    #[test]
+    fn undeletable_slot_and_staging_are_moved_aside() {
+        // SAFETY: geteuid has no preconditions.
+        let as_root = unsafe { libc::geteuid() } == 0;
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let releases = root.join("releases");
+        // Stand-ins for root-owned trees: a directory nobody may write.
+        let lock = |dir: &Path, mode: u32| {
+            let locked = dir.join("locked");
+            fs::create_dir_all(&locked).unwrap();
+            if !locked.join("vesyl-print").exists() {
+                fs::write(locked.join("vesyl-print"), b"old").unwrap();
+            }
+            crate::util::set_mode(&locked, mode).unwrap();
+        };
+        lock(&releases.join("0.5.0"), 0o555);
+        lock(&releases.join("0.5.0.staging"), 0o555);
+
+        let st = maybe_update_from_heartbeat(
+            &desire(td.path(), "0.5.0"),
+            &c,
+            &env(&root),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(current_name(&root), "0.5.0");
+        assert!(releases.join("0.5.0/vesyl-print").is_file());
+        assert!(!releases.join("0.5.0/locked").exists());
+        assert!(!releases.join("0.5.0.staging").exists());
+        assert_eq!(list_releases(&root), ["0.3.0", "0.4.0", "0.5.0"]);
+        let aside = [
+            releases.join(".0.5.0.stale-1"),
+            releases.join(".0.5.0.staging.stale-1"),
+        ];
+        if !as_root {
+            for a in &aside {
+                assert!(a.join("locked/vesyl-print").is_file(), "{}", a.display());
+                lock(a, 0o755);
+            }
+        }
+
+        // Deletable now: the next install clears them.
+        let st = maybe_update_from_heartbeat(
+            &desire(td.path(), "0.5.1"),
+            &c,
+            &env(&root),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        for a in &aside {
+            assert!(!a.exists(), "{}", a.display());
+        }
+    }
+
+    const SERVICE_USER_TD: &str = "VESYL_TEST_SERVICE_USER_TD";
+
+    /// The case for real: an older `update apply` run as root left a
+    /// root-owned `releases/0.5.0` and staging dir in the service user's
+    /// `releases/`. The agent, running as that user, still installs 0.5.0
+    /// from a heartbeat; root's next install clears what it moved aside.
+    /// Needs root (or a user namespace):
+    /// `unshare --map-root-user --map-auto <test binary> --include-ignored`.
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown and switch users"]
+    fn service_user_replaces_a_slot_root_unpacked() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::process::CommandExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        local_manifest(td.path(), "0.5.0");
+        // As setup.sh leaves it: the install tree is the service user's.
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        crate::util::hand_tree_to_parent_owner(&root).unwrap();
+        let releases = root.join("releases");
+        for dir in ["0.5.0/bin", "0.5.0.staging/vesyl-print-0.5.0"] {
+            fs::create_dir_all(releases.join(dir)).unwrap();
+            fs::write(releases.join(dir).join("vesyl-print"), b"root's").unwrap();
+        }
+
+        // Through /proc: the service user may not search the directories the
+        // test binary sits in.
+        let out = std::process::Command::new("/proc/self/exe")
+            .args([
+                "--exact",
+                "update::tests::service_user_install_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SERVICE_USER_TD, td.path())
+            .uid(1000)
+            .gid(1000)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(current_name(&root), "0.5.0");
+        let owner = |p: &Path| fs::symlink_metadata(p).unwrap().uid();
+        assert_eq!(owner(&releases.join("0.5.0/vesyl-print")), 1000);
+        let aside = [
+            releases.join(".0.5.0.stale-1"),
+            releases.join(".0.5.0.staging.stale-1"),
+        ];
+        for a in &aside {
+            assert_eq!(owner(a), 0, "{}", a.display());
+        }
+
+        let st = maybe_update_from_heartbeat(
+            &desire(td.path(), "0.5.1"),
+            &unsigned_ok(td.path()),
+            &env(&root),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        for a in &aside {
+            assert!(!a.exists(), "{}", a.display());
+        }
+    }
+
+    #[test]
+    #[ignore = "child process of service_user_replaces_a_slot_root_unpacked"]
+    fn service_user_install_child() {
+        let Some(td) = std::env::var_os(SERVICE_USER_TD).map(PathBuf::from) else {
+            return;
+        };
+        let manifest = url::Url::from_file_path(td.join("m-0.5.0.json")).unwrap();
+        let hb = obj(json!({"desired_agent_version": "0.5.0", "update_url": manifest.to_string()}));
+        let root = td.join("opt");
+        let st =
+            maybe_update_from_heartbeat(&hb, &unsigned_ok(&td), &env(&root), None, None, false);
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
     }
 
     /// A gate armed on disk after the agent read its status this cycle
