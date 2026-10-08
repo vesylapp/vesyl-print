@@ -135,7 +135,7 @@ jobs:
       # binary is linked for glibc 2.31, must need no newer glibc symbol and
       # must print its version under qemu-aarch64 (CI is set, so a binary
       # that cannot run fails), and the tarball gets every runtime file. The
-      # MIN_AGENT_VERSION floor is the tag's concern (tests/build_release.rs).
+      # MIN_AGENT_VERSION floor is the tag's concern; build_release.rs tests it.
       - name: Build the release tarball (aarch64, unsigned)
         working-directory: .
         env:
