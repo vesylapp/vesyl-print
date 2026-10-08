@@ -29,10 +29,10 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fs::{self, File};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -987,8 +987,8 @@ impl JobStore {
         if !valid_job_id(job_id) {
             return;
         }
-        if let Ok(dir) = FailedDir::open(&self.failed_dir()) {
-            let _ = dir.remove(&format!("{job_id}.json"));
+        if let Ok(dir) = NoFollowDir::open(&self.failed_dir()) {
+            let _ = dir.remove(format!("{job_id}.json").as_ref());
         }
     }
 
@@ -1028,7 +1028,7 @@ impl JobStore {
         let dir = self.failed_dir();
         crate::util::create_dir_all_owned(&dir)?;
         after_mkdir(&dir);
-        let failed = FailedDir::open(&dir)?;
+        let failed = NoFollowDir::open(&dir)?;
         failed.rename_into(&src, &file)?;
         if let Err(e) = failed.touch(&file) {
             log::debug!(target: LOG, "could not restart the retention of failed/{file}: {e}");
@@ -1097,7 +1097,8 @@ impl JobStore {
     /// Delete processed markers older than `max_age` (by mtime) and return how
     /// many went. A marker whose queue file still exists is kept: the startup
     /// drain relies on it to skip re-printing a job that finished just before
-    /// a crash. Per-file errors are ignored.
+    /// a crash. Per-file errors are ignored, and a symlink at processed/ is
+    /// not followed (see [`prune_files`]).
     ///
     /// The same pass prunes `queue/failed/` with the same retention (see
     /// [`JobStore::prune_failed`]); those are logged here, not counted.
@@ -1111,57 +1112,75 @@ impl JobStore {
                 max_age.as_secs() / (24 * 60 * 60)
             );
         }
-        let Ok(entries) = fs::read_dir(&self.processed_dir) else {
-            return 0;
-        };
-        let now = SystemTime::now();
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            if !entry
-                .metadata()
-                .is_ok_and(|m| expired_file(&m, now, max_age))
-            {
-                continue;
-            }
-            let name = entry.file_name();
+        prune_files(&self.processed_dir, max_age, |name| {
             let queued = name
                 .to_str()
                 .is_some_and(|n| self.queue_dir.join(format!("{n}.json")).exists());
-            if !queued && fs::remove_file(entry.path()).is_ok() {
-                removed += 1;
-            }
-        }
-        removed
+            !queued
+        })
     }
 
     /// Delete `queue/failed/*.json` older than `max_age` (by mtime, which
     /// [`JobStore::retire_queue`] sets when it retires a file) and return how
     /// many went. Every permanently failed job keeps its whole payload there,
     /// inline base64 content included, so without this the directory only
-    /// grows. Per-file errors are ignored.
+    /// grows. Per-file errors are ignored, and a symlink at failed/ is not
+    /// followed (see [`prune_files`]).
     pub fn prune_failed(&self, max_age: Duration) -> usize {
-        let Ok(entries) = fs::read_dir(self.failed_dir()) else {
-            return 0;
-        };
-        let now = SystemTime::now();
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let json = entry.file_name().as_bytes().ends_with(b".json");
-            if json
-                && entry
-                    .metadata()
-                    .is_ok_and(|m| expired_file(&m, now, max_age))
-                && fs::remove_file(entry.path()).is_ok()
-            {
-                removed += 1;
-            }
-        }
-        removed
+        prune_files(&self.failed_dir(), max_age, |name| {
+            name.as_bytes().ends_with(b".json")
+        })
     }
 }
 
-/// True for a regular file (not followed if a symlink: `DirEntry::metadata`
-/// does not) last modified at least `max_age` before `now`.
+/// Delete the regular files directly in `dir` that were last modified at
+/// least `max_age` ago and whose names `prunable` accepts; return how many
+/// went. Per-file errors are ignored.
+///
+/// The service user owns the state directory and queue/, so it can put a
+/// symlink where processed/ or queue/failed/ is (to /etc, say) for an agent
+/// started as root to prune through. So `dir` is opened without following
+/// one (a link there makes this a no-op), and each file is checked and
+/// unlinked relative to that descriptor. The names come from listing `dir`
+/// by path: a link swapped in after the open only changes which names are
+/// tried, never where they are checked or removed.
+fn prune_files(dir: &Path, max_age: Duration, prunable: impl Fn(&OsStr) -> bool) -> usize {
+    prune_files_with(dir, max_age, prunable, &|_| {})
+}
+
+/// [`prune_files`]. `after_open` runs once `dir` is open, so tests can swap
+/// it for a symlink the way the service user could.
+fn prune_files_with(
+    dir: &Path,
+    max_age: Duration,
+    prunable: impl Fn(&OsStr) -> bool,
+    after_open: &dyn Fn(&Path),
+) -> usize {
+    let Ok(opened) = NoFollowDir::open(dir) else {
+        return 0;
+    };
+    after_open(dir);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if opened
+            .metadata(&name)
+            .is_ok_and(|m| expired_file(&m, now, max_age))
+            && prunable(&name)
+            && opened.remove(&name).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// True for a regular file (`meta` from lstat: a symlink is not one) last
+/// modified at least `max_age` before `now`.
 fn expired_file(meta: &fs::Metadata, now: SystemTime, max_age: Duration) -> bool {
     meta.is_file()
         && meta
@@ -1171,19 +1190,21 @@ fn expired_file(meta: &fs::Metadata, now: SystemTime, max_age: Duration) -> bool
             .is_some_and(|age| age >= max_age)
 }
 
-/// `queue/failed/`, opened without following a symlink at that name: the
-/// service user owns queue/ and could put one there while root (an operator's
-/// print-test) works in it. Names are resolved relative to this descriptor.
-struct FailedDir(File);
+/// A directory the service user owns (processed/, queue/failed/), opened
+/// without following a symlink at its name: that user could put one there
+/// while root (an operator's print-test, or an agent started as root) works
+/// in it. Names in it are resolved relative to this descriptor, never
+/// through the path again.
+struct NoFollowDir(File);
 
-impl FailedDir {
+impl NoFollowDir {
     /// Open the directory; a symlink there fails (ENOTDIR or ELOOP).
     fn open(path: &Path) -> io::Result<Self> {
         fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(path)
-            .map(FailedDir)
+            .map(NoFollowDir)
     }
 
     /// rename(2) `src` to `name` in this directory.
@@ -1217,9 +1238,25 @@ impl FailedDir {
         os_result(rc)
     }
 
+    /// lstat(2) `name` in this directory: a symlink is described, never
+    /// followed. Linux's O_PATH only locates the file without opening it (no
+    /// read permission needed, a FIFO does not block), and with O_NOFOLLOW
+    /// it locates a symlink itself.
+    fn metadata(&self, name: &OsStr) -> io::Result<fs::Metadata> {
+        let name = CString::new(name.as_bytes())?;
+        let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: as above; without O_CREAT, openat reads no mode argument.
+        let fd = unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just opened here and nothing else owns it.
+        unsafe { File::from_raw_fd(fd) }.metadata()
+    }
+
     /// unlink(2) `name` in this directory.
-    fn remove(&self, name: &str) -> io::Result<()> {
-        let name = CString::new(name)?;
+    fn remove(&self, name: &OsStr) -> io::Result<()> {
+        let name = CString::new(name.as_bytes())?;
         // SAFETY: as above.
         let rc = unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) };
         os_result(rc)
@@ -2756,6 +2793,103 @@ mod tests {
         assert_eq!(owner(rooted.path()), before, "link target chowned");
         assert_eq!(fs::read_dir(rooted.path()).unwrap().count(), 0);
         assert!(refused_link(&result.unwrap_err()));
+    }
+
+    /// A temp directory holding a file per name, each 31 days old.
+    fn month_old_files(names: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for name in names {
+            let path = dir.path().join(name);
+            fs::write(&path, "keep").unwrap();
+            backdate(&path, 31 * DAY);
+        }
+        dir
+    }
+
+    fn all_files_in(dir: &Path, names: &[&str]) -> bool {
+        names.iter().all(|n| dir.join(n).is_file())
+    }
+
+    /// The service user owns queue/ and the state directory, so it can plant
+    /// queue/failed or processed as a symlink (to /etc/vesyl-print, say)
+    /// before an agent run as root prunes. Neither prune follows it: nothing
+    /// in the link's target goes, however old.
+    #[test]
+    fn prune_never_follows_a_symlink_at_failed_or_processed() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let retention = 30 * DAY;
+
+        let names = ["credentials.json", "config.json"];
+        let target = month_old_files(&names);
+        std::os::unix::fs::symlink(target.path(), st.failed_dir()).unwrap();
+        assert_eq!(st.prune_failed(retention), 0);
+        assert_eq!(st.prune_processed(retention), 0);
+        assert!(all_files_in(target.path(), &names), "went via failed/");
+
+        let names = ["passwd", "shadow"];
+        let target = month_old_files(&names);
+        fs::remove_dir(&st.processed_dir).unwrap();
+        std::os::unix::fs::symlink(target.path(), &st.processed_dir).unwrap();
+        assert_eq!(st.prune_processed(retention), 0);
+        assert!(all_files_in(target.path(), &names), "went via processed/");
+    }
+
+    /// failed/ swapped for a link after the prune opened it: the link's
+    /// target only supplies the names tried. Each is checked, and removed,
+    /// in the directory that was opened; nothing in the target goes.
+    #[test]
+    fn prune_checks_and_removes_in_the_directory_it_opened() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let failed = st.failed_dir();
+        fs::create_dir(&failed).unwrap();
+        for (name, age) in [
+            ("stale.json", 31 * DAY),
+            ("fresh.json", DAY),
+            ("unlisted.json", 31 * DAY),
+        ] {
+            fs::write(failed.join(name), "{}").unwrap();
+            backdate(&failed.join(name), age);
+        }
+        let in_target = ["stale.json", "fresh.json", "elsewhere.json"];
+        let target = month_old_files(&in_target);
+        let swap = swap_failed_for(target.path());
+        assert_eq!(prune_files_with(&failed, 30 * DAY, |_| true, &swap), 1);
+        assert!(all_files_in(target.path(), &in_target), "target pruned");
+        let opened = failed.with_extension("moved");
+        assert!(!opened.join("stale.json").exists());
+        // Fresh where it was checked; the other was not listed, so it waits
+        // for the next pass.
+        assert!(all_files_in(&opened, &["fresh.json", "unlisted.json"]));
+    }
+
+    /// The same as root, the case that matters: an operator starts the
+    /// agent as root over links the service user planted to a root-owned
+    /// directory.
+    ///
+    /// Needs root: `sudo cargo test`, or unprivileged with
+    /// `unshare --map-root-user --map-auto <test binary> --include-ignored root_`.
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_prune_never_follows_a_planted_symlink() {
+        if !is_root() {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        let st = store(td.path());
+        let names = ["credentials.json", "config.json", "shadow"];
+        let rooted = month_old_files(&names);
+        assert_eq!(fs::metadata(rooted.path()).unwrap().uid(), 0);
+        fs::remove_dir(&st.processed_dir).unwrap();
+        for link in [st.failed_dir(), st.processed_dir.clone()] {
+            std::os::unix::fs::symlink(rooted.path(), &link).unwrap();
+            std::os::unix::fs::lchown(&link, Some(1000), Some(1000)).unwrap();
+        }
+        assert_eq!(st.prune_failed(30 * DAY), 0);
+        assert_eq!(st.prune_processed(30 * DAY), 0);
+        assert!(all_files_in(rooted.path(), &names));
     }
 
     fn no_fetch() -> FetchFn {
