@@ -1568,6 +1568,14 @@ fn check_manifest(
     verify_manifest(manifest, public_key_pem, require_signature)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// While a test sets this, [`install_release`] on its thread sets its
+    /// `stop` once the release is unpacked: the agent is stopped while the
+    /// release is checked (see `tests::stopping_once_unpacked`).
+    static STOP_ONCE_UNPACKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Install the verified `tarball` as the slot for `manifest.version`, then
 /// [`activate`] it. The archive is unpacked into a staging dir beside the
 /// slot, where it must be the release the manifest names and hold a
@@ -1586,6 +1594,10 @@ fn install_release(
     unless_stopping(stop, "before the extract")?;
     log::info!(target: LOG, "extracting beside {}", release_dir.display());
     let staged = Staged::unpack(tarball, &release_dir)?;
+    #[cfg(test)]
+    if STOP_ONCE_UNPACKED.with(|s| s.get()) {
+        stop.store(true, Ordering::SeqCst);
+    }
     let checked = (|| {
         staged.check_version(&manifest.version)?;
         if !slot_is_runnable(&staged.dir) {
@@ -1752,22 +1764,31 @@ fn deadline_passed(deadline_iso: Option<&str>, now_iso: &str) -> bool {
     deadline_iso.is_some_and(|d| !d.is_empty() && now_iso >= d)
 }
 
+/// True when `st` records a gate that judged its version and failed it
+/// with nothing to roll back to (`health failed: …`, see
+/// [`close_failed_gate`]).
+fn failed_by_its_gate(st: &UpdateStatus) -> bool {
+    st.is(STATUS_FAILED)
+        && st
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(HEALTH_FAILED))
+}
+
 /// If OTA activated successfully but status was marked failed (e.g. SIGTERM
 /// during self-restart), promote back to `pending_health` so the gate runs.
 ///
 /// Never a gate that has judged its version already and failed it with
 /// nothing to roll back to (`health failed: …`): promoted, it would arm
-/// again on every cycle, pausing jobs each time for the same verdict.
+/// again on every cycle, pausing jobs each time for the same verdict. Such
+/// a failure clears once its version runs healthy (see
+/// `clear_failed_gate_once_healthy`).
 pub fn recover_false_update_failure(
     mut st: UpdateStatus,
     cfg: &Config,
     env: &UpdateEnv,
 ) -> UpdateStatus {
-    let judged = st
-        .last_error
-        .as_deref()
-        .is_some_and(|e| e.starts_with(HEALTH_FAILED));
-    if !st.is(STATUS_FAILED) || judged {
+    if !st.is(STATUS_FAILED) || failed_by_its_gate(&st) {
         return st;
     }
     let target = st
@@ -1870,6 +1891,10 @@ fn started_before_gate(
 /// Once `stop` is set, a rollback still flips `current`, but the services
 /// are not restarted: that restart would replace the `systemctl stop` in
 /// progress. The next start runs the slot rolled back to.
+///
+/// A gate that failed with nothing to roll back to is not judged again,
+/// but cleared once its version runs healthy (see
+/// `clear_failed_gate_once_healthy`).
 pub fn process_pending_health(
     st: UpdateStatus,
     cfg: &Config,
@@ -1903,16 +1928,17 @@ fn judge_pending_health(
     started_at: Option<DateTime<Utc>>,
     stop: &AtomicBool,
 ) -> UpdateStatus {
-    let mut st = if st.is(STATUS_FAILED) {
+    let st = if st.is(STATUS_FAILED) {
         recover_false_update_failure(st, cfg, env)
     } else {
         st
     };
+    let now = now_iso.map(String::from).unwrap_or_else(utc_now);
+    let mut st = clear_failed_gate_once_healthy(st, env, whoami, &now);
     if !st.is(STATUS_PENDING_HEALTH) {
         return st;
     }
 
-    let now = now_iso.map(String::from).unwrap_or_else(utc_now);
     let expected = st
         .target_version
         .clone()
@@ -2074,6 +2100,48 @@ fn close_failed_gate(
     st
 }
 
+/// A gate that failed its version with nothing to roll back to (`health
+/// failed: …`) is never armed again ([`recover_false_update_failure`]), but
+/// once that version runs healthy here after all (its slot checks out and
+/// whoami does not fail: the network is back, say), its failure is over:
+/// `idle` at once, as a gate that passes leaves it, never through
+/// `pending_health`, so jobs do not pause for it. While whoami fails it
+/// stays failed. Any other status is returned as it is.
+fn clear_failed_gate_once_healthy(
+    mut st: UpdateStatus,
+    env: &UpdateEnv,
+    whoami: WhoamiResult,
+    now: &str,
+) -> UpdateStatus {
+    let target = st
+        .target_version
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !failed_by_its_gate(&st)
+        || whoami == WhoamiResult::Error
+        || target.is_empty()
+        || !same_version(&env.running_version, &target)
+        || local_slot_healthy(env, Some(&target)).is_err()
+    {
+        return st;
+    }
+    log::info!(
+        target: LOG,
+        "{target} runs healthy after its failed health gate ({}) — clearing the failure",
+        st.last_error.as_deref().unwrap_or_default()
+    );
+    st.status = STATUS_IDLE.into();
+    st.current_version = env.running_version.clone();
+    st.previous_version = None;
+    st.health_deadline_at = None;
+    st.armed_at = None;
+    st.last_error = None;
+    st.last_checked_at = Some(now.into());
+    st
+}
+
 /// Channel recorded in `update_status.json` (local-only; wms-api sends none).
 fn status_channel(cfg: &Config) -> String {
     if cfg.update_channel.is_empty() {
@@ -2156,8 +2224,7 @@ fn manual_rollback(st: &UpdateStatus) -> bool {
 /// ran.
 fn failed_health_gate(st: &UpdateStatus) -> bool {
     let err = st.last_error.as_deref().unwrap_or_default();
-    (st.is(STATUS_ROLLED_BACK) && !err.starts_with(RESTART_MISSED))
-        || (st.is(STATUS_FAILED) && err.starts_with(HEALTH_FAILED))
+    (st.is(STATUS_ROLLED_BACK) && !err.starts_with(RESTART_MISSED)) || failed_by_its_gate(st)
 }
 
 /// True when this status records an install of its target that failed in a
@@ -2227,8 +2294,11 @@ fn current_status(status: Option<UpdateStatus>, status_path: Option<&Path>) -> U
 /// Refuse a manifest for a version other than `desired`, the one asked for:
 /// installed, it would leave the node off `desired`, to fetch it again on
 /// every heartbeat (and `update apply --version` would install what was not
-/// asked for). Only a leading `v` may differ.
-fn check_manifest_version(manifest: &ReleaseManifest, desired: &str) -> Result<(), UpdateError> {
+/// asked for, whatever its source). Only a leading `v` may differ.
+pub fn check_manifest_version(
+    manifest: &ReleaseManifest,
+    desired: &str,
+) -> Result<(), UpdateError> {
     if normalize_version(&manifest.version) == normalize_version(desired) {
         return Ok(());
     }
@@ -5965,16 +6035,19 @@ mod tests {
     /// failed: …`) has given its verdict: it is not promoted back into a
     /// gate, which would pause jobs again on every cycle. An install cut
     /// off after its activation still is (see `recover_false_failed_then_health_ok`
-    /// and `interrupted_install_can_still_roll_back`).
+    /// and `interrupted_install_can_still_roll_back`). Once the version it
+    /// failed runs healthy after all (whoami answers again), the failure is
+    /// cleared at once, never through `pending_health`: jobs never pause.
     #[test]
     fn a_failed_gate_is_not_armed_again() {
         let td = tempfile::tempdir().unwrap();
         let root = two_slots(td.path());
         let c = cfg(td.path());
         let expired = || pending("2000-01-01T00:00:00+00:00".into());
-        let judge = |st: UpdateStatus, whoami: WhoamiResult| {
-            process_pending_health(st, &c, &env(&root), whoami, Some("timeout"), None, &NO_STOP)
+        let judge_in = |agent: &UpdateEnv, st: UpdateStatus, whoami: WhoamiResult| {
+            process_pending_health(st, &c, agent, whoami, Some("timeout"), None, &NO_STOP)
         };
+        let judge = |st: UpdateStatus, whoami: WhoamiResult| judge_in(&env(&root), st, whoami);
         let no_previous = judge(
             UpdateStatus {
                 previous_version: None,
@@ -6000,17 +6073,71 @@ mod tests {
         );
         // The agent runs 0.4.0 from a healthy slot: each later cycle used to
         // promote these back to pending_health.
-        for failed in [no_previous, no_rollback] {
-            assert_eq!(failed.status, STATUS_FAILED);
+        for failed in [no_previous.clone(), no_rollback] {
+            let ctx = failed.last_error.clone().unwrap();
+            assert_eq!(failed.status, STATUS_FAILED, "{ctx}");
+            assert!(!should_pause_jobs(Some(&failed)), "{ctx}");
             let again = recover_false_update_failure(failed.clone(), &c, &env(&root));
-            assert_eq!(again, failed);
-            for whoami in [WhoamiResult::Error, WhoamiResult::Ok] {
-                let again = judge(failed.clone(), whoami);
-                assert_eq!(again, failed, "{whoami:?}");
+            assert_eq!(again, failed, "{ctx}");
+            // Cycle after cycle while whoami fails: failed, as it was.
+            let mut st = failed.clone();
+            for _ in 0..3 {
+                st = judge(st, WhoamiResult::Error);
+                assert_eq!(st, failed, "{ctx}");
             }
-            assert!(!should_pause_jobs(Some(&failed)));
-            assert_eq!(current_name(&root), "0.4.0");
+            // Whoami answers (paired or not): 0.4.0 runs healthy here after
+            // all, and its failure is over.
+            for whoami in [
+                WhoamiResult::Ok,
+                WhoamiResult::Unauthorized,
+                WhoamiResult::Skipped,
+            ] {
+                let healed = judge(failed.clone(), whoami);
+                assert_eq!(healed.status, STATUS_IDLE, "{ctx}: {whoami:?}");
+                assert_eq!(
+                    (
+                        healed.current_version.as_str(),
+                        healed.target_version.as_deref()
+                    ),
+                    ("0.4.0", Some("0.4.0")),
+                    "{ctx}: {whoami:?}"
+                );
+                assert_eq!(
+                    (
+                        healed.last_error.as_deref(),
+                        healed.previous_version.as_deref(),
+                        healed.health_deadline_at.as_deref(),
+                        healed.armed_at.as_deref()
+                    ),
+                    (None, None, None, None),
+                    "{ctx}: {whoami:?}"
+                );
+                assert!(!should_pause_jobs(Some(&healed)), "{ctx}: {whoami:?}");
+                // The heartbeat that follows asks for the version it runs.
+                let hb = obj(json!({"desired_agent_version": "0.4.0"}));
+                let after = maybe_update_from_heartbeat(
+                    &hb,
+                    &c,
+                    &env(&root),
+                    Some(healed),
+                    None,
+                    false,
+                    &NO_STOP,
+                );
+                assert_eq!(after.status, STATUS_IDLE, "{ctx}: {whoami:?}");
+            }
+            assert_eq!(current_name(&root), "0.4.0", "{ctx}");
         }
+
+        // Not while the version it failed does not run here (another agent),
+        // nor while its slot cannot run.
+        let other = slot_agent(&root, "0.3.0");
+        assert_eq!(
+            judge_in(&other, no_previous.clone(), WhoamiResult::Ok),
+            no_previous
+        );
+        crate::util::set_mode(&root.join("releases/0.4.0/vesyl-print"), 0o644).unwrap();
+        assert_eq!(judge(no_previous.clone(), WhoamiResult::Ok), no_previous);
     }
 
     /// `update rollback` from 0.4.0 to 0.3.0 is recorded: the agent does not
@@ -6167,6 +6294,87 @@ mod tests {
             false,
             &NO_STOP,
         );
+        assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
+        assert_eq!(current_name(&root), "0.5.0");
+    }
+
+    /// Run `f` with a stop of its own, which the agent gets once the release
+    /// is unpacked: while it is checked, before it is put in place.
+    fn stopping_once_unpacked<T>(f: impl FnOnce(&AtomicBool) -> T) -> T {
+        let stop = AtomicBool::new(false);
+        STOP_ONCE_UNPACKED.with(|s| s.set(true));
+        let out = f(&stop);
+        STOP_ONCE_UNPACKED.with(|s| s.set(false));
+        assert!(stop.load(Ordering::SeqCst), "nothing was unpacked");
+        out
+    }
+
+    /// A stop that lands once the release is unpacked, while it is checked,
+    /// is honored before the release is put in place: nothing is installed
+    /// or left behind (no slot, staging dir or download), and a reinstall of
+    /// the slot `current` points at leaves that slot as it was. Through the
+    /// heartbeat, the status lets the next start try again: neither failed
+    /// nor backing off, the failed attempts before it forgotten.
+    #[test]
+    fn a_stop_before_the_activation_installs_nothing() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let slot = root.join("releases/0.4.0");
+        let before = tree(&slot);
+        let stopped = "update stopped before the activation: the agent is stopping";
+        let assert_stopped = |installed: Result<PathBuf, UpdateError>| {
+            let err = installed.unwrap_err();
+            assert_eq!((err.code, err.message.as_str()), (STOPPED, stopped));
+        };
+
+        // A reinstall of the version `current` points at, downloaded and not.
+        let again = build_release(&td.path().join("again"), "0.4.0");
+        let m = manifest_for(&again, "0.4.0");
+        assert_stopped(stopping_once_unpacked(|stop| {
+            apply_release(&m, &env(&root), None, false, stop)
+        }));
+        assert_stopped(stopping_once_unpacked(|stop| {
+            install_release(&m, &env(&root), &again, stop)
+        }));
+        assert_eq!(tree(&slot), before, "the active slot changed");
+        assert_eq!(current_name(&root), "0.4.0");
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"]);
+        assert_eq!(names(&root.join("update")), Vec::<String>::new());
+
+        // A new version, asked for by the heartbeat after two failed tries.
+        let c = unsigned_ok(td.path());
+        let hb = desire(td.path(), "0.5.0");
+        let retrying = UpdateStatus {
+            status: STATUS_FAILED.into(),
+            target_version: Some("0.5.0".into()),
+            last_error: Some("HTTP 503 downloading artifact".into()),
+            last_error_code: Some("download_failed".into()),
+            attempts: 2,
+            retry_at: Some(utc_now_plus(-1)),
+            ..Default::default()
+        };
+        let st = stopping_once_unpacked(|stop| {
+            maybe_update_from_heartbeat(&hb, &c, &env(&root), Some(retrying), None, false, stop)
+        });
+        assert_eq!(st.status, STATUS_IDLE, "{:?}", st.last_error);
+        assert_eq!(st.last_error.as_deref(), Some(stopped));
+        assert_eq!(st.target_version.as_deref(), Some("0.5.0"));
+        assert_eq!(
+            (
+                st.last_error_code.as_deref(),
+                st.attempts,
+                st.retry_at.as_deref()
+            ),
+            (None, 0, None)
+        );
+        assert_eq!(st.previous_version, None);
+        assert!(!should_pause_jobs(Some(&st)));
+        assert_eq!(names(&root.join("releases")), ["0.3.0", "0.4.0"]);
+        assert_eq!(names(&root.join("update")), Vec::<String>::new());
+        assert_eq!(current_name(&root), "0.4.0");
+
+        // The next start installs it.
+        let st = maybe_update_from_heartbeat(&hb, &c, &env(&root), Some(st), None, false, &NO_STOP);
         assert_eq!(st.status, STATUS_PENDING_HEALTH, "{:?}", st.last_error);
         assert_eq!(current_name(&root), "0.5.0");
     }

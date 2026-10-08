@@ -100,7 +100,8 @@ pub enum UpdateAction {
     Check,
     /// Download+install update
     Apply {
-        /// Target version (uses releases_base_url)
+        /// Target version (uses releases_base_url; with --manifest-url or
+        /// --file, the version their manifest must be for)
         #[arg(long)]
         version: Option<String>,
         /// Direct manifest URL
@@ -807,18 +808,35 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
         UpdateAction::Apply {
             file: Some(file),
             manifest,
-            restart,
-            ..
-        } => apply_local(deps, out, &file, manifest.as_deref(), restart),
-
-        UpdateAction::Apply {
-            manifest_url: Some(url),
+            version,
             restart,
             ..
         } => {
+            let version = version.as_deref().map(version_arg).transpose()?;
+            apply_local(
+                deps,
+                out,
+                &file,
+                manifest.as_deref(),
+                version.as_deref(),
+                restart,
+            )
+        }
+
+        UpdateAction::Apply {
+            manifest_url: Some(url),
+            version,
+            restart,
+            ..
+        } => {
+            // With a source of its own, --version is what it must hold.
+            let version = version.as_deref().map(version_arg).transpose()?;
             // Signatures required: a key that cannot be loaded is an error.
             let pem = update::manifest_public_key(cfg)?;
             let manifest = update::fetch_manifest(&url)?;
+            if let Some(v) = &version {
+                update::check_manifest_version(&manifest, v)?;
+            }
             let previous = update::slot_before_activation(env);
             // No stop to honor: a signal ends the CLI outright.
             update::apply_release(
@@ -938,12 +956,14 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
 }
 
 /// Offline tarball + manifest: installed and activated like an online apply
-/// ([`update::apply_local_release`]), only not downloaded.
+/// ([`update::apply_local_release`]), only not downloaded. With `version`
+/// (`--version`), the manifest must be for that version.
 fn apply_local(
     deps: &Deps,
     out: &mut dyn Write,
     file: &Path,
     manifest: Option<&Path>,
+    version: Option<&str>,
     restart: bool,
 ) -> CmdResult {
     let cfg = &deps.cfg;
@@ -956,6 +976,9 @@ fn apply_local(
         return die("manifest must be a JSON object");
     };
     let manifest = ReleaseManifest::from_dict(&data)?;
+    if let Some(v) = version {
+        update::check_manifest_version(&manifest, v)?;
+    }
     let tarball = fs::canonicalize(&file)
         .ok()
         .filter(|p| p.is_file())
@@ -3222,6 +3245,168 @@ mod tests {
         let root = &d.update_env.install_root;
         assert_eq!(file_names(&root.join("update")), Vec::<String>::new());
         assert_eq!(file_names(&root.join("releases")), ["0.8.0"]);
+    }
+
+    /// `Agent::run` of the 0.9.0 agent started after its update, which
+    /// finds the health gate for 0.9.0 (over 0.8.0) past its deadline;
+    /// whoami answers `whoami`. The agent is stopped while whoami is under
+    /// way when `stop_in_whoami`, else once the gate's verdict is on disk.
+    /// Returns the update status left, and the restarts asked for.
+    fn gate_under_agent_run(whoami: u16, stop_in_whoami: bool) -> (update::UpdateStatus, usize) {
+        let td = tempfile::tempdir().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let srv = http_stub::serve(move |req, s| match req.path.as_str() {
+            "/print/v1/whoami" => {
+                if stop_in_whoami {
+                    stopping.store(true, Ordering::SeqCst);
+                }
+                respond(s, whoami, &[], b"{}");
+            }
+            _ => respond(s, 404, &[], b"{}"),
+        });
+        let base = unsigned_deps(td.path());
+        let d = Deps {
+            cfg: Config {
+                api_base_url: srv.base_url.clone(),
+                cable_enabled: false,
+                pull_jobs_enabled: false,
+                ..base.cfg
+            },
+            ..base
+        };
+        d.cfg.ensure_dirs().unwrap();
+        installed_slot(&d, "0.8.0");
+        installed_slot(&d, "0.9.0");
+        pair(&d);
+        if whoami == 401 {
+            // Whoami reaching the API passes the gate: what fails it here
+            // is the slot, which can no longer run.
+            let binary = d.update_env.install_root.join("releases/0.9.0/vesyl-print");
+            crate::util::set_mode(&binary, 0o644).unwrap();
+        }
+        let path = d.cfg.update_status_path();
+        let gate = update::UpdateStatus {
+            status: update::STATUS_PENDING_HEALTH.into(),
+            current_version: "0.9.0".into(),
+            target_version: Some("0.9.0".into()),
+            previous_version: Some("0.8.0".into()),
+            health_deadline_at: Some("2000-01-01T00:00:00+00:00".into()),
+            ..Default::default()
+        };
+        update::write_update_status(&path, &gate).unwrap();
+        let mut agent = slot_agent(&d, "0.9.0", Arc::new(|| Some(Vec::new())));
+        // Never real CUPS (lpinfo, lpadmin, a LAN scan) from a test.
+        agent.provision_printers = Arc::new(Vec::new);
+        // Counted by restarts_during, never run.
+        agent.update_env.restart = true;
+        // Stops the agent once the gate's verdict is on disk, which it writes
+        // after it has restarted the services or not; or after 20 s, so that
+        // a gate that never decides fails the test rather than hangs it.
+        let stopper = {
+            let (stop, path) = (stop.clone(), path.clone());
+            thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !stop.load(Ordering::SeqCst)
+                    && update::read_update_status(&path)
+                        .is_none_or(|st| st.status == update::STATUS_PENDING_HEALTH)
+                    && std::time::Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+        let ((), restarts) = update::restarts_during(|| agent.run(stop));
+        stopper.join().unwrap();
+        assert_eq!(current(&d).as_deref(), Some("0.8.0"), "never rolled back");
+        (update::read_update_status(&path).unwrap(), restarts)
+    }
+
+    /// The agent's stop reaches its health gate: a gate that rolls back
+    /// during a `systemctl stop` flips `current` but restarts nothing, as
+    /// that restart would replace the stop job and bring the agent back. So
+    /// whether whoami fails or the API turns the node away (the gate runs
+    /// on either path of the agent's cycle). Not stopping, it restarts.
+    #[test]
+    fn the_agents_stop_reaches_its_health_gate() {
+        for (whoami, why) in [
+            (503, "health failed: "),
+            (
+                401,
+                "health failed: current slot has no executable vesyl-print binary",
+            ),
+        ] {
+            let (st, restarts) = gate_under_agent_run(whoami, true);
+            assert_eq!(st.status, update::STATUS_ROLLED_BACK, "{whoami}: {st:?}");
+            let error = st.last_error.unwrap_or_default();
+            assert!(
+                error.starts_with(why) && error.ends_with("; rolled back to 0.8.0"),
+                "{whoami}: {error}"
+            );
+            assert_eq!(restarts, 0, "{whoami}: restarted while stopping");
+        }
+        let (st, restarts) = gate_under_agent_run(503, false);
+        assert_eq!(st.status, update::STATUS_ROLLED_BACK, "{st:?}");
+        assert_eq!(restarts, 1);
+    }
+
+    /// `--version` with `--manifest-url` or `--file` is the version the
+    /// release must be: a manifest for another is refused before anything
+    /// is downloaded, unpacked or activated, and a `--version` that is no
+    /// version before the manifest is even fetched. (It was ignored: 0.9.3
+    /// was installed for `--version 0.9.2`, and `--version latest` passed.)
+    #[test]
+    fn update_apply_version_holds_for_every_source() {
+        let td = tempfile::tempdir().unwrap();
+        let d = unsigned_deps(td.path());
+        installed_slot(&d, "0.8.0");
+        let (tarball, manifest) = release(td.path(), "0.9.3");
+        let served = fs::read(&manifest).unwrap();
+        let srv = http_stub::serve(move |_, s| respond(s, 200, &[], &served));
+        let url = format!("{}/m.json", srv.base_url);
+        let (t, m) = (tarball.to_str().unwrap(), manifest.to_str().unwrap());
+        // `update apply --version <v>` from the manifest URL, and from the file.
+        let from_url =
+            |v: &'static str| vec!["update", "apply", "--manifest-url", &url, "--version", v];
+        let from_file = |v: &'static str| {
+            vec![
+                "update",
+                "apply",
+                "--version",
+                v,
+                "--file",
+                t,
+                "--manifest",
+                m,
+            ]
+        };
+        let root = &d.update_env.install_root;
+        let invalid = "invalid --version \"latest\": expected a release version such as 0.5.0";
+        let another = "manifest is for version 0.9.3, not 0.9.2";
+        for (argv, error) in [
+            (from_url("latest"), invalid),
+            (from_url("0.9.2"), another),
+            (from_file("latest"), invalid),
+            (from_file("0.9.2"), another),
+        ] {
+            let (r, out) = run_args(&d, &argv);
+            assert_eq!(r.unwrap_err().0, error, "{argv:?}");
+            assert_eq!(out, "", "{argv:?}");
+            assert_eq!(current(&d).as_deref(), Some("0.8.0"), "{argv:?}");
+            assert_eq!(file_names(&root.join("releases")), ["0.8.0"], "{argv:?}");
+            assert_eq!(file_names(&root.join("update")), Vec::<String>::new());
+        }
+        // Only the --version that is one fetched the manifest.
+        assert_eq!(srv.requests().len(), 1);
+
+        // The version the release is: installed, from either source.
+        for argv in [from_url("v0.9.3"), from_file("0.9.3")] {
+            update::flip_current(root, "0.8.0").unwrap();
+            let (r, out) = run_args(&d, &argv);
+            assert_eq!(r.unwrap(), 0, "{argv:?}: {out}");
+            assert_eq!(current(&d).as_deref(), Some("0.9.3"), "{argv:?}");
+        }
     }
 
     #[test]
