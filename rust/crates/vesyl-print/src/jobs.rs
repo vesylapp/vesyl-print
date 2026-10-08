@@ -5,8 +5,10 @@
 //! 1. If processed/<job_id> exists → already finished (idempotent), skip print
 //! 2. If no queue file → write + fsync full job JSON to queue/<job_id>.json
 //! 3. Only then call ack callback (when cloud supports it)
-//! 4. Materialize content → lp -d <cups_name> (`-o raw` for raw_*/ZPL)
-//! 5. Report **delivered** when lp accepts the job
+//! 4. Record the attempt in the queue file, then materialize content →
+//!    lp -d <cups_name> (`-o raw` for raw_*/ZPL)
+//! 5. When lp accepts the job, record that in the queue file (its CUPS
+//!    request id), then report **delivered**
 //! 6. Optionally poll CUPS → report **printed** or **error**
 //!    (`WaitCups::Async` hands the job to the pipeline's shared
 //!    [`CupsWatcher`] so the next job can be `lp`'d immediately; CUPS FIFO
@@ -20,6 +22,16 @@
 //! when [`JobStore::prune_processed`] finds it past the retention.
 //!
 //! On agent start: [`Pipeline::drain`] recovers queue/*.json left from crashes.
+//!
+//! What steps 4 and 5 record (under `_agent` in the queue file, beside the
+//! cloud's payload) is what the next run goes by. A job CUPS already has is
+//! never given to `lp` again, which would print a second label: it is
+//! finished from what CUPS says ([`Pipeline::resume`]). A job the agent died
+//! in [`MAX_ATTEMPTS`] times while converting or submitting it (out of
+//! memory, say) is retired as `crash_loop` instead of killing every start.
+//! Once [`Pipeline::stop`] is set the drain takes no more jobs, none goes to
+//! `lp`, and a CUPS wait ends early, each leaving its record for the next
+//! start.
 //!
 //! Job ids become file names, so only [`valid_job_id`] ids are accepted.
 //!
@@ -37,12 +49,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::WaitCups;
@@ -154,6 +168,10 @@ const PERMANENT_CODES: &[&str] = &[
     "cups_job_failed",
 ];
 
+/// Code of a job the agent died in [`MAX_ATTEMPTS`] times while converting
+/// or submitting it: permanent, as one more try would only kill it again.
+pub const CRASH_LOOP: &str = "crash_loop";
+
 impl JobError {
     pub fn new(message: impl Into<String>, code: &str) -> Self {
         JobError {
@@ -163,10 +181,11 @@ impl JobError {
     }
 
     /// True when retrying cannot succeed (bad payload or content, unknown
-    /// CUPS queue, a CUPS job that was canceled or aborted). Transient
-    /// failures (network, CUPS down, local I/O) return false.
+    /// CUPS queue, a CUPS job that was canceled or aborted, a job that
+    /// keeps killing the agent). Transient failures (network, CUPS down,
+    /// local I/O) return false.
     pub fn is_permanent(&self) -> bool {
-        PERMANENT_CODES.contains(&self.code.as_str())
+        PERMANENT_CODES.contains(&self.code.as_str()) || self.code == CRASH_LOOP
     }
 }
 
@@ -340,6 +359,10 @@ pub enum JobOutcome {
     Printed,
     /// `lp` accepted it; completion not tracked (or tracked in the background).
     Delivered,
+    /// Cut short because the agent is stopping ([`Pipeline::stop`]): the job
+    /// keeps its queue record, and the next start prints it, or (once `lp`
+    /// has it) finishes following it in CUPS.
+    Interrupted,
 }
 
 impl JobOutcome {
@@ -347,6 +370,7 @@ impl JobOutcome {
         match self {
             JobOutcome::Printed => "printed",
             JobOutcome::Delivered => "delivered",
+            JobOutcome::Interrupted => "interrupted",
         }
     }
 }
@@ -358,8 +382,31 @@ pub enum CupsOutcome {
     Printed,
     /// CUPS reports canceled/aborted (best-effort).
     Error,
-    /// Hard timeout, or CUPS queries failed repeatedly.
+    /// Hard timeout, CUPS queries failed repeatedly, or the wait was cut
+    /// short because the agent is stopping ([`WaitCtx::stop`]).
     Unknown,
+}
+
+/// Where CUPS has a job now ([`Pipeline::cups_lookup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CupsJobState {
+    /// Pending, held or printing (`lpstat -W not-completed` lists it).
+    Active,
+    /// Completed (`lpstat -W completed`, with no cancel/abort reason).
+    Printed,
+    /// Canceled or aborted.
+    Failed,
+    /// In neither list: CUPS no longer knows the job.
+    Forgotten,
+}
+
+/// What a CUPS wait ([`WaitFn`]) gets besides the request id.
+pub struct WaitCtx {
+    /// Called on each poll that finds the job still active
+    /// ([`Pipeline::on_wait_tick`]).
+    pub tick: Option<TickFn>,
+    /// Once set, the wait gives up and returns [`CupsOutcome::Unknown`].
+    pub stop: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -375,7 +422,10 @@ pub type StateFn =
     Arc<dyn Fn(&PrintJob, JobState, Option<&str>) -> Result<(), BoxError> + Send + Sync>;
 pub type FetchFn = Arc<dyn Fn(&str) -> Result<Vec<u8>, BoxError> + Send + Sync>;
 pub type TickFn = Arc<dyn Fn() + Send + Sync>;
-pub type WaitFn = Arc<dyn Fn(&str, Option<&TickFn>) -> CupsOutcome + Send + Sync>;
+pub type WaitFn = Arc<dyn Fn(&str, &WaitCtx) -> CupsOutcome + Send + Sync>;
+/// Where CUPS has the job with this request key, or `Err` when CUPS could
+/// not be asked. See [`lookup_cups_job`].
+pub type CupsLookupFn = Arc<dyn Fn(&str) -> Result<CupsJobState, String> + Send + Sync>;
 pub type RawProbeFn = Arc<dyn Fn(&str) -> Result<bool, BoxError> + Send + Sync>;
 /// One CUPS round for a set of request keys (`Printer-N`): the final outcome
 /// of every key that has left the not-completed list (keys still active are
@@ -441,6 +491,11 @@ fn lp_failure(text: &str) -> JobError {
         "lp_error"
     };
     JobError::new(if text.is_empty() { "lp failed" } else { text }, code)
+}
+
+/// CUPS canceled or aborted request `cid` (`cups_job_failed`, permanent).
+fn cups_job_failed(cid: &str) -> JobError {
+    JobError::new(format!("CUPS job {cid} failed"), "cups_job_failed")
 }
 
 /// Submit a file to CUPS via `lp`.
@@ -544,6 +599,12 @@ fn listed_job_ids(listing: &str) -> HashSet<&str> {
 /// message) may say "canceled" about anything. No failure reason, or no
 /// block for the job → `Printed`.
 fn completed_outcome(done_out: &str, job_key: &str) -> CupsOutcome {
+    completed_block_outcome(done_out, job_key).unwrap_or(CupsOutcome::Printed)
+}
+
+/// [`completed_outcome`], or `None` when the listing has no block for
+/// `job_key`.
+fn completed_block_outcome(done_out: &str, job_key: &str) -> Option<CupsOutcome> {
     let mut in_block = false;
     for line in done_out.lines() {
         if !line.starts_with(char::is_whitespace) {
@@ -565,10 +626,27 @@ fn completed_outcome(done_out: &str, job_key: &str) -> CupsOutcome {
                 .any(|k| r.contains(k))
         });
         if failed {
-            return CupsOutcome::Error;
+            return Some(CupsOutcome::Error);
         }
     }
-    CupsOutcome::Printed
+    // Still set when the job's block was found (the loop stops in it).
+    in_block.then_some(CupsOutcome::Printed)
+}
+
+/// Where CUPS has the job `job_key` ([`CupsJobState`]): `lpstat -W
+/// not-completed`, then, when it is not listed there, `lpstat -W completed
+/// -l`.
+fn lookup_cups_job(lpstat: &Lpstat, job_key: &str) -> Result<CupsJobState, String> {
+    let active = lpstat_listing(lpstat, &["-W", "not-completed"])?;
+    if listed_job_ids(&active).contains(job_key) {
+        return Ok(CupsJobState::Active);
+    }
+    let done = lpstat_listing(lpstat, &["-W", "completed", "-l"])?;
+    Ok(match completed_block_outcome(&done, job_key) {
+        Some(CupsOutcome::Error) => CupsJobState::Failed,
+        Some(_) => CupsJobState::Printed,
+        None => CupsJobState::Forgotten,
+    })
 }
 
 /// One CUPS round for `keys`: `lpstat -W not-completed`, then (only if some
@@ -597,21 +675,34 @@ pub fn poll_cups_jobs(keys: &[String]) -> Result<HashMap<String, CupsOutcome>, S
     query_cups(&run_lpstat, keys)
 }
 
-/// Poll CUPS until the job leaves the active (not-completed) queue.
+/// Poll CUPS until the job leaves the active (not-completed) queue, or
+/// `ctx.stop` is set.
 pub fn wait_cups_job(
     request_id: &str,
     timeout: Duration,
     poll: Duration,
-    on_tick: Option<&TickFn>,
+    ctx: &WaitCtx,
 ) -> CupsOutcome {
-    wait_cups_job_with(request_id, timeout, poll, on_tick, &run_lpstat)
+    wait_cups_job_with(request_id, timeout, poll, ctx, &run_lpstat)
+}
+
+/// Sleep `pause`, or less once `stop` is set.
+fn nap(pause: Duration, stop: &AtomicBool) {
+    let until = Instant::now() + pause;
+    while !stop.load(Ordering::SeqCst) {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        thread::sleep(left.min(Duration::from_millis(100)));
+    }
 }
 
 fn wait_cups_job_with(
     request_id: &str,
     timeout: Duration,
     poll: Duration,
-    on_tick: Option<&TickFn>,
+    ctx: &WaitCtx,
     lpstat: &Lpstat,
 ) -> CupsOutcome {
     let Some(job_key) = request_id.split_whitespace().next() else {
@@ -624,6 +715,11 @@ fn wait_cups_job_with(
     let mut last_log: Option<Instant> = None;
 
     while Instant::now() < deadline {
+        // A stop (SIGTERM) must not wait out a printer that is out of paper.
+        if ctx.stop.load(Ordering::SeqCst) {
+            log::info!(target: LOG, "stopping — no longer waiting on CUPS job {job_key}");
+            return CupsOutcome::Unknown;
+        }
         // A panic (a thread `lpstat` needs is refused) is a failed query.
         let polled = catch_panic(|| query_cups(lpstat, &keys))
             .unwrap_or_else(|msg| Err(format!("CUPS query panicked: {msg}")));
@@ -641,7 +737,7 @@ fn wait_cups_job_with(
                     log::warn!(target: LOG, "CUPS lpstat failed {failures} times for {job_key} — leaving delivered");
                     return CupsOutcome::Unknown;
                 }
-                thread::sleep(poll.max(Duration::from_millis(500)));
+                nap(poll.max(Duration::from_millis(500)), &ctx.stop);
                 continue;
             }
         }
@@ -655,12 +751,12 @@ fn wait_cups_job_with(
             last_log = Some(Instant::now());
         }
         // Keep admin inventory fresh while this thread is blocked on paper-out.
-        if let Some(tick) = on_tick {
+        if let Some(tick) = &ctx.tick {
             if let Err(msg) = catch_panic(|| tick()) {
                 log::warn!(target: LOG, "CUPS wait tick for {job_key} panicked: {msg}");
             }
         }
-        thread::sleep(poll.max(Duration::from_millis(250)));
+        nap(poll.max(Duration::from_millis(250)), &ctx.stop);
     }
     log::warn!(
         target: LOG,
@@ -914,6 +1010,73 @@ fn report_cups_outcome(w: WatchedJob, outcome: CupsOutcome) {
     }
 }
 
+/// The key of a queue record under which the agent keeps its own notes on
+/// the job, beside the cloud's payload ([`LocalState`]). An older agent,
+/// reading the record after a rollback, ignores it as it ignores any key it
+/// does not know (Python's `PrintJob.from_dict` as well as ours keep the
+/// whole payload in `raw` and read only theirs).
+const LOCAL_KEY: &str = "_agent";
+
+/// Runs of conversion and `lp` for one job that the agent died in (out of
+/// memory, an allocation abort no `catch_unwind` stops) before the job is
+/// retired as [`CRASH_LOOP`]: each restart (systemd's, 5 s later) would run
+/// it again, and kill the agent again, before it took any other job.
+pub const MAX_ATTEMPTS: u32 = 3;
+
+/// What a queue record says about earlier runs of its job ([`LOCAL_KEY`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LocalState {
+    /// Runs of conversion and `lp` that never returned: the agent died in
+    /// them. Written before each run, and taken back once it returns.
+    attempts: u32,
+    /// Set once `lp` has accepted the job.
+    submitted: Option<Submission>,
+}
+
+/// `lp` accepted the job: CUPS has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Submission {
+    /// The CUPS request (`Zebra-42`), when `lp` named one.
+    cups_job_id: Option<String>,
+    submitted_at: String,
+}
+
+impl LocalState {
+    /// From a record's [`LOCAL_KEY`] value; anything unreadable counts as
+    /// no notes at all.
+    fn from_value(v: Option<&Value>) -> LocalState {
+        let Some(Value::Object(o)) = v else {
+            return LocalState::default();
+        };
+        let text = |k: &str| {
+            o.get(k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        };
+        LocalState {
+            attempts: o
+                .get("attempts")
+                .and_then(py_int)
+                .map_or(0, |n| n.clamp(0, i64::from(u32::MAX)) as u32),
+            submitted: text("submitted_at").map(|submitted_at| Submission {
+                cups_job_id: text("cups_job_id"),
+                submitted_at,
+            }),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        let mut v = json!({ "attempts": self.attempts });
+        if let Some(s) = &self.submitted {
+            v["cups_job_id"] = json!(s.cups_job_id);
+            v["submitted_at"] = json!(s.submitted_at);
+        }
+        v
+    }
+}
+
 /// Durable queue + processed markers under state_dir.
 #[derive(Debug, Clone)]
 pub struct JobStore {
@@ -974,11 +1137,47 @@ impl JobStore {
         if path.is_file() {
             return Ok(path);
         }
-        let mut raw =
-            serde_json::to_string_pretty(&job.to_dict()).map_err(std::io::Error::other)?;
+        // A new record has no history here, whatever its payload carries.
+        let mut data = job.to_dict();
+        data.remove(LOCAL_KEY);
+        let mut raw = serde_json::to_string_pretty(&data).map_err(std::io::Error::other)?;
         raw.push('\n');
         write_durable(&path, raw.as_bytes(), 0o600, true)?;
         Ok(path)
+    }
+
+    /// What queue/<job_id>.json records about earlier runs of the job:
+    /// nothing for a record without notes, or one that cannot be read. Only
+    /// the notes are kept from the file, not its content.
+    fn local_state(&self, job_id: &str) -> LocalState {
+        #[derive(Deserialize)]
+        struct Notes {
+            // LOCAL_KEY (an attribute takes a literal only).
+            #[serde(rename = "_agent")]
+            notes: Option<Value>,
+        }
+        if !valid_job_id(job_id) {
+            return LocalState::default();
+        }
+        fs::read(self.queue_path(job_id))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Notes>(&raw).ok())
+            .map(|n| LocalState::from_value(n.notes.as_ref()))
+            .unwrap_or_default()
+    }
+
+    /// Rewrite queue/<job.id>.json as `job` with the notes `local`, as
+    /// durably as [`JobStore::write_queue`] (a new file, fsynced, renamed
+    /// over the old one, directory fsynced).
+    fn write_local(&self, job: &PrintJob, local: &LocalState) -> std::io::Result<()> {
+        if !valid_job_id(&job.id) {
+            return Err(invalid_id_error());
+        }
+        let mut data = job.to_dict();
+        data.insert(LOCAL_KEY.into(), local.to_value());
+        let mut raw = serde_json::to_string_pretty(&data).map_err(std::io::Error::other)?;
+        raw.push('\n');
+        write_durable(&self.queue_path(&job.id), raw.as_bytes(), 0o600, true)
     }
 
     /// Write the processed/<job_id> marker (a timestamp). It goes through
@@ -1515,8 +1714,16 @@ pub struct Pipeline {
     pub wait_cups_job: WaitFn,
     /// Follows `WaitCups::Async` jobs; shared by every clone of the pipeline.
     pub cups_watcher: Arc<CupsWatcher>,
+    /// Where CUPS has a job `lp` accepted before the agent stopped or died
+    /// ([`Pipeline::resume`]).
+    pub cups_lookup: CupsLookupFn,
     pub supports_raw: RawProbeFn,
     pub work_dir: Option<PathBuf>,
+    /// Set when the agent is stopping (the agent's stop flag; never, by
+    /// default): the drain takes no further job, no job goes to `lp`, and a
+    /// CUPS wait ends early. Each such job keeps its queue record for the
+    /// next start ([`JobOutcome::Interrupted`]).
+    pub stop: Arc<AtomicBool>,
 }
 
 impl Default for Pipeline {
@@ -1528,12 +1735,14 @@ impl Default for Pipeline {
             fetch_url: Arc::new(http_get),
             on_wait_tick: None,
             wait_cups: WaitCups::Sync,
-            wait_cups_job: Arc::new(|id, tick| {
-                wait_cups_job(id, DEFAULT_CUPS_WAIT, Duration::from_secs(2), tick)
+            wait_cups_job: Arc::new(|id, ctx| {
+                wait_cups_job(id, DEFAULT_CUPS_WAIT, Duration::from_secs(2), ctx)
             }),
             cups_watcher: Arc::new(CupsWatcher::default()),
+            cups_lookup: Arc::new(|key| lookup_cups_job(&run_lpstat, key)),
             supports_raw: Arc::new(|q| Ok(crate::printers::queue_supports_raw(q, None))),
             work_dir: None,
+            stop: Arc::default(),
         }
     }
 }
@@ -1560,11 +1769,27 @@ impl Pipeline {
         send_state(&self.report_state, job, state, detail);
     }
 
+    fn stopping(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Report `e` as the job's error; a permanent one also retires its queue
+    /// file to `queue/failed/`.
+    fn failed(&self, job: &PrintJob, store: &JobStore, e: JobError) -> JobError {
+        self.report(job, JobState::Error, Some(&e.message));
+        log::error!(target: LOG, "job {} error: {}", job.id, e.message);
+        if e.is_permanent() {
+            retire_queue_file(store, &job.id, &e);
+        }
+        e
+    }
+
     /// Run the full durable pipeline for one job.
     ///
     /// Returns `Printed`, `Delivered` (CUPS not tracked or tracked in the
-    /// background), or a `JobError` after reporting `error` (a permanent one
-    /// also moves the queue file to `queue/failed/`).
+    /// background), `Interrupted` (the agent is stopping), or a `JobError`
+    /// after reporting `error` (a permanent one also moves the queue file to
+    /// `queue/failed/`).
     ///
     /// A panic in a step (e.g. the OS refusing a thread that `lp` or a cloud
     /// call needs) is handled like Python's catch-all: the ack and status
@@ -1594,6 +1819,29 @@ impl Pipeline {
         // 2. Durable receive before any ack / print
         store.write_queue(job).map_err(io_err)?;
 
+        // What an earlier run of this job left in its record.
+        let local = store.local_state(job_id);
+        if let Some(sub) = &local.submitted {
+            // CUPS has it already: never `lp` it again.
+            return self
+                .resume(job, store, sub)
+                .map_err(|e| self.failed(job, store, e));
+        }
+        if local.attempts >= MAX_ATTEMPTS {
+            let e = JobError::new(
+                format!(
+                    "printing this job ended the agent {} times (out of memory?) — not tried again",
+                    local.attempts
+                ),
+                CRASH_LOOP,
+            );
+            return Err(self.failed(job, store, e));
+        }
+        if self.stopping() {
+            log::info!(target: LOG, "stopping — job {job_id} stays queued for the next start");
+            return Ok(JobOutcome::Interrupted);
+        }
+
         // 3. Ack only after disk durability. Non-fatal: cloud can redeliver.
         // An ack that panics did not happen either; the job still prints.
         match catch_panic(|| (self.ack)(job)) {
@@ -1602,10 +1850,20 @@ impl Pipeline {
             Err(msg) => log::warn!(target: LOG, "ack failed for job {job_id}: panicked: {msg}"),
         }
 
-        // 4–6. Materialize + submit + optional CUPS completion wait
+        // 4–6. Materialize + submit + optional CUPS completion wait. The
+        // attempt is on disk before the steps that could end the agent
+        // (conversion, lp), so a job that keeps doing so is caught.
         self.report(job, JobState::Printing, None);
+        let attempt = LocalState {
+            attempts: local.attempts + 1,
+            submitted: None,
+        };
+        if let Err(e) = store.write_local(job, &attempt) {
+            let e = JobError::new(format!("could not record the attempt: {e}"), "job_error");
+            return Err(self.failed(job, store, e));
+        }
         let mut temp: Option<PathBuf> = None;
-        let result = catch_panic(|| self.submit(job, store, &mut temp))
+        let result = catch_panic(|| self.submit(job, store, &attempt, &mut temp))
             .unwrap_or_else(|msg| Err(JobError::new(format!("job panicked: {msg}"), "job_error")));
 
         if let Some(path) = &temp {
@@ -1623,24 +1881,36 @@ impl Pipeline {
             }
         }
 
-        match result {
-            Ok(outcome) => Ok(outcome),
-            Err(e) => {
-                self.report(job, JobState::Error, Some(&e.message));
-                log::error!(target: LOG, "job {job_id} error: {}", e.message);
-                if e.is_permanent() {
-                    retire_queue_file(store, job_id, &e);
-                }
-                Err(e)
-            }
+        // The agent lived through this attempt: take it back, unless the
+        // record is gone (done, or retired) or CUPS has the job now.
+        let kept = match &result {
+            Ok(outcome) => *outcome == JobOutcome::Interrupted,
+            Err(e) => !e.is_permanent(),
+        };
+        if kept {
+            self.end_attempt(job, store, &local);
+        }
+        result.map_err(|e| self.failed(job, store, e))
+    }
+
+    /// Put back `before`, the record's notes from before an attempt that
+    /// returned, unless `lp` took the job meanwhile (the notes say so).
+    fn end_attempt(&self, job: &PrintJob, store: &JobStore, before: &LocalState) {
+        if !store.has_queue_file(&job.id) || store.local_state(&job.id).submitted.is_some() {
+            return;
+        }
+        if let Err(e) = store.write_local(job, before) {
+            log::warn!(target: LOG, "job {}: could not take back the attempt: {e}", job.id);
         }
     }
 
-    /// Steps 4–7; `temp` receives any temp file the caller must delete.
+    /// Steps 4–7; `temp` receives any temp file the caller must delete, and
+    /// `attempt` is the record's notes for this run.
     fn submit(
         &self,
         job: &PrintJob,
         store: &JobStore,
+        attempt: &LocalState,
         temp: &mut Option<PathBuf>,
     ) -> Result<JobOutcome, JobError> {
         let job_id = job.id.as_str();
@@ -1689,6 +1959,11 @@ impl Pipeline {
             use_raw = true;
         }
 
+        // A stop does not wait for one more label: the next start prints it.
+        if self.stopping() {
+            log::info!(target: LOG, "stopping — job {job_id} not sent to CUPS; it stays queued for the next start");
+            return Ok(JobOutcome::Interrupted);
+        }
         let cups_id = (self.lp)(
             &job.cups_name,
             &path,
@@ -1699,23 +1974,50 @@ impl Pipeline {
             },
         )?;
         let cups_job = cups_id.filter(|s| !s.trim().is_empty());
+        // On disk before anything else: should the agent stop or die before
+        // the job is marked processed, the next start must not print it again.
+        let submitted = LocalState {
+            submitted: Some(Submission {
+                cups_job_id: cups_job.clone(),
+                submitted_at: utc_now_iso(),
+            }),
+            ..attempt.clone()
+        };
+        if let Err(e) = store.write_local(job, &submitted) {
+            log::warn!(target: LOG, "job {job_id}: could not record that CUPS has it ({e}) — a restart before it is marked processed prints it again");
+        }
         self.report(job, JobState::Delivered, cups_job.as_deref());
 
+        match self.follow(job, cups_job.as_deref())? {
+            // CUPS has it, and its record says so: the next start follows it.
+            JobOutcome::Interrupted => Ok(JobOutcome::Interrupted),
+            outcome => self.finish(job, store, outcome),
+        }
+    }
+
+    /// What follows `lp`: wait for CUPS to finish the job (`Sync`), hand it
+    /// to the watcher (`Async`), or neither (`Off`). `Interrupted` when a
+    /// stop cut the wait short.
+    fn follow(&self, job: &PrintJob, cups_job: Option<&str>) -> Result<JobOutcome, JobError> {
+        let job_id = job.id.as_str();
         let mut outcome = JobOutcome::Delivered;
-        match (&cups_job, self.wait_cups) {
+        match (cups_job, self.wait_cups) {
             (Some(cid), WaitCups::Sync) => {
+                let ctx = WaitCtx {
+                    tick: self.on_wait_tick.clone(),
+                    stop: self.stop.clone(),
+                };
                 // CUPS has the job: a panic while waiting leaves it delivered
                 // (a job error would keep the queue file and print it again).
-                match catch_panic(|| (self.wait_cups_job)(cid, self.on_wait_tick.as_ref())) {
+                match catch_panic(|| (self.wait_cups_job)(cid, &ctx)) {
                     Ok(CupsOutcome::Printed) => {
                         self.report(job, JobState::Printed, Some(cid));
                         outcome = JobOutcome::Printed;
                     }
-                    Ok(CupsOutcome::Error) => {
-                        return Err(JobError::new(
-                            format!("CUPS job {cid} failed"),
-                            "cups_job_failed",
-                        ));
+                    Ok(CupsOutcome::Error) => return Err(cups_job_failed(cid)),
+                    Ok(CupsOutcome::Unknown) if self.stopping() => {
+                        log::info!(target: LOG, "stopping — job {job_id} is with CUPS ({cid}); the next start follows it");
+                        outcome = JobOutcome::Interrupted;
                     }
                     Ok(CupsOutcome::Unknown) => {
                         log::info!(target: LOG, "job {job_id} CUPS tracking timed out for {cid} — left delivered");
@@ -1734,7 +2036,17 @@ impl Pipeline {
                 log::info!(target: LOG, "job {job_id} no CUPS request id — left delivered")
             }
         }
+        Ok(outcome)
+    }
 
+    /// Step 7: the processed marker, then the queue file goes.
+    fn finish(
+        &self,
+        job: &PrintJob,
+        store: &JobStore,
+        outcome: JobOutcome,
+    ) -> Result<JobOutcome, JobError> {
+        let job_id = job.id.as_str();
         store
             .mark_processed(job_id)
             .map_err(|e| JobError::new(e.to_string(), "job_error"))?;
@@ -1746,8 +2058,71 @@ impl Pipeline {
         Ok(outcome)
     }
 
+    /// Finish a job whose record says `lp` accepted it (`sub`): the agent
+    /// stopped or died before marking it processed. Giving it to `lp` again
+    /// would print a second label, so what is left is what follows `lp`,
+    /// from where CUPS has the job now: still printing → report delivered
+    /// and follow it as usual; finished → report printed, or the error;
+    /// with `WaitCups::Off` or no request id → report delivered.
+    ///
+    /// A job CUPS no longer knows (its history purged, CUPS reset or
+    /// reinstalled) is finished as delivered, without printing: `lp` took
+    /// it, and whether it printed is lost with CUPS's record. Printing it
+    /// again risks the very duplicate label this avoids, and reporting it
+    /// printed or failed would claim what no one can tell; delivered is what
+    /// the agent reports whenever it loses track of a job in CUPS. When CUPS
+    /// cannot be asked (down), it is followed like a job just handed to
+    /// `lp`, which gives up on CUPS the same way.
+    fn resume(
+        &self,
+        job: &PrintJob,
+        store: &JobStore,
+        sub: &Submission,
+    ) -> Result<JobOutcome, JobError> {
+        let job_id = job.id.as_str();
+        let cid = sub.cups_job_id.as_deref();
+        log::info!(
+            target: LOG,
+            "job {job_id} went to CUPS ({}) at {} — finishing it without printing it again",
+            cid.unwrap_or("no request id"),
+            sub.submitted_at
+        );
+        let Some(cid) = cid.filter(|_| self.wait_cups != WaitCups::Off) else {
+            self.report(job, JobState::Delivered, cid);
+            return self.finish(job, store, JobOutcome::Delivered);
+        };
+        let key = cid.split_whitespace().next().unwrap_or(cid);
+        let state = catch_panic(|| (self.cups_lookup)(key))
+            .unwrap_or_else(|msg| Err(format!("CUPS query panicked: {msg}")));
+        let outcome = match state {
+            Ok(CupsJobState::Printed) => {
+                self.report(job, JobState::Printed, Some(cid));
+                JobOutcome::Printed
+            }
+            Ok(CupsJobState::Failed) => return Err(cups_job_failed(cid)),
+            Ok(CupsJobState::Forgotten) => {
+                log::warn!(target: LOG, "job {job_id}: CUPS no longer knows {cid} — left delivered");
+                self.report(job, JobState::Delivered, Some(cid));
+                JobOutcome::Delivered
+            }
+            Ok(CupsJobState::Active) | Err(_) => {
+                if let Err(e) = &state {
+                    log::warn!(target: LOG, "job {job_id}: {e} — following {cid} as if just sent");
+                }
+                self.report(job, JobState::Delivered, Some(cid));
+                match self.follow(job, Some(cid))? {
+                    JobOutcome::Interrupted => return Ok(JobOutcome::Interrupted),
+                    outcome => outcome,
+                }
+            }
+        };
+        self.finish(job, store, outcome)
+    }
+
     /// Process every queue/*.json (crash recovery). Returns `[(job_id, result)]`
-    /// where result is `printed`, `delivered` or `error:<code>`.
+    /// where result is `printed`, `delivered`, `interrupted` or
+    /// `error:<code>`. Once [`Pipeline::stop`] is set it takes no further
+    /// job: the rest stay queued for the next start.
     ///
     /// Files that cannot be loaded (corrupt, invalid, misnamed) can never
     /// succeed and are moved to `queue/failed/`; so are jobs that fail
@@ -1756,6 +2131,10 @@ impl Pipeline {
         let _ = store.ensure();
         let mut results = Vec::new();
         for job_id in store.list_queued_ids() {
+            if self.stopping() {
+                log::info!(target: LOG, "stopping — the queued jobs from {job_id} on wait for the next start");
+                break;
+            }
             let job = match store.load_queued(&job_id) {
                 Ok(j) => j,
                 Err(e) => {
@@ -1891,6 +2270,7 @@ mod tests {
                 Duration::from_secs(5),
             ),
             fetch_url: Arc::new(|_| Err("no network in tests".into())),
+            cups_lookup: Arc::new(|_| panic!("cups_lookup should not run")),
             ..Pipeline::default()
         }
     }
@@ -3504,6 +3884,430 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// The agent's notes in a job's queue record (`_agent`).
+    fn notes(st: &JobStore, id: &str) -> Value {
+        let raw = fs::read_to_string(st.queue_path(id)).unwrap();
+        serde_json::from_str::<Value>(&raw).unwrap()[LOCAL_KEY].clone()
+    }
+
+    /// `lpstat` with `key` still pending (paper out), calling `on_poll`
+    /// before it answers each not-completed query.
+    fn printer_out_of_paper(
+        key: &'static str,
+        on_poll: impl Fn() + Send + Sync + 'static,
+    ) -> WaitFn {
+        let on_poll = Arc::new(on_poll);
+        Arc::new(move |id, ctx| {
+            let on_poll = on_poll.clone();
+            let lpstat = move |args: &[&str]| {
+                assert_eq!(args[1], "not-completed", "it never completes");
+                on_poll();
+                ok(&format!("{key}  ben  1024  date\n"))
+            };
+            wait_cups_job_with(
+                id,
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+                ctx,
+                &lpstat,
+            )
+        })
+    }
+
+    /// J3: a stop during the CUPS wait (out of paper) used to be ignored for
+    /// up to 24 h; systemd then SIGKILLs the agent, leaving the queue file
+    /// as if `lp` had never run, and the next start printed the label again.
+    /// The wait ends at once now, and the record says CUPS has the job.
+    #[test]
+    fn a_stop_during_the_cups_wait_leaves_the_job_with_cups_on_record() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let events: Events = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let p = Pipeline {
+            lp: Arc::new(|_, _, _| Ok(Some("Zebra-42".into()))),
+            wait_cups: WaitCups::Sync,
+            // systemctl stop, while the printer is out of paper.
+            wait_cups_job: printer_out_of_paper("Zebra-42", move || {
+                s.store(true, Ordering::SeqCst)
+            }),
+            report_state: recording_state(&events),
+            stop,
+            ..test_pipeline()
+        };
+        let j = png_job("w-1");
+        let started = Instant::now();
+        assert_eq!(p.process(&j, &st).unwrap(), JobOutcome::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["state:printing", "state:delivered"]
+        );
+        assert!(!st.is_processed("w-1"));
+        let n = notes(&st, "w-1");
+        assert_eq!(n["cups_job_id"], "Zebra-42");
+        assert!(n["submitted_at"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("+00:00")));
+        assert_eq!(n["attempts"], 1);
+        // The payload is as it was: an older agent reads the record as ever.
+        let mut back = st.load_queued("w-1").unwrap().raw;
+        assert!(back.remove(LOCAL_KEY).is_some());
+        assert_eq!(back, j.to_dict());
+    }
+
+    /// J3: the next start never gives a job CUPS already has to `lp`. It
+    /// finishes it from what CUPS says now, and reports what the pipeline
+    /// would have.
+    #[test]
+    fn a_job_cups_already_has_is_finished_without_printing_it_again() {
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            WaitCups,
+            Result<CupsJobState, String>,
+        );
+        let cases: Vec<(Case, &str, Vec<&str>)> = vec![
+            (
+                (
+                    "printed",
+                    Some("Zebra-42"),
+                    WaitCups::Sync,
+                    Ok(CupsJobState::Printed),
+                ),
+                "printed",
+                vec!["printed:Zebra-42"],
+            ),
+            (
+                (
+                    "failed",
+                    Some("Zebra-42"),
+                    WaitCups::Async,
+                    Ok(CupsJobState::Failed),
+                ),
+                "error:cups_job_failed",
+                vec!["error:CUPS job Zebra-42 failed"],
+            ),
+            // Its history purged, or CUPS reset: delivered, never printed again.
+            (
+                (
+                    "forgotten",
+                    Some("Zebra-42"),
+                    WaitCups::Sync,
+                    Ok(CupsJobState::Forgotten),
+                ),
+                "delivered",
+                vec!["delivered:Zebra-42"],
+            ),
+            // Still printing: followed as right after lp (here the wait).
+            (
+                (
+                    "active",
+                    Some("Zebra-42"),
+                    WaitCups::Sync,
+                    Ok(CupsJobState::Active),
+                ),
+                "printed",
+                vec!["delivered:Zebra-42", "printed:Zebra-42"],
+            ),
+            // CUPS down: the same.
+            (
+                (
+                    "cups-down",
+                    Some("Zebra-42"),
+                    WaitCups::Sync,
+                    Err("lpstat: Scheduler is not running.".into()),
+                ),
+                "printed",
+                vec!["delivered:Zebra-42", "printed:Zebra-42"],
+            ),
+            // Not followed in CUPS, or no request id: delivered, CUPS unasked.
+            (
+                (
+                    "off",
+                    Some("Zebra-42"),
+                    WaitCups::Off,
+                    Err("not asked".into()),
+                ),
+                "delivered",
+                vec!["delivered:Zebra-42"],
+            ),
+            (
+                ("no-id", None, WaitCups::Sync, Err("not asked".into())),
+                "delivered",
+                vec!["delivered:"],
+            ),
+        ];
+        for ((id, cid, mode, answer), result, reports) in cases {
+            let td = tempfile::tempdir().unwrap();
+            let st = store(td.path());
+            let j = png_job(id);
+            st.write_queue(&j).unwrap();
+            let sub = Submission {
+                cups_job_id: cid.map(String::from),
+                submitted_at: "2026-10-08T12:00:00+00:00".into(),
+            };
+            st.write_local(
+                &j,
+                &LocalState {
+                    attempts: 1,
+                    submitted: Some(sub),
+                },
+            )
+            .unwrap();
+            let events: Events = Arc::default();
+            let ev = events.clone();
+            let asked = Arc::new(AtomicUsize::new(0));
+            let a = asked.clone();
+            let p = Pipeline {
+                lp: Arc::new(|_, _, _| panic!("must not print again")),
+                ack: Arc::new(|_| panic!("no second ack")),
+                wait_cups: mode,
+                wait_cups_job: Arc::new(|cid, _| {
+                    assert_eq!(cid, "Zebra-42");
+                    CupsOutcome::Printed
+                }),
+                cups_lookup: Arc::new(move |key| {
+                    assert_eq!(key, "Zebra-42");
+                    a.fetch_add(1, Ordering::SeqCst);
+                    answer.clone()
+                }),
+                report_state: Arc::new(move |_, state, detail| {
+                    ev.lock()
+                        .unwrap()
+                        .push(format!("{}:{}", state.as_str(), detail.unwrap_or("")));
+                    Ok(())
+                }),
+                ..test_pipeline()
+            };
+            assert_eq!(p.drain(&st), [(id.to_string(), result.to_string())], "{id}");
+            assert_eq!(*events.lock().unwrap(), reports, "{id}");
+            let looked_up = cid.is_some() && mode != WaitCups::Off;
+            assert_eq!(asked.load(Ordering::SeqCst), usize::from(looked_up), "{id}");
+            assert!(!st.has_queue_file(id), "{id}");
+            let failed = result.starts_with("error:");
+            assert_eq!(st.is_processed(id), !failed, "{id}");
+            assert_eq!(
+                st.failed_dir().join(format!("{id}.json")).is_file(),
+                failed,
+                "{id}"
+            );
+        }
+    }
+
+    /// J3: a stop before `lp` (here during the content fetch) sends nothing
+    /// to CUPS: the record stays as it was, and the next start prints the
+    /// job once. Once stopping, the drain takes no further job either.
+    #[test]
+    fn a_stop_before_lp_leaves_the_job_queued_and_it_prints_once() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        for id in ["s-1", "s-2"] {
+            st.write_queue(&job(
+                id,
+                "P",
+                "png_uri",
+                "https://example.test/l.png".into(),
+            ))
+            .unwrap();
+        }
+        let printed: Events = Arc::default();
+        let pipeline = |stop: Arc<AtomicBool>| {
+            let (pr, s) = (printed.clone(), stop.clone());
+            Pipeline {
+                fetch_url: Arc::new(move |_| {
+                    // systemctl stop, while the content downloads.
+                    s.store(true, Ordering::SeqCst);
+                    Ok(b"\x89PNG\r\n\x1a\nfake".to_vec())
+                }),
+                lp: Arc::new(move |_, path, _| {
+                    pr.lock()
+                        .unwrap()
+                        .push(path.file_stem().unwrap().to_string_lossy().into());
+                    Ok(None)
+                }),
+                stop,
+                ..test_pipeline()
+            }
+        };
+        let first = pipeline(Arc::default());
+        assert_eq!(
+            first.drain(&st),
+            [("s-1".to_string(), "interrupted".to_string())]
+        );
+        assert!(printed.lock().unwrap().is_empty());
+        assert_eq!(st.list_queued_ids(), ["s-1", "s-2"]);
+        // The attempt that returned is taken back; nothing went to CUPS.
+        assert_eq!(notes(&st, "s-1"), json!({"attempts": 0}));
+
+        // The next start: each prints once.
+        let next = Pipeline {
+            fetch_url: Arc::new(|_| Ok(b"\x89PNG\r\n\x1a\nfake".to_vec())),
+            ..pipeline(Arc::default())
+        };
+        let results = next.drain(&st);
+        assert!(results.iter().all(|(_, r)| r == "delivered"), "{results:?}");
+        assert_eq!(*printed.lock().unwrap(), ["s-1", "s-2"]);
+        assert!(st.list_queued_ids().is_empty());
+    }
+
+    /// J3: a CUPS wait ends promptly once the agent is stopping, however
+    /// long its poll interval (here 5 s).
+    #[test]
+    fn the_cups_wait_ends_promptly_when_stopping() {
+        let ctx = wait_ctx(None);
+        let stop = ctx.stop.clone();
+        let lpstat = move |_: &[&str]| {
+            stop.store(true, Ordering::SeqCst);
+            ok("Zebra-43 ben 1 date\n")
+        };
+        let started = Instant::now();
+        let outcome = wait_cups_job_with(
+            "Zebra-43",
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            &ctx,
+            &lpstat,
+        );
+        assert_eq!(outcome, CupsOutcome::Unknown);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A queue record for `id` as a run the agent died in leaves it after
+    /// `attempts` such runs.
+    fn died_in(st: &JobStore, id: &str, attempts: u32) -> PrintJob {
+        let j = png_job(id);
+        st.write_queue(&j).unwrap();
+        let local = LocalState {
+            attempts,
+            submitted: None,
+        };
+        st.write_local(&j, &local).unwrap();
+        j
+    }
+
+    /// J5: the attempt is on disk before the steps that can kill the agent
+    /// (conversion, lp), and taken back once a run returns: a job the agent
+    /// died in MAX_ATTEMPTS times is retired as crash_loop and reported
+    /// failed, instead of killing every start (RestartSec=5) again.
+    #[test]
+    fn a_job_that_keeps_killing_the_agent_is_retired() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        died_in(&st, "poison", 2);
+        let s = st.clone();
+        let p = Pipeline {
+            lp: Arc::new(move |_, _, _| {
+                assert_eq!(notes(&s, "poison")["attempts"], 3, "recorded before lp");
+                Err(JobError::new("printer offline", "lp_error"))
+            }),
+            ..test_pipeline()
+        };
+        assert_eq!(
+            p.drain(&st),
+            [("poison".to_string(), "error:lp_error".to_string())]
+        );
+        // It returned: two deaths on record, as before.
+        assert_eq!(notes(&st, "poison"), json!({"attempts": 2}));
+
+        // The third death (what one leaves on disk), and the next start.
+        died_in(&st, "poison", MAX_ATTEMPTS);
+        let events: Events = Arc::default();
+        let ev = events.clone();
+        let p = Pipeline {
+            lp: Arc::new(|_, _, _| panic!("must not run again")),
+            ack: Arc::new(|_| panic!("no ack either")),
+            report_state: Arc::new(move |_, state, detail| {
+                ev.lock()
+                    .unwrap()
+                    .push(format!("{}:{}", state.as_str(), detail.unwrap_or("")));
+                Ok(())
+            }),
+            ..test_pipeline()
+        };
+        assert_eq!(
+            p.drain(&st),
+            [("poison".to_string(), format!("error:{CRASH_LOOP}"))]
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["error:printing this job ended the agent 3 times (out of memory?) — not tried again"]
+        );
+        assert!(st.failed_dir().join("poison.json").is_file());
+        assert!(!st.has_pending_work());
+        assert!(!st.is_processed("poison"));
+        assert!(JobError::new("x", CRASH_LOOP).is_permanent());
+
+        // One death short of the limit, the job still runs, and prints.
+        let st = store(&td.path().join("other"));
+        died_in(&st, "survivor", MAX_ATTEMPTS - 1);
+        assert_eq!(
+            test_pipeline().drain(&st),
+            [("survivor".to_string(), "delivered".to_string())]
+        );
+        assert!(st.is_processed("survivor"));
+    }
+
+    /// J5: a run that returns, failed or not, does not count: a job that
+    /// fails again and again (printer offline) is never taken for one that
+    /// kills the agent.
+    #[test]
+    fn retried_failures_never_count_as_crashes() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        st.write_queue(&png_job("offline")).unwrap();
+        let offline = Pipeline {
+            lp: Arc::new(|_, _, _| Err(JobError::new("printer offline", "lp_error"))),
+            ..test_pipeline()
+        };
+        let panicking = Pipeline {
+            lp: Arc::new(|_, _, _| panic!("failed to spawn thread")),
+            ..test_pipeline()
+        };
+        for p in [&offline, &panicking, &offline, &offline, &panicking] {
+            let results = p.drain(&st);
+            assert_eq!(results.len(), 1);
+            assert_ne!(results[0].1, format!("error:{CRASH_LOOP}"));
+            assert_eq!(notes(&st, "offline"), json!({"attempts": 0}));
+        }
+        assert_eq!(
+            test_pipeline().drain(&st),
+            [("offline".to_string(), "delivered".to_string())]
+        );
+    }
+
+    /// A cloud payload never brings notes of its own: they would make the
+    /// agent skip the job (CUPS has it) or retire it unprinted.
+    #[test]
+    fn a_payload_cannot_bring_notes_of_its_own() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let payload = json!({"id": "n-1", "cups_name": "P", "content_type": "png_base64",
+            "content": PNG_1X1_B64, LOCAL_KEY: {"attempts": 9,
+            "cups_job_id": "P-1", "submitted_at": "2026-10-08T12:00:00+00:00"}});
+        let j = PrintJob::from_dict(payload.as_object().unwrap()).unwrap();
+        let printed = Arc::new(AtomicUsize::new(0));
+        let pr = printed.clone();
+        let p = Pipeline {
+            lp: Arc::new(move |_, _, _| {
+                pr.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }),
+            ..test_pipeline()
+        };
+        assert_eq!(p.process(&j, &st).unwrap(), JobOutcome::Delivered);
+        assert_eq!(printed.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn png_to_zebra_queue_converts_to_zpl() {
         let td = tempfile::tempdir().unwrap();
@@ -3708,6 +4512,14 @@ Zebra-48                ben            1024   Wed 08 Oct 2026 01:03:00 AM CDT
 
     type LpstatCalls = Arc<Mutex<Vec<String>>>;
 
+    /// A wait context that is never stopped.
+    fn wait_ctx(tick: Option<TickFn>) -> WaitCtx {
+        WaitCtx {
+            tick,
+            stop: Arc::default(),
+        }
+    }
+
     fn ok(stdout: &str) -> io::Result<CmdOutput> {
         Ok(CmdOutput {
             success: true,
@@ -3738,7 +4550,7 @@ Zebra-48                ben            1024   Wed 08 Oct 2026 01:03:00 AM CDT
             "Zebra_1-42 (1 file(s))",
             Duration::from_secs(60),
             Duration::from_millis(10),
-            None,
+            &wait_ctx(None),
             &lpstat,
         );
         assert_eq!(outcome, CupsOutcome::Unknown);
@@ -3764,7 +4576,7 @@ Zebra-48                ben            1024   Wed 08 Oct 2026 01:03:00 AM CDT
             "Zebra-43",
             Duration::from_secs(60),
             Duration::from_millis(10),
-            None,
+            &wait_ctx(None),
             &lpstat,
         );
         assert_eq!(outcome, CupsOutcome::Printed);
@@ -3804,7 +4616,7 @@ Zebra-48                ben            1024   Wed 08 Oct 2026 01:03:00 AM CDT
             "Zebra-43",
             Duration::from_secs(60),
             Duration::from_millis(10),
-            Some(&tick),
+            &wait_ctx(Some(tick)),
             &lpstat,
         );
         assert_eq!(outcome, CupsOutcome::Printed);
@@ -3832,7 +4644,7 @@ Zebra-48                ben            1024   Wed 08 Oct 2026 01:03:00 AM CDT
             "Zebra-43",
             Duration::from_secs(60),
             Duration::from_millis(10),
-            Some(&tick),
+            &wait_ctx(Some(tick)),
             &lpstat,
         );
         assert_eq!(outcome, CupsOutcome::Printed);
