@@ -110,13 +110,27 @@ pub struct CmdOutput {
 /// `thread::spawn` panics on failure, which could happen after `lp` has
 /// already queued the label. Running out of tasks now fails the child spawn
 /// with an ordinary error.
+///
+/// The child starts with no signal blocked (see [`unblocked_signals`]).
 pub fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> std::io::Result<CmdOutput> {
-    let mut child = Command::new(cmd)
+    run_with_timeout_env(cmd, args, &[], timeout)
+}
+
+/// [`run_with_timeout`] with `env` added to the child's environment.
+pub fn run_with_timeout_env(
+    cmd: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> std::io::Result<CmdOutput> {
+    let mut command = Command::new(cmd);
+    command
         .args(args)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = unblocked_signals(&mut command).spawn()?;
     let result = collect_output(&mut child, Instant::now() + timeout);
     if !matches!(result, Ok(Some(_))) {
         let _ = child.kill();
@@ -125,6 +139,33 @@ pub fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> std::io:
     result?.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{cmd} timed out"))
     })
+}
+
+/// Have `cmd`'s child start with no signal blocked.
+///
+/// The agent blocks SIGINT and SIGTERM in all its threads (only its signal
+/// thread takes them; see [`crate::agent::stop_on_signals`]), and std passes
+/// the spawning thread's mask on to the child. Left so, `lp` or `lpstat`
+/// would ignore the SIGTERM that systemd sends the whole unit on stop.
+pub fn unblocked_signals(cmd: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    let mut empty = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: sigemptyset initializes the set.
+    let empty = unsafe {
+        libc::sigemptyset(empty.as_mut_ptr());
+        empty.assume_init()
+    };
+    // SAFETY: the hook runs in the child between fork and exec, where only
+    // async-signal-safe calls are allowed: pthread_sigmask is one, and an
+    // OS error code is built without allocating.
+    unsafe {
+        cmd.pre_exec(move || {
+            match libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) {
+                0 => Ok(()),
+                rc => Err(std::io::Error::from_raw_os_error(rc)),
+            }
+        })
+    }
 }
 
 /// One child pipe being read without blocking; `file` is `None` after EOF.
@@ -832,9 +873,10 @@ pub type FetchFn = Arc<dyn Fn(&str) -> Result<Vec<u8>, BoxError> + Send + Sync>;
 /// - The environment's `http_proxy` / `no_proxy` apply, as with urllib.
 /// - Redirects are followed and a non-2xx status is a failure (`HTTPError`).
 ///
-/// There is no overall deadline on top: ureq starts a DNS thread per request
-/// when one is set, and the per-phase budgets already cap a probe at a few
-/// times `timeout`, which a byte-at-a-time server cannot stretch.
+/// There is no overall deadline on top: the per-phase budgets already cap a
+/// probe at a few times `timeout`, which a byte-at-a-time server cannot
+/// stretch. Names are looked up on the calling thread (see [`net`]), so a
+/// probe starts no thread.
 fn http_fetch_head(url: &str, timeout: Duration) -> Result<Vec<u8>, BoxError> {
     let agent = net::agent(url, net::Timeouts::lan(timeout), net::Redirects::Follow);
     let mut resp = agent.get(url).header("Accept", "text/html, */*").call()?;
@@ -2149,6 +2191,45 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// The `SigBlk` mask in a /proc status file.
+    fn sig_blk(status: &str) -> u64 {
+        let line = status.lines().find(|l| l.starts_with("SigBlk:")).unwrap();
+        u64::from_str_radix(line["SigBlk:".len()..].trim(), 16).unwrap()
+    }
+
+    /// The agent blocks SIGINT and SIGTERM in every thread, and std passes
+    /// the spawning thread's mask on to a child. The tools run here (lp,
+    /// lpstat) must still start with nothing blocked, so that the SIGTERM
+    /// systemd sends the whole unit on stop ends them.
+    #[test]
+    fn run_with_timeout_children_start_with_no_signal_blocked() {
+        let stop_bits = (1u64 << (libc::SIGINT - 1)) | (1 << (libc::SIGTERM - 1));
+        // On a thread of its own: the blocked signals stay with it.
+        let (own, child) = thread::spawn(|| {
+            let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            // SAFETY: the set is initialized before it is changed or used.
+            let rc = unsafe {
+                libc::sigemptyset(set.as_mut_ptr());
+                libc::sigaddset(set.as_mut_ptr(), libc::SIGINT);
+                libc::sigaddset(set.as_mut_ptr(), libc::SIGTERM);
+                libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut())
+            };
+            assert_eq!(rc, 0);
+            let own = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            let child =
+                run_with_timeout("cat", &["/proc/self/status"], Duration::from_secs(10)).unwrap();
+            (own, child.stdout)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            sig_blk(&own) & stop_bits,
+            stop_bits,
+            "the caller blocks them"
+        );
+        assert_eq!(sig_blk(&child), 0, "the child started with signals blocked");
     }
 
     #[test]

@@ -1,6 +1,12 @@
 //! Cloud agent: whoami + heartbeat + job pull + ActionCable push.
 
 use std::collections::VecDeque;
+use std::ffi::CStr;
+use std::fs;
+use std::io;
+use std::mem::MaybeUninit;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
@@ -381,6 +387,9 @@ impl Agent {
     /// (or sooner, when [`InventoryCache::request_refresh`] asks) until
     /// `stop`. Returns its generation (to end it). If the thread cannot
     /// start, heartbeats fall back to querying inline.
+    ///
+    /// It runs paired or not: the LCD's printer rows and test-print overlay
+    /// (open while unpaired too) read the printers.json it writes.
     fn start_inventory_refresher(&self, stop: &Arc<AtomicBool>) -> u64 {
         let generation = self.shared.inventory.begin();
         let (shared, source, stop) = (self.shared.clone(), self.inventory.clone(), stop.clone());
@@ -576,6 +585,14 @@ impl Agent {
     /// `jobs_busy`: when true, OTA download/install is deferred (job work in
     /// flight, e.g. buffered ActionCable jobs) so we never flip slots mid-print.
     pub fn run_once(&self, jobs_busy: bool) -> AgentStatus {
+        self.run_once_with_stop(jobs_busy, &AtomicBool::new(false))
+    }
+
+    /// [`Agent::run_once`] for [`Agent::run`], which passes its `stop`: once
+    /// that is set, the heartbeat's reply starts no update. An update runs
+    /// on to its restart, and that restart replaces a `systemctl stop`
+    /// still in progress: the agent would come back, on the new slot.
+    fn run_once_with_stop(&self, jobs_busy: bool, stop: &AtomicBool) -> AgentStatus {
         let creds = auth::load_credentials(&self.cfg.credentials_path());
 
         // Promote sticky false "failed" (self-restart SIGTERM) to pending_health
@@ -680,6 +697,12 @@ impl Agent {
                 self.write_status(&mut st);
 
                 // OTA: desired version + optional update_url on heartbeat response.
+                // None once the agent is stopping: checked now that the reply
+                // is in, as a stop lets the request in flight finish.
+                if stop.load(Ordering::SeqCst) {
+                    log::info!(target: LOG, "stopping — any update waits for the next start");
+                    return st;
+                }
                 let ust = update::maybe_update_from_heartbeat(
                     &hb,
                     &self.cfg,
@@ -884,6 +907,9 @@ impl Agent {
         // --- ActionCable session (push) ------------------------------------
         let push_jobs: Arc<Mutex<VecDeque<JsonObject>>> = Arc::default();
         let revoke_flag = Arc::new(AtomicBool::new(false));
+        // Set by the session after each pushed job or revoke: ends the
+        // loop's sleep, so they are handled now rather than next cycle.
+        let wake = Arc::new(AtomicBool::new(false));
         // Set by on_subscribed; resets the cable retry pacing.
         let cable_subscribed = Arc::new(AtomicBool::new(false));
         let holder: Arc<Mutex<Option<Arc<PrintCableSession>>>> = Arc::default();
@@ -914,6 +940,7 @@ impl Agent {
             let handlers = agent.session_handlers(
                 push_jobs.clone(),
                 revoke_flag.clone(),
+                wake.clone(),
                 holder.clone(),
                 cable_subscribed.clone(),
             );
@@ -964,6 +991,10 @@ impl Agent {
 
         while !stop.load(Ordering::SeqCst) {
             let cycle_start = Instant::now();
+            // Cleared before the revoke flag and the pushed jobs are read
+            // below: one that arrives after this is either handled in this
+            // cycle or cuts its sleep short.
+            wake.store(false, Ordering::SeqCst);
             let mut creds = auth::load_credentials(&cfg.credentials_path());
             let mut sess = lock(&holder).clone();
 
@@ -1002,7 +1033,7 @@ impl Agent {
             // files (retryable failures) must not hold off every OTA.
             let jobs_busy = !lock(&push_jobs).is_empty();
             let st = if elapsed_since(last_hb, hb_interval) {
-                let st = self.heartbeat_step(|| self.run_once(jobs_busy));
+                let st = self.heartbeat_step(|| self.run_once_with_stop(jobs_busy, &stop));
                 last_hb = Some(Instant::now());
                 // Re-read: an OTA may have activated (pending_health) or failed.
                 ota_pause = update::should_pause_jobs_from_path(&cfg.update_status_path());
@@ -1107,7 +1138,7 @@ impl Agent {
                 last_prune = Instant::now();
             }
 
-            // Sleep
+            // Sleep (a pushed job or a revoke ends it early: see `wake`)
             let mut sleep_for = if !lock(&push_jobs).is_empty() {
                 secs(0.05)
             } else {
@@ -1118,20 +1149,21 @@ impl Agent {
                     Some(s) if s.cloud == CloudState::Offline => {
                         secs(backoff.max(5.0).min(max_backoff))
                     }
-                    _ if cfg.pull_jobs_enabled && creds.is_some() => {
-                        if subscribed {
-                            pull_interval.min(secs(1.0))
-                        } else {
-                            pull_interval
-                        }
-                    }
+                    _ if cfg.pull_jobs_enabled && creds.is_some() => pull_interval,
                     _ => hb_interval,
                 }
             };
+            // While a session is subscribed, come round every second whatever
+            // the pull or offline pacing says: its heartbeat is due every
+            // 10-15 s, and a dropped session or a local change (credentials,
+            // update status) is seen within a second.
+            if subscribed {
+                sleep_for = sleep_for.min(secs(1.0));
+            }
             if let Some(t) = last_hb {
                 sleep_for = sleep_for.min(hb_interval.saturating_sub(t.elapsed()));
             }
-            sleep_until(cycle_start + sleep_for, &stop);
+            sleep_until_any(cycle_start + sleep_for, &[&stop, &wake]);
         }
 
         stop_cable();
@@ -1143,15 +1175,25 @@ impl Agent {
         &self,
         push_jobs: Arc<Mutex<VecDeque<JsonObject>>>,
         revoke_flag: Arc<AtomicBool>,
+        wake: Arc<AtomicBool>,
         holder: Arc<Mutex<Option<Arc<PrintCableSession>>>>,
         subscribed_flag: Arc<AtomicBool>,
     ) -> SessionHandlers {
         let store = self.store.clone();
         let cfg = self.cfg.clone();
         let (shared, inventory) = (self.shared.clone(), self.inventory.clone());
+        let revoke_wake = wake.clone();
         SessionHandlers {
-            on_print_job: Some(Arc::new(move |job| lock(&push_jobs).push_back(job))),
-            on_revoke: Some(Arc::new(move || revoke_flag.store(true, Ordering::SeqCst))),
+            // The job (or revoke) first, then the wake-up: the loop clears
+            // `wake` before it looks, so it never misses one.
+            on_print_job: Some(Arc::new(move |job| {
+                lock(&push_jobs).push_back(job);
+                wake.store(true, Ordering::SeqCst);
+            })),
+            on_revoke: Some(Arc::new(move || {
+                revoke_flag.store(true, Ordering::SeqCst);
+                revoke_wake.store(true, Ordering::SeqCst);
+            })),
             on_job_canceled: Some(Arc::new(move |job_id| {
                 if let Err(e) = handle_job_canceled(&job_id, &store) {
                     log::error!(target: LOG, "job_canceled handler failed: {e}");
@@ -1249,11 +1291,6 @@ fn printer_setup_summary(names: &[String]) -> String {
     }
 }
 
-/// Sleep until `deadline`, waking early if `stop` is set.
-fn sleep_until(deadline: Instant, stop: &AtomicBool) {
-    sleep_until_any(deadline, &[stop]);
-}
-
 /// Sleep until `deadline`, waking early once any of `flags` is set.
 fn sleep_until_any(deadline: Instant, flags: &[&AtomicBool]) {
     while !flags.iter().any(|f| f.load(Ordering::SeqCst)) {
@@ -1263,6 +1300,160 @@ fn sleep_until_any(deadline: Instant, flags: &[&AtomicBool]) {
         }
         thread::sleep((deadline - now).min(Duration::from_millis(100)));
     }
+}
+
+// --- the agent process (`vesyl-print agent`) --------------------------------
+
+/// What stops the agent: SIGTERM (`systemctl stop`) and SIGINT (Ctrl-C).
+const STOP_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
+
+/// Stop the agent on SIGINT / SIGTERM without interrupting what it is doing.
+///
+/// A signal handler runs on whichever thread the kernel picks, often the
+/// main one, and Linux never restarts a recv() it interrupts on a socket
+/// with a receive timeout, which every ureq request has (signal(7)): the
+/// heartbeat, ack or download in flight failed with EINTR. So both signals
+/// are blocked instead, here on the calling thread before it starts any
+/// other (threads inherit the mask), and one thread takes them with
+/// sigwait(). The first sets `stop`: the agent finishes its current step,
+/// a request in flight included (though a heartbeat then starts no
+/// update), and [`Agent::run`] returns. A second one ends the process at
+/// once. Child processes (lp, lpstat) still start with nothing blocked: std
+/// would pass the mask on, so [`printers::run_with_timeout`] empties it
+/// before exec.
+pub fn stop_on_signals(stop: Arc<AtomicBool>) -> io::Result<()> {
+    let set = signal_set(&STOP_SIGNALS);
+    let mut old = signal_set(&[]);
+    // SAFETY: both are initialized signal sets.
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    let taker = thread::Builder::new()
+        .name("vesyl-print-signals".into())
+        .spawn(move || take_stop_signals(&set, &stop));
+    if let Err(e) = taker {
+        // Nothing would ever take them: unblock them again.
+        // SAFETY: as above.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The signal thread: the first stop signal sets `stop`, a second one ends
+/// the process.
+fn take_stop_signals(set: &libc::sigset_t, stop: &AtomicBool) {
+    let mut stopping = false;
+    loop {
+        let mut sig: libc::c_int = 0;
+        // SAFETY: `set` is an initialized signal set and `sig` is writable.
+        if unsafe { libc::sigwait(set, &mut sig) } != 0 {
+            continue;
+        }
+        let name = signal_name(sig);
+        if stopping {
+            log::warn!(target: LOG, "second stop signal ({name}) — quitting at once");
+            die_by(sig);
+        }
+        stopping = true;
+        log::info!(target: LOG, "{name} received — stopping once the current step is done (a second signal quits at once)");
+        stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// End the process by `sig`'s default action, as if it had never been
+/// blocked.
+fn die_by(sig: libc::c_int) -> ! {
+    let set = signal_set(&[sig]);
+    // SAFETY: plain libc calls on an initialized set. Unblocked, with its
+    // default action, the raised signal ends the process.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(sig);
+    }
+    // Not reached for a stop signal.
+    std::process::exit(128 + sig)
+}
+
+fn signal_set(signals: &[libc::c_int]) -> libc::sigset_t {
+    let mut set = MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: sigemptyset initializes the set before sigaddset changes it.
+    unsafe {
+        libc::sigemptyset(set.as_mut_ptr());
+        for &sig in signals {
+            libc::sigaddset(set.as_mut_ptr(), sig);
+        }
+        set.assume_init()
+    }
+}
+
+fn signal_name(sig: libc::c_int) -> String {
+    match sig {
+        libc::SIGINT => "SIGINT".into(),
+        libc::SIGTERM => "SIGTERM".into(),
+        other => format!("signal {other}"),
+    }
+}
+
+/// `Err` (what to do instead) when this process runs as root; see
+/// [`root_refusal`].
+pub fn refuse_root(cfg: &Config) -> Result<(), String> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    match root_refusal(unsafe { libc::geteuid() }, &cfg.state_dir) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
+}
+
+/// Why the agent must not run with effective uid `euid`, if it must not.
+///
+/// The service user owns the state and config directories: setup.sh makes
+/// them so (and refuses root as the service user), and the unit runs the
+/// agent as that user. A root agent leaves root-owned files there, and it
+/// follows symlinks that user can plant: with queue/ a link, a root drain
+/// moved config.json into the link target's failed/, where pruning would
+/// delete it.
+fn root_refusal(euid: u32, state_dir: &Path) -> Option<String> {
+    if euid != 0 {
+        return None;
+    }
+    let user = match fs::metadata(state_dir).map(|m| m.uid()) {
+        Ok(uid) if uid != 0 => user_name(uid).unwrap_or_else(|| format!("'#{uid}'")),
+        _ => "<service user>".into(),
+    };
+    Some(format!(
+        "vesyl-print agent must not run as root: it would leave root-owned files in {} \
+         and follow links the service user can plant there.\n\
+         Run it as the service account: `sudo systemctl start vesyl-print-agent`, \
+         or in the foreground `sudo -u {user} vesyl-print agent`.",
+        state_dir.display()
+    ))
+}
+
+/// The login name of `uid`.
+fn user_name(uid: u32) -> Option<String> {
+    let mut pwd = MaybeUninit::<libc::passwd>::uninit();
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call and `buf` is as long as stated.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            pwd.as_mut_ptr(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() {
+        return None;
+    }
+    // SAFETY: on success `found` is `pwd`, whose name is a NUL-terminated
+    // string in `buf`.
+    let name = unsafe { CStr::from_ptr((*found).pw_name) };
+    Some(name.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -1275,8 +1466,9 @@ mod tests {
     use std::net::TcpListener;
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::OnceLock;
+    use std::sync::{mpsc, OnceLock};
     use std::time::SystemTime;
+    use tungstenite::Message;
 
     const CLAIM: &str = r#"{
         "node_id": "node-uuid-1",
@@ -1955,6 +2147,44 @@ mod tests {
         assert_eq!(ust.target_version.as_deref(), Some("9.9.9"));
     }
 
+    /// A stop that lands while the heartbeat is in flight (the request now
+    /// finishes) starts no update its reply announces: the update would run
+    /// on to its restart, and that restart replaces the stop.
+    #[test]
+    fn a_stop_during_the_heartbeat_starts_no_update() {
+        let td = tempfile::tempdir().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let base: Arc<OnceLock<String>> = Arc::default();
+        let (b, s) = (base.clone(), stop.clone());
+        let srv = stub(move |_, path| match path {
+            "/print/v1/whoami" => (200, WHOAMI.into()),
+            "/print/v1/heartbeat" => {
+                // systemctl stop, while the request is in flight.
+                s.store(true, Ordering::SeqCst);
+                (
+                    200,
+                    json!({"desired_agent_version": "9.9.9",
+                           "update_url": format!("{}/manifest.json", b.get().unwrap())})
+                    .to_string(),
+                )
+            }
+            _ => (404, r#"{"error":"not found"}"#.into()),
+        });
+        base.set(srv.base_url.clone()).unwrap();
+        let mut agent = test_agent(td.path(), &srv.base_url);
+        agent.cfg.cable_enabled = false;
+        pair(&agent);
+
+        agent.run(stop);
+
+        assert_eq!(srv.count("/print/v1/heartbeat"), 1);
+        assert_eq!(srv.count("/manifest.json"), 0, "an update started");
+        let st = statusio::read_status(&agent.cfg.status_path()).unwrap();
+        assert_eq!(st.cloud, CloudState::Online);
+        // Nothing recorded about it either: the next start decides afresh.
+        assert!(update::read_update_status(&agent.cfg.update_status_path()).is_none());
+    }
+
     /// A fresh process cannot be mid-download: a status left at downloading
     /// / installing becomes failed at start, so it neither pauses jobs nor
     /// keeps held push jobs and the deferred update waiting on each other.
@@ -2536,6 +2766,220 @@ mod tests {
         assert!(!agent.start_printer_setup());
         assert!(!agent.shared.printer_setup.load(Ordering::SeqCst));
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    // --- cable pushes wake the loop -----------------------------------------
+
+    /// A loopback ActionCable endpoint for one agent session: it welcomes
+    /// the client, confirms the subscription `confirm_after` the subscribe
+    /// arrives, sends `message` on the channel 300 ms later, then reads the
+    /// client's frames until it hangs up.
+    struct CableEndpoint {
+        url: String,
+        /// When `message` was sent.
+        pushed: mpsc::Receiver<Instant>,
+        /// When the client hung up.
+        closed: mpsc::Receiver<Instant>,
+        server: thread::JoinHandle<()>,
+    }
+
+    fn cable_endpoint(message: Value, confirm_after: Duration) -> CableEndpoint {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/print/cable", listener.local_addr().unwrap());
+        let (pushed_tx, pushed) = mpsc::channel();
+        let (closed_tx, closed) = mpsc::channel();
+        let server = thread::spawn(move || {
+            // Never wait forever: a test that failed early stops the agent.
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                    Err(_) => return,
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let identifier = json!({ "channel": "PrintNodeChannel" }).to_string();
+            ws.send(Message::text(r#"{"type":"welcome"}"#)).unwrap();
+            let subscribe: Value =
+                serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(subscribe["command"], "subscribe");
+            thread::sleep(confirm_after);
+            let confirm = json!({"identifier": identifier, "type": "confirm_subscription"});
+            ws.send(Message::text(confirm.to_string())).unwrap();
+            thread::sleep(Duration::from_millis(300));
+            let push = json!({"identifier": identifier, "message": message});
+            ws.send(Message::text(push.to_string())).unwrap();
+            let _ = pushed_tx.send(Instant::now());
+            // Acks, job statuses and heartbeats, until the agent hangs up.
+            while ws.read().is_ok() {}
+            let _ = closed_tx.send(Instant::now());
+        });
+        CableEndpoint {
+            url,
+            pushed,
+            closed,
+            server,
+        }
+    }
+
+    fn pushed_job(id: &str) -> Value {
+        json!({"type": "print_job", "job": {
+            "id": id, "cups_name": "P", "content_type": "png_base64", "content": PNG_1X1_B64,
+        }})
+    }
+
+    /// A paired agent taking cable pushes: REST answers whoami and the ws
+    /// ticket, the job pull is off (heartbeat every 30 s), and its `lp`
+    /// reports when it prints.
+    fn push_agent(td: &Path, cable_url: &str) -> (Agent, Stub, mpsc::Receiver<Instant>) {
+        let srv = stub(|_, path| match path {
+            "/print/v1/whoami" => (200, WHOAMI.into()),
+            "/print/v1/ws_ticket" => (200, r#"{"ticket":"t"}"#.into()),
+            _ => (200, "{}".into()),
+        });
+        let mut agent = test_agent(td, &srv.base_url);
+        agent.cfg.pull_jobs_enabled = false;
+        agent.cfg.cable_url = cable_url.into();
+        let (printed_tx, printed) = mpsc::channel();
+        agent.pipeline.lp = Arc::new(move |_, _, _| {
+            let _ = printed_tx.send(Instant::now());
+            Ok(None)
+        });
+        pair(&agent);
+        (agent, srv, printed)
+    }
+
+    /// N13: a job pushed over the cable while the loop sleeps (job pull
+    /// off, 30 s heartbeat) is taken at once, not at the next cycle.
+    #[test]
+    fn a_pushed_job_wakes_the_loop() {
+        let td = tempfile::tempdir().unwrap();
+        // Confirmed well after the first cycle went to sleep, so only a
+        // wake-up can cut that sleep short.
+        let cable = cable_endpoint(pushed_job("push-1"), Duration::from_millis(500));
+        let (agent, _srv, printed) = push_agent(td.path(), &cable.url);
+
+        let (stop, handle) = start_run(&agent);
+        let pushed = cable.pushed.recv_timeout(Duration::from_secs(10));
+        let taken = pushed
+            .is_ok()
+            .then(|| printed.recv_timeout(Duration::from_secs(5)));
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        cable.server.join().unwrap();
+
+        let pushed = pushed.expect("no job was pushed");
+        let taken = taken
+            .unwrap()
+            .expect("the pushed job waited for the next cycle");
+        let waited = taken.saturating_duration_since(pushed);
+        assert!(waited < Duration::from_secs(2), "taken after {waited:?}");
+        assert!(agent.store.is_processed("push-1"));
+    }
+
+    /// A revoke pushed over the cable is acted on at once too.
+    #[test]
+    fn a_pushed_revoke_wakes_the_loop() {
+        let td = tempfile::tempdir().unwrap();
+        let cable = cable_endpoint(json!({"type": "revoke"}), Duration::from_millis(500));
+        let (agent, _srv, _) = push_agent(td.path(), &cable.url);
+        let creds = agent.cfg.credentials_path();
+
+        let (stop, handle) = start_run(&agent);
+        let pushed = cable.pushed.recv_timeout(Duration::from_secs(10));
+        let revoked = pushed.is_ok() && eventually(Duration::from_secs(2), || !creds.exists());
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        cable.server.join().unwrap();
+
+        pushed.expect("no revoke was pushed");
+        assert!(revoked, "the revoke waited for the next cycle");
+        let st = statusio::read_status(&agent.cfg.status_path()).unwrap();
+        assert_eq!(st.pairing, PairingState::Revoked);
+    }
+
+    /// While a session is subscribed the loop comes round every second,
+    /// whatever its pacing says (here: no pull, 30 s heartbeat). So it sees
+    /// local changes within a second, like credentials removed by `unpair`,
+    /// on which it closes the session.
+    #[test]
+    fn a_subscribed_loop_comes_round_every_second() {
+        let td = tempfile::tempdir().unwrap();
+        let cable = cable_endpoint(pushed_job("push-2"), Duration::ZERO);
+        let (agent, _srv, printed) = push_agent(td.path(), &cable.url);
+
+        let (stop, handle) = start_run(&agent);
+        // The job is taken in a cycle that ran with the session subscribed;
+        // the sleep after it is the one under test.
+        let taken = cable
+            .pushed
+            .recv_timeout(Duration::from_secs(10))
+            .is_ok_and(|_| printed.recv_timeout(Duration::from_secs(5)).is_ok());
+        auth::clear_credentials(&agent.cfg.credentials_path()).unwrap();
+        let closed = taken && cable.closed.recv_timeout(Duration::from_secs(4)).is_ok();
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        cable.server.join().unwrap();
+
+        assert!(taken, "the pushed job was not taken");
+        assert!(closed, "the session stayed open after the credentials went");
+    }
+
+    /// A3: as root the agent would leave root-owned files in the service
+    /// user's state and follow links that user can plant there. It refuses,
+    /// and says how to run it instead.
+    #[test]
+    fn agent_refuses_to_run_as_root() {
+        let td = tempfile::tempdir().unwrap();
+        let state = td.path();
+        assert_eq!(root_refusal(1000, state), None);
+        let why = root_refusal(0, state).unwrap();
+        assert!(why.contains("must not run as root"), "{why}");
+        assert!(why.contains(&state.display().to_string()), "{why}");
+        assert!(
+            why.contains("`sudo systemctl start vesyl-print-agent`"),
+            "{why}"
+        );
+        // The foreground hint names the state directory's owner (setup.sh
+        // makes it the service user); when root owns it, or it is missing,
+        // it can only ask for the service user.
+        let owner = fs::metadata(state).unwrap().uid();
+        let name = if owner == 0 {
+            "<service user>".to_string()
+        } else {
+            let id = std::process::Command::new("id")
+                .args(["-nu", &owner.to_string()])
+                .output()
+                .unwrap();
+            if id.status.success() {
+                String::from_utf8(id.stdout).unwrap().trim().to_string()
+            } else {
+                format!("'#{owner}'")
+            }
+        };
+        assert!(
+            why.contains(&format!("`sudo -u {name} vesyl-print agent`")),
+            "{why}"
+        );
+        let why = root_refusal(0, &state.join("missing")).unwrap();
+        assert!(
+            why.contains("`sudo -u <service user> vesyl-print agent`"),
+            "{why}"
+        );
+        // This process: refused exactly when it is root.
+        let cfg = Config {
+            state_dir: state.to_path_buf(),
+            ..Config::default()
+        };
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        assert_eq!(refuse_root(&cfg).is_err(), root);
     }
 
     #[test]
