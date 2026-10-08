@@ -478,8 +478,14 @@ const MAX_WATCHED_JOBS: usize = 1000;
 /// Runs `lpstat` with the given arguments.
 type Lpstat = dyn Fn(&[&str]) -> io::Result<CmdOutput>;
 
+/// `lpstat`'s environment: CUPS translates the labels of its output into
+/// the locale's language ("Alerts:" is "Alarme:" in German), and
+/// [`completed_outcome`] reads the untranslated ones. CUPS takes the
+/// language from LC_MESSAGES before LC_ALL when the locale is missing.
+const LPSTAT_ENV: &[(&str, &str)] = &[("LC_ALL", "C.UTF-8"), ("LC_MESSAGES", "C.UTF-8")];
+
 fn run_lpstat(args: &[&str]) -> io::Result<CmdOutput> {
-    run_with_timeout("lpstat", args, Duration::from_secs(15))
+    crate::printers::run_with_timeout_env("lpstat", args, LPSTAT_ENV, Duration::from_secs(15))
 }
 
 /// stdout of a successful `lpstat` run. A run that fails to start, times out
@@ -515,34 +521,34 @@ fn listed_job_ids(listing: &str) -> HashSet<&str> {
 }
 
 /// Outcome of `job_key` from `lpstat -W completed -l`. Only that job's own
-/// block is read: its header line (first token exactly `job_key`) and the
-/// indented lines under it. A canceled or aborted neighbour can therefore
-/// never mark a printed job failed. No block for the job → `Printed`.
+/// block is read (its header line, first token exactly `job_key`, and the
+/// indented lines under it), so a canceled or aborted neighbour can never
+/// mark a printed job failed. And in that block only the `Alerts:` line,
+/// the job's state reasons (`job-canceled-by-user`, `aborted-by-system`, …):
+/// the header's user name and the `Status:` line (a free-text printer
+/// message) may say "canceled" about anything. No failure reason, or no
+/// block for the job → `Printed`.
 fn completed_outcome(done_out: &str, job_key: &str) -> CupsOutcome {
-    // The queue name ("queued for <dest>") must not count as a marker.
-    let dest = job_key.rsplit_once('-').map_or(job_key, |(d, _)| d);
     let mut in_block = false;
     for line in done_out.lines() {
-        let mut tokens = line.split_whitespace();
         if !line.starts_with(char::is_whitespace) {
             if in_block {
                 break; // next job's block
             }
-            in_block = tokens.next() == Some(job_key);
-            if !in_block {
-                continue;
-            }
-        } else if !in_block {
+            in_block = line.split_whitespace().next() == Some(job_key);
             continue;
         }
-        let failed = tokens
-            .filter(|t| *t != dest && *t != job_key)
-            .map(str::to_lowercase)
-            .any(|t| {
-                ["canceled", "cancelled", "aborted"]
-                    .iter()
-                    .any(|k| t.contains(k))
-            });
+        if !in_block {
+            continue;
+        }
+        let Some(reasons) = line.trim_start().strip_prefix("Alerts:") else {
+            continue;
+        };
+        let failed = reasons.split_whitespace().map(str::to_lowercase).any(|r| {
+            ["canceled", "cancelled", "aborted"]
+                .iter()
+                .any(|k| r.contains(k))
+        });
         if failed {
             return CupsOutcome::Error;
         }
@@ -3517,15 +3523,48 @@ mod tests {
 
     #[test]
     fn completed_outcome_markers() {
+        let block = |alerts: &str| {
+            format!("Q-1  ben  1024  date\n\tStatus: \n\tAlerts: {alerts}\n\tqueued for Q\n")
+        };
+        for failed in [
+            "job-canceled-by-user",
+            "job-canceled-by-operator",
+            "job-canceled-at-device",
+            "job-cancelled-by-user",
+            "aborted-by-system",
+            "printer-stopped job-aborted-by-system",
+        ] {
+            let outcome = completed_outcome(&block(failed), "Q-1");
+            assert_eq!(outcome, CupsOutcome::Error, "{failed}");
+        }
+        for done in [
+            "job-completed-successfully",
+            "job-completed-with-warnings",
+            "",
+        ] {
+            let outcome = completed_outcome(&block(done), "Q-1");
+            assert_eq!(outcome, CupsOutcome::Printed, "{done}");
+        }
+        // A header, whatever it says, holds no failure reason.
         assert_eq!(
             completed_outcome("Q-1 user 1024 ... aborted", "Q-1"),
-            CupsOutcome::Error
-        );
-        assert_eq!(
-            completed_outcome("Q-1 user 1024 completed", "Q-1"),
             CupsOutcome::Printed
         );
         assert_eq!(completed_outcome("", "Q-1"), CupsOutcome::Printed);
+    }
+
+    /// lpstat runs untranslated: in a German locale CUPS prints "Alarme:"
+    /// where completed_outcome looks for "Alerts:".
+    #[test]
+    fn lpstat_runs_untranslated() {
+        let out = crate::printers::run_with_timeout_env(
+            "sh",
+            &["-c", "echo \"$LC_ALL $LC_MESSAGES\""],
+            LPSTAT_ENV,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(out.stdout, "C.UTF-8 C.UTF-8\n");
     }
 
     /// `lpstat -W completed -l`, newest first (real CUPS layout).
@@ -3572,6 +3611,33 @@ Zebra-40                ben            1024   Wed 08 Oct 2026 01:00:00 AM CDT
             completed_outcome(named, "Canceled_Returns-7"),
             CupsOutcome::Printed
         );
+    }
+
+    /// Only the job's Alerts line (its state reasons) can mark it failed: a
+    /// user name, or a printer message, saying "canceled" does not.
+    #[test]
+    fn completed_outcome_reads_only_the_alerts_line() {
+        let done = "\
+Zebra-51                cancelled-orders 1024   Wed 08 Oct 2026 01:06:00 AM CDT
+\tStatus: Ready; the previous job was aborted at the printer
+\tAlerts: job-completed-successfully
+\tqueued for Zebra
+Zebra-50                canceled       1024   Wed 08 Oct 2026 01:05:00 AM CDT
+\tStatus: Job canceled by user.
+\tAlerts: job-completed-successfully
+\tqueued for Zebra
+Zebra-49                ben            1024   Wed 08 Oct 2026 01:04:00 AM CDT
+\tStatus: Ready
+\tAlerts: job-canceled-by-user
+\tqueued for Zebra
+Zebra-48                ben            1024   Wed 08 Oct 2026 01:03:00 AM CDT
+\tAlerts: processing-to-stop-point aborted-by-system
+\tqueued for Zebra
+";
+        assert_eq!(completed_outcome(done, "Zebra-51"), CupsOutcome::Printed);
+        assert_eq!(completed_outcome(done, "Zebra-50"), CupsOutcome::Printed);
+        assert_eq!(completed_outcome(done, "Zebra-49"), CupsOutcome::Error);
+        assert_eq!(completed_outcome(done, "Zebra-48"), CupsOutcome::Error);
     }
 
     #[test]

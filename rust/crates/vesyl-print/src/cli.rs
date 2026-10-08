@@ -675,11 +675,14 @@ fn cmd_unpair(deps: &Deps, out: &mut dyn Write) -> CmdResult {
 }
 
 fn cmd_agent(deps: &Deps, verbose: bool) -> CmdResult {
+    // Before anything is written: as root the agent would leave root-owned
+    // files in the service user's state.
+    crate::agent::refuse_root(&deps.cfg).map_err(Die)?;
     crate::logging::init(verbose);
     let stop = Arc::new(AtomicBool::new(false));
-    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-        signal_hook::flag::register(sig, stop.clone())?;
-    }
+    // Before Agent::run starts a thread: they all inherit the blocked stop
+    // signals, so only the signal thread ever takes them.
+    crate::agent::stop_on_signals(stop.clone())?;
     Agent::new(deps.cfg.clone()).run(stop);
     Ok(0)
 }

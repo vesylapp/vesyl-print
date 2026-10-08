@@ -816,7 +816,7 @@ fn cable_proxy(url: &Url, env: net::Env) -> Option<ProxyTarget> {
     if proxy.is_none() {
         log::warn!(
             target: LOG,
-            "cable: ignoring unsupported proxy {} (only http:// proxies can tunnel); connecting directly",
+            "cable: ignoring unsupported proxy {} (only http:// and https:// proxies can tunnel); connecting directly",
             without_userinfo(&raw)
         );
     }
@@ -1345,6 +1345,12 @@ mod tests {
                 "{local}"
             );
         }
+        // An https:// proxy URL tunnels too, through a plain CONNECT.
+        let tls_proxy = [("https_proxy", "https://proxy.lan:3129")];
+        assert_eq!(
+            pick("wss://wms-api.vesyl.dev/print/cable", &tls_proxy).as_deref(),
+            Some("proxy.lan:3129")
+        );
         let socks = [("https_proxy", "socks5://user:secret@p:1080")];
         assert_eq!(pick("wss://wms-api.vesyl.dev/print/cable", &socks), None);
         assert_eq!(
