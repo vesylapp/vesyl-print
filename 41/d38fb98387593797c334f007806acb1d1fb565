@@ -1,0 +1,33 @@
+rust/crates/vesyl-print/src/cli.rs
+  s_2883cba6969ed7::t_ea8d468105334f 1213-1214
+  s_2883cba6969ed7::t_630af16ea00f67 882-883,885-888
+  s_2883cba6969ed7::t_7436312a4fcb20 1327-1346,1352-1504
+  s_2883cba6969ed7::t_295e53ff88b038 1347-1351
+  s_2883cba6969ed7::t_46442ff3d8ee81 784-788
+rust/crates/vesyl-print/src/update.rs
+  s_2883cba6969ed7::t_7d5d86d61ed910 1286
+  s_2883cba6969ed7::t_295e53ff88b038 2642-2643,2647-2648
+  s_2883cba6969ed7::t_4384de83709bf9 1090
+  s_2883cba6969ed7::t_5ddb4a96ce0a6e 1278-1283,1285,1297,1299-1300,1307,1317
+  s_2883cba6969ed7::t_0464ffcd520086 1284,1287-1296,1298
+  s_2883cba6969ed7::t_4f86e64fc9fe35 1084-1087
+  s_2883cba6969ed7::t_5390b9d0409d4f 2538-2641,2644-2646,2649-2651
+  s_2883cba6969ed7::t_c88d91cb773263 1083,1088-1089,1091-1097,1103-1107,1130-1142
+  s_2883cba6969ed7::t_fd9ec02d3d1f08 1308
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "41d38fb98387593797c334f007806acb1d1fb565",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
