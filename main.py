@@ -7,6 +7,12 @@ that overlay is open, taps do not cycle pages: ‹ › change printer, Test, Bac
 
 Renders to the 3.5" LCD (/dev/fb1) at ~1 Hz.
 Run with:  python3 main.py
+
+Data comes from files the Rust agent writes under state_dir (status.json,
+update_status.json, printers.json, the job queue); the test print runs this
+slot's ``vesyl-print`` binary. Printer rows are re-read from printers.json
+every 8 s; a snapshot older than 120 s shows every status as "unknown"
+(see statusio.read_printers).
 """
 
 from __future__ import annotations
@@ -22,11 +28,9 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-import printers
 import statusio
 import sysinfo
 import touch as touch_mod
-import update as update_mod
 import wifi_setup
 from config import AGENT_VERSION, load_config
 from display_status import (
@@ -39,11 +43,14 @@ from display_status import (
     PAGE_SYSTEM,
     PAGE_TEST,
     PAIRED_PAGES,
+    STATUS_FAILED,
+    STATUS_ROLLED_BACK,
     TEST_IDLE_SECONDS,
     WARN,
     HitRect,
     PageState,
     TestPrintState,
+    UpdateStatus,
     apply_test_hit,
     coarse_test_action,
     count_queue_jobs,
@@ -55,8 +62,12 @@ from display_status import (
     layout_test_print,
     ota_display_message,
     network_status_color,
+    package_version,
+    printer_rows,
     printer_status_color,
     printer_status_label,
+    read_update_status,
+    submit_test_print,
     test_print_default_format,
 )
 from framebuffer import Framebuffer
@@ -86,7 +97,7 @@ ACCENT = (237, 252, 51)  # VESYL yellow-green, matches logo mark
 FG = (235, 238, 245)
 MUTED = (140, 148, 165)
 
-# Background inventory refresh (CUPS/IPP can be slow).
+# How often the printer thread re-reads the agent's printers.json.
 _PRINTER_REFRESH_S = 8.0
 
 
@@ -115,7 +126,7 @@ class InfoScreen:
         self.f_footer = load_font(FONT_PATH, 16)
         self.f_hint = load_font(FONT_PATH, 15)
         self.logo = self._load_logo()
-        # Filled by the background CUPS discovery / status thread.
+        # Filled from the agent's printers.json by the background thread.
         self.printer_names: list[str] = []
         self.printer_rows: list[dict[str, Any]] = []
         self.status_path = status_path
@@ -154,16 +165,16 @@ class InfoScreen:
             return None
         return statusio.read_status(self.status_path)
 
-    def _update_status(self) -> update_mod.UpdateStatus | None:
+    def _update_status(self) -> UpdateStatus | None:
         if not self.update_status_path:
             return None
-        return update_mod.read_update_status(Path(self.update_status_path))
+        return read_update_status(Path(self.update_status_path))
 
     def _display_version(self, st: statusio.AgentStatus | None) -> str:
         if st and st.agent_version:
             return format_agent_version(st.agent_version)
         try:
-            return format_agent_version(update_mod.package_version())
+            return format_agent_version(package_version())
         except Exception:
             return format_agent_version(AGENT_VERSION)
 
@@ -261,9 +272,7 @@ class InfoScreen:
 
         def _run() -> None:
             try:
-                from test_label import submit_test_label
-
-                state = submit_test_label(cups, fmt, wait_cups=False)
+                state = submit_test_print(cups, fmt)
                 self.test_ui.message = f"{fmt.upper()} {state}"
                 log.info("test print %s → %s (%s)", fmt, cups, state)
             except Exception as e:
@@ -388,8 +397,8 @@ class InfoScreen:
         self._centered(d, label, self.f_label, y=y, fill=color)
         y += 26
         if ust and ust.last_error and ust.status in (
-            update_mod.STATUS_FAILED,
-            update_mod.STATUS_ROLLED_BACK,
+            STATUS_FAILED,
+            STATUS_ROLLED_BACK,
         ):
             err = self._fit(d, ust.last_error, self.f_hint, self.w - 32)
             self._centered(d, err, self.f_hint, y=y, fill=MUTED)
@@ -864,29 +873,26 @@ def open_framebuffer(device: str, wait: float = 0.0) -> Framebuffer:
             time.sleep(0.5)
 
 
-def _refresh_printers(screen: InfoScreen, stop: threading.Event) -> None:
-    """Discover queues once, then periodically refresh status for Ops."""
-    try:
-        screen.printer_names = printers.ensure_printers()
-    except Exception:
-        log.exception("printer discovery failed")
+def _refresh_printers(
+    screen: InfoScreen, stop: threading.Event, printers_path: str | Path
+) -> None:
+    """Re-read the agent's printers.json for the Ops / test-print rows.
 
+    The agent provisions CUPS queues and refreshes the inventory itself. A
+    missing or unreadable file keeps the current rows (or the placeholder
+    rows built from the last known names); a stale one (older than 120 s)
+    arrives with every status "unknown".
+    """
     while not stop.is_set():
         try:
-            inv = printers.inventory_payload()
-            rows = [
-                {
-                    "name": str(item.get("display_name") or item.get("cups_name") or "—"),
-                    "cups_name": str(item.get("cups_name") or ""),
-                    "status": item.get("status"),
-                    "message": item.get("status_message"),
-                    "supports_raw": bool(item.get("supports_raw")),
-                }
-                for item in inv
-            ]
-            screen.printer_rows = rows
-            if rows:
-                screen.printer_names = [str(r["name"]) for r in rows]
+            snap = statusio.read_printers(printers_path)
+            if snap is None:
+                log.debug("printer inventory unavailable: %s", printers_path)
+            else:
+                rows = printer_rows(snap.printers)
+                screen.printer_rows = rows
+                if rows:
+                    screen.printer_names = [str(r["name"]) for r in rows]
         except Exception:
             log.debug("printer inventory refresh failed", exc_info=True)
         stop.wait(_PRINTER_REFRESH_S)
@@ -971,6 +977,7 @@ def main() -> None:
     status_path = str(cfg.status_path)
     update_status_path = str(cfg.update_status_path)
     queue_dir = cfg.queue_dir
+    printers_path = cfg.printers_path
 
     manual = args.once or args.offline or args.splash
     fb = open_framebuffer(args.device, wait=0.0 if manual else 30.0)
@@ -1003,7 +1010,7 @@ def main() -> None:
     stop_bg = threading.Event()
     threading.Thread(
         target=_refresh_printers,
-        args=(screen, stop_bg),
+        args=(screen, stop_bg, printers_path),
         daemon=True,
         name="vesyl-printers",
     ).start()
@@ -1044,6 +1051,7 @@ def main() -> None:
                 config_dir=cfg.config_dir,
                 state_dir=cfg.state_dir,
                 api_base_url=cfg.api_base_url,
+                printers_path=printers_path,
             )
 
         streamer = LcdStreamServer(
