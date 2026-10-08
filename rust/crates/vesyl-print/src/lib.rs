@@ -1,21 +1,24 @@
-//! VESYL print node agent — Rust port of the Python agent.
+//! VESYL print node: the cloud agent and the `vesyl-print` CLI. The LCD
+//! display is Python; it reads the state files the agent writes
+//! (`status.json`, `printers.json`, `update_status.json`) and calls the CLI.
 //!
-//! Module map (Python → Rust):
-//!
-//! | Python        | Rust            |
-//! |---------------|-----------------|
-//! | `config.py`   | [`config`]      |
-//! | `auth.py`     | [`auth`]        |
-//! | `statusio.py` | [`statusio`]    |
-//! | `cloud.py`    | [`cloud`]       |
-//! | `cable.py`    | [`cable`]       |
-//! | `jobs.py`     | [`jobs`]        |
-//! | `zpl.py`      | [`zpl`]         |
-//! | `printers.py` | [`printers`]    |
-//! | `agent.py`    | [`agent`]       |
-//! | `cli.py`      | [`cli`]         |
-//! | `update.py`   | [`update`]      |
-//! | `sysinfo.py`  | [`sysinfo`] (hostname only so far) |
+//! | Module       | What it holds                                              |
+//! |--------------|------------------------------------------------------------|
+//! | [`agent`]    | heartbeat loop: whoami, job pull, ActionCable push, OTA    |
+//! | [`cli`]      | `vesyl-print` subcommands                                  |
+//! | [`config`]   | `config.json`, env overrides, config/state dirs            |
+//! | [`auth`]     | device credentials (`credentials.json`, mode 0600)         |
+//! | [`cloud`]    | print/v1 REST client                                       |
+//! | [`cable`]    | ActionCable `PrintNodeChannel` client                      |
+//! | [`net`]      | HTTP transport: timeouts, proxies, redirects               |
+//! | [`jobs`]     | durable job queue, content fetch, CUPS submit + completion |
+//! | [`printers`] | CUPS discovery and provisioning                            |
+//! | [`zpl`]      | PDF / raster to ZPL for raw thermal queues                 |
+//! | [`update`]   | app OTA: verify, install, activate, roll back, health gate |
+//! | [`statusio`] | `status.json`, pairing and cloud state for the LCD         |
+//! | [`sysinfo`]  | host facts (hostname)                                      |
+//! | [`logging`]  | log lines on stderr (journald)                             |
+//! | [`util`]     | JSON coercion, durable writes that keep the service owner  |
 
 pub mod agent;
 pub mod auth;
@@ -39,5 +42,5 @@ mod testutil;
 /// Generic boxed error for injectable hooks (ack, report_state, fetch, …).
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A JSON object (`dict[str, Any]` in the Python agent).
+/// A JSON object: API bodies, `config.json`, the release manifest.
 pub type JsonObject = serde_json::Map<String, serde_json::Value>;

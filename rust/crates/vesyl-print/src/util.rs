@@ -78,9 +78,9 @@ pub fn py_int(v: &Value) -> Option<i64> {
 ///
 /// When root writes (an operator running the CLI), the new file keeps the
 /// owner of the file it replaces, or of the directory for a new file, so the
-/// non-root service can still read it, and a rolled-back Python agent, which
-/// rewrites some files in place, can still write it. Directories created on
-/// the way get the owner of the closest existing one.
+/// non-root service can still read it (credentials.json is 0600), and no
+/// root-owned file is left in the service user's trees. Directories created
+/// on the way get the owner of the closest existing one.
 pub fn write_durable(path: &Path, data: &[u8], mode: u32, sync_dir: bool) -> io::Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -251,6 +251,28 @@ fn open_dir_at(parent: &File, name: &OsStr) -> io::Result<File> {
 /// of the closest directory that already existed (see [`write_durable`]).
 pub fn create_dir_all_owned(dir: &Path) -> io::Result<()> {
     create_dirs(dir)
+}
+
+/// Hand `file`, just created in `dir`, to `dir`'s owner when root created it
+/// (an operator running the CLI), as [`write_durable`] does with the files it
+/// writes. Through the open file, so nothing is resolved by path. Best
+/// effort: a failure is logged.
+pub fn hand_new_file_to_dir_owner(file: &File, dir: &Path) {
+    let euid = euid();
+    if euid != 0 {
+        return;
+    }
+    let dir_owner = fs::metadata(dir).ok().map(|m| owner(&m));
+    let Some((uid, gid)) = owner_for_rewrite(euid, None, dir_owner) else {
+        return;
+    };
+    if let Err(e) = std::os::unix::fs::fchown(file, Some(uid), Some(gid)) {
+        log::warn!(
+            target: LOG,
+            "could not hand a new file in {} to uid {uid} gid {gid}: {e}",
+            dir.display()
+        );
+    }
 }
 
 /// After root (an operator running the CLI) unpacked a tree into a directory
