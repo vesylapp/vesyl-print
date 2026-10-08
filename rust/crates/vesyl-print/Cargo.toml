@@ -4,7 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "VESYL print node agent (Rust port)"
+description = "VESYL print node: the cloud agent and the vesyl-print CLI"
 
 [dependencies]
 base64 = "0.23.1"
@@ -28,6 +28,3 @@ tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json", "platform-verifier"] }
 url = "2.5.8"
 uuid = { version = "1.27.0", features = ["v4"] }
-
-[dev-dependencies]
-tempfile = "3.27.0"
