@@ -1,0 +1,53 @@
+rust/crates/vesyl-print/tests/agent_process.rs
+  s_2883cba6969ed7::t_8dffb46eacdd4a 500-569
+  s_2883cba6969ed7::t_7da3dfa8eea2bf 436
+  s_2883cba6969ed7::t_e887e976ac9697 592
+  s_2883cba6969ed7::t_4c36c0c853f6fd 3-7,9-13
+  s_2883cba6969ed7::t_90b6b01c1f5090 213-214,221-223
+  s_2883cba6969ed7::t_a0ac5bbdc7d6da 257-265
+  s_2883cba6969ed7::t_0622a197dcb51a 51-53
+  s_2883cba6969ed7::t_b552d73e5172e2 101,105-107,112
+  s_2883cba6969ed7::t_dbc15d1646a8a7 146-149,154-169,176-204
+  s_2883cba6969ed7::t_4e64753b793841 174,205,266,683-746,751-849,855-876
+  s_2883cba6969ed7::t_6adf9a0547dde5 170-173,747-750,850-854
+  s_2883cba6969ed7::t_a3541e6c8737be 175,206,267
+rust/crates/vesyl-print/src/agent.rs
+  s_2883cba6969ed7::t_febef9c200ac27 548,2234-2299,2304-2323,2326-2342,2347-2385,2390-2394,2397-2403,2406-2432,2438-2475
+  s_2883cba6969ed7::t_164a1a8859c66c 287-294,304-306
+  s_2883cba6969ed7::t_481a007de5ae29 874-875
+  s_2883cba6969ed7::t_77c382434a2dc5 1103-1107,1113
+  s_2883cba6969ed7::t_ea119a47f55475 1033
+  s_2883cba6969ed7::t_fcc02a6aab7526 1307-1322
+  s_2883cba6969ed7::t_ee2a2c6fca6cfe 960-961
+  s_2883cba6969ed7::t_8656da884c381e 1081-1082
+  s_2883cba6969ed7::t_616819c629791e 2324-2325
+  s_2883cba6969ed7::t_471a1cd6ca9523 45-49
+  s_2883cba6969ed7::t_ea9b400d23361a 800-802
+  s_2883cba6969ed7::t_e7e6bc8bd957e2 876
+  s_2883cba6969ed7::t_4be2bfd523439d 847,853
+  s_2883cba6969ed7::t_68c18309f269f3 1634
+  s_2883cba6969ed7::t_99a03f1065c2c6 2300-2303,2343-2346,2386-2389,2433-2437
+  s_2883cba6969ed7::t_0f336ad3a16c6a 1256-1257
+  s_2883cba6969ed7::t_65903c7bd1000c 1128-1137
+  s_2883cba6969ed7::t_c1925ef8c25371 1030-1032,1034-1041
+  s_2883cba6969ed7::t_a64b8e1b6d2c3c 2395-2396,2404-2405
+  s_2883cba6969ed7::t_49cecd78288d1a 1221
+  s_2883cba6969ed7::t_8a412fe038b3a0 505-507,509-510,513-522,526-547
+  s_2883cba6969ed7::t_f05938f0c3ca6c 549,1138,1323-1324,2476
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "48711bef7c3309d4cf052765eaaf954ad30bd19f",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
