@@ -21,7 +21,9 @@
 #   UPDATE_PRIVATE_KEY  — PEM for Ed25519 private key (pair of keys/update_public.pem)
 #
 # Third-party actions are pinned to commit SHAs and the zig toolchain to exact
-# versions and wheel hashes; bump them deliberately.
+# versions and wheel hashes (.github/zigbuild-requirements.txt); bump them
+# deliberately, together with rust.yml, which builds the same binary on every
+# change.
 name: Release
 
 on:
@@ -51,12 +53,14 @@ jobs:
           echo "${VERSION}" > VERSION
 
       # qemu-user + the aarch64 glibc let build-release.sh run the packaged
-      # binary's --version and check it reports the tag's version. jq and rsync
-      # are also used by the script tests in `cargo test`.
+      # binary's --version and check it reports the tag's version (in CI it
+      # must run); binutils' readelf checks the binary needs no glibc newer
+      # than 2.31. jq and rsync are also used by the script tests in
+      # `cargo test`.
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq rsync qemu-user libc6-arm64-cross
+          sudo apt-get install -y -qq jq rsync binutils qemu-user libc6-arm64-cross
 
       - name: Install Rust (aarch64 target)
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
@@ -72,20 +76,14 @@ jobs:
       # Build tooling only (nothing from it ships): zig + cargo-zigbuild come
       # as PyPI wheels, in their own venv because the runner's system Python
       # is externally managed (PEP 668). Exact versions, binary wheels only,
-      # hashes for x86_64 and aarch64 runners.
+      # hashes for x86_64 and aarch64 runners, all in
+      # .github/zigbuild-requirements.txt, which rust.yml's aarch64 job
+      # installs too.
       - name: Install cargo-zigbuild
         run: |
           python3 -m venv "$RUNNER_TEMP/zigbuild"
-          cat > "$RUNNER_TEMP/zigbuild-requirements.txt" <<'EOF'
-          ziglang==0.17.0 \
-            --hash=sha256:97079827064a7492cce5541ceb438ae8003ce1e54e399676da2d62fb7a5dc08b \
-            --hash=sha256:d2804f94f54f7fcf8169f4b212a619ad688a4e2e6592e976f0cf2e58e2cd8af3
-          cargo-zigbuild==0.23.4 \
-            --hash=sha256:0a149a2a07b9513d422efa9cc23e1add9741f08abe86845fa418eaeb4cca7931 \
-            --hash=sha256:9f848addf9ca16e8df52b4a86eb41f7555bb4205aea117ad521f501a307129f5
-          EOF
           "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet --require-hashes --only-binary :all: \
-            -r "$RUNNER_TEMP/zigbuild-requirements.txt"
+            -r .github/zigbuild-requirements.txt
           echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
 
       - name: Test Rust agent, CLI and release scripts
