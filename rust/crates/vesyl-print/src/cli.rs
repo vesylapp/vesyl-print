@@ -818,7 +818,15 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
                 restart: false,
                 ..env.clone()
             };
-            let ust = update::maybe_update_from_heartbeat(&hb, cfg, &apply_env, None, None, false);
+            // `auto_update_enabled: false` keeps the agent from installing a
+            // desired version on its own; asked for here, it is installed, as
+            // with --file and --manifest-url.
+            let manual = Config {
+                auto_update_enabled: true,
+                ..cfg.clone()
+            };
+            let ust =
+                update::maybe_update_from_heartbeat(&hb, &manual, &apply_env, None, None, false);
             update::write_update_status(&cfg.update_status_path(), &ust)?;
             if ust.status == update::STATUS_PENDING_HEALTH && env.restart {
                 update::restart_services(env.apply_helper.as_deref());
@@ -2178,6 +2186,65 @@ mod tests {
             r.unwrap_err().0,
             "not paired and no --manifest-url / --file"
         );
+    }
+
+    /// `auto_update_enabled: false` keeps the agent from installing a desired
+    /// version on its own, not an operator: `update apply` installs the
+    /// heartbeat's desired version, and `update apply --version` its own.
+    #[test]
+    fn update_apply_online_installs_with_auto_update_disabled() {
+        let td = tempfile::tempdir().unwrap();
+        let (_, m090) = release(td.path(), "0.9.0");
+        let (_, m091) = release(td.path(), "0.9.1");
+        // --version finds its manifest under releases_base_url.
+        let cdn = td.path().join("cdn");
+        fs::create_dir_all(&cdn).unwrap();
+        fs::copy(&m091, cdn.join("vesyl-print-0.9.1.manifest.json")).unwrap();
+        // This node, with auto-update off, its heartbeats answered with `hb`.
+        let node = |hb: Value| {
+            let srv = http_stub::serve(move |_, s| respond(s, 200, &[], hb.to_string().as_bytes()));
+            let d = deps(td.path(), &srv.base_url);
+            Deps {
+                cfg: Config {
+                    auto_update_enabled: false,
+                    update_require_signature: false,
+                    releases_base_url: file_url(&cdn),
+                    ..d.cfg
+                },
+                ..d
+            }
+        };
+        let desired =
+            node(json!({"desired_agent_version": "0.9.0", "update_url": file_url(&m090)}));
+        let silent = node(json!({"ok": true}));
+        installed_slot(&desired, "0.8.0");
+        let creds = auth::credentials_from_pair_response(
+            json!({"node_id": "n1", "device_token": "tok"})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        auth::save_credentials(&desired.cfg.credentials_path(), &creds).unwrap();
+        let root = &desired.update_env.install_root;
+        for (d, argv, version) in [
+            (&desired, &["update", "apply"][..], "0.9.0"),
+            (&silent, &["update", "apply", "--version", "0.9.1"], "0.9.1"),
+        ] {
+            let (r, out) = run_args(d, argv);
+            assert_eq!(r.unwrap(), 0, "{argv:?}: {out}");
+            let st: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(
+                st["status"],
+                update::STATUS_PENDING_HEALTH,
+                "{argv:?}: {out}"
+            );
+            assert_eq!(st["target_version"], version, "{argv:?}");
+            assert_eq!(
+                update::current_release_version(root).as_deref(),
+                Some(version),
+                "{argv:?}"
+            );
+        }
     }
 
     /// `update apply … --restart` must leave pending_health for the restarted
