@@ -1403,14 +1403,6 @@ mod tests {
         );
     }
 
-    /// A URL nothing listens on.
-    fn closed_port_url() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        format!("http://{addr}")
-    }
-
     /// Every failed `claim --json` prints one JSON object, exits 1 and
     /// writes no credentials.
     #[test]
@@ -1457,8 +1449,10 @@ mod tests {
             assert_eq!(srv.requests.lock().unwrap().len(), 1);
         }
 
-        // Transport errors are status 0 too.
-        let d = deps(td.path(), &closed_port_url());
+        // Transport errors are status 0 too. Nothing listens on port 9, and
+        // no test can (it is privileged); a port just closed could be bound
+        // by any process before both claims below have been refused.
+        let d = deps(td.path(), "http://127.0.0.1:9");
         let err = failed(&d, &["claim", "AB7K2Q9M", "--json"]);
         assert_eq!(
             (&err["ok"], &err["status"], &err["code"]),
