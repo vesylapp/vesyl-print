@@ -1,0 +1,65 @@
+rust/crates/vesyl-print/src/cli.rs
+  s_2883cba6969ed7::t_d4d8324e0a460e 678-680,683-685
+rust/crates/vesyl-print/src/cable.rs
+  s_2883cba6969ed7::t_d71fc42edf4557 1348-1353
+  s_2883cba6969ed7::t_ac98da7db6b9fc 819
+rust/crates/vesyl-print/src/jobs.rs
+  s_2883cba6969ed7::t_3070dfe74d02b9 488
+  s_2883cba6969ed7::t_23129ba981ac92 540,3526-3543
+  s_2883cba6969ed7::t_2345874cfa9f75 3563,3569,3616-3637
+  s_2883cba6969ed7::t_b6dfb93a925401 481-486
+  s_2883cba6969ed7::t_4125ed61783999 541,547-551
+  s_2883cba6969ed7::t_dd7362aa7f1f14 524-530,538-539,544-546
+  s_2883cba6969ed7::t_f7d74a20b7f08b 3544-3548,3556-3562,3564-3568,3638-3642
+rust/crates/vesyl-print/tests/agent_process.rs
+  s_2883cba6969ed7::t_9bdb4494a36d3d 331-333
+  s_2883cba6969ed7::t_086d0d50050b70 388-390
+  s_2883cba6969ed7::t_28a7446baba5f9 407,410
+  s_2883cba6969ed7::t_9bb9e187f938de 187-188,192-199
+  s_2883cba6969ed7::t_523df8a2ed240a 1-74,76-186,189-191,200-293,310-330,334-337,345,350-356,358-368,372,379-387,391-406,408-409,411-421,423-450
+  s_2883cba6969ed7::t_83d8ac1de5fbef 422
+  s_2883cba6969ed7::t_625097f224949a 294-309
+  s_2883cba6969ed7::t_d386894c6bbea3 357
+  s_2883cba6969ed7::t_da68d3d78d667e 338-344,346-349
+  s_2883cba6969ed7::t_02918e3575632c 369-371,373-378
+  s_2883cba6969ed7::t_a9d499122655ef 75
+rust/crates/vesyl-print/src/printers.rs
+  s_2883cba6969ed7::t_ee4466d1a299d5 113-114,116-127,129,132-133
+  s_2883cba6969ed7::t_48c5f4f1a36b58 2196-2234
+  s_2883cba6969ed7::t_d917dde524dd77 151,162
+  s_2883cba6969ed7::t_5b641b5edc86e4 876-879
+  s_2883cba6969ed7::t_3ed8660848a882 144-150,152-161,163-170
+rust/crates/vesyl-print/src/agent.rs
+  s_2883cba6969ed7::t_d6e0714dece58a 2881-2906,2911-2931
+  s_2883cba6969ed7::t_c281b44aa3c8d4 896-898
+  s_2883cba6969ed7::t_ee457c1d33f03e 980-983
+  s_2883cba6969ed7::t_760b61dbefbba0 1143-1145
+  s_2883cba6969ed7::t_61689fba2f666b 1127,1138,1142,1146-1148,1152
+  s_2883cba6969ed7::t_030596d61134a4 2718-2880
+  s_2883cba6969ed7::t_bacd6b491fed38 1454,1456
+  s_2883cba6969ed7::t_09b01a150e22d2 929
+  s_2883cba6969ed7::t_f350191bbdb3ad 4-9
+  s_2883cba6969ed7::t_f318a263e240f0 1164,1171,1173-1182
+  s_2883cba6969ed7::t_2d8a8bd52ee516 1291-1306,1309-1396,1403-1431,1433-1443
+  s_2883cba6969ed7::t_3556775866bedd 390-392
+  s_2883cba6969ed7::t_6ed1841aff9481 1307-1308
+  s_2883cba6969ed7::t_8e7489b5409ba2 1397-1402
+  s_2883cba6969ed7::t_796e5912e1095c 2907-2910
+  s_2883cba6969ed7::t_82f82c49c58b8a 1432
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a8e31f16d55a667a61d0dc382011f9f928772c2e",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
