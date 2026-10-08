@@ -18,21 +18,23 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde_json::{json, Value};
 
-use crate::BoxError;
+use crate::{net, BoxError};
 
 const LOG: &str = "vesyl-print.printers";
 
@@ -101,6 +103,13 @@ pub struct CmdOutput {
 
 /// Run a command with a timeout (killing it on expiry), like
 /// `subprocess.run(..., capture_output=True, timeout=...)`.
+///
+/// Both pipes are drained on the calling thread with `poll(2)`, as Python's
+/// `communicate()` does. There are no helper threads, because starting one
+/// can fail at the service's task limit (systemd `TasksMax`), and
+/// `thread::spawn` panics on failure, which could happen after `lp` has
+/// already queued the label. Running out of tasks now fails the child spawn
+/// with an ordinary error.
 pub fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> std::io::Result<CmdOutput> {
     let mut child = Command::new(cmd)
         .args(args)
@@ -108,54 +117,121 @@ pub fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> std::io:
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    // Drain pipes on threads so a chatty child can't block on a full pipe.
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
-            }
-            let _ = tx.send(buf);
-        });
-        rx
-    };
-    let out_rx = drain(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let err_rx = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(st) = child.try_wait()? {
-            break st;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("{cmd} timed out"),
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let text = |rx: mpsc::Receiver<Vec<u8>>| {
-        String::from_utf8_lossy(&rx.recv().unwrap_or_default()).into_owned()
-    };
-    Ok(CmdOutput {
-        success: status.success(),
-        stdout: text(out_rx),
-        stderr: text(err_rx),
+    let result = collect_output(&mut child, Instant::now() + timeout);
+    if !matches!(result, Ok(Some(_))) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result?.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{cmd} timed out"))
     })
+}
+
+/// One child pipe being read without blocking; `file` is `None` after EOF.
+struct PipeDrain {
+    file: Option<File>,
+    buf: Vec<u8>,
+}
+
+impl PipeDrain {
+    fn new(pipe: Option<impl Into<OwnedFd>>) -> std::io::Result<Self> {
+        let file = pipe.map(|p| File::from(p.into()));
+        if let Some(f) = &file {
+            set_nonblocking(f)?;
+        }
+        Ok(PipeDrain {
+            file,
+            buf: Vec::new(),
+        })
+    }
+
+    /// Read everything available right now. EOF (or a read error, which the
+    /// old reader threads ignored too) closes the pipe.
+    fn drain(&mut self) {
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        let mut chunk = [0u8; 8192];
+        let closed = loop {
+            match file.read(&mut chunk) {
+                Ok(0) => break true,
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break false,
+                Err(_) => break true,
+            }
+        };
+        if closed {
+            self.file = None;
+        }
+    }
+
+    fn pollfd(&self) -> Option<libc::pollfd> {
+        self.file.as_ref().map(|f| libc::pollfd {
+            fd: f.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+    }
+
+    fn text(self) -> String {
+        String::from_utf8_lossy(&self.buf).into_owned()
+    }
+}
+
+fn set_nonblocking(f: &File) -> std::io::Result<()> {
+    let fd = f.as_raw_fd();
+    // SAFETY: fcntl on an open descriptor we own; no pointers are passed.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: as above.
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Read the child's stdout/stderr until it exits (`Some`) or `deadline`
+/// passes (`None`). The caller kills the child unless this returns `Some`.
+fn collect_output(child: &mut Child, deadline: Instant) -> std::io::Result<Option<CmdOutput>> {
+    let mut out = PipeDrain::new(child.stdout.take())?;
+    let mut err = PipeDrain::new(child.stderr.take())?;
+    loop {
+        out.drain();
+        err.drain();
+        if let Some(status) = child.try_wait()? {
+            // Everything the child wrote is in the pipes now. Take it without
+            // waiting for EOF, which a background grandchild could hold off.
+            out.drain();
+            err.drain();
+            return Ok(Some(CmdOutput {
+                success: status.success(),
+                stdout: out.text(),
+                stderr: err.text(),
+            }));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        // Sleep until output arrives; wake regularly to notice the exit.
+        let wait = (deadline - now).min(Duration::from_millis(50));
+        let mut fds: Vec<libc::pollfd> =
+            [out.pollfd(), err.pollfd()].into_iter().flatten().collect();
+        if fds.is_empty() {
+            // Both pipes closed; the child is exiting.
+            thread::sleep(wait.min(Duration::from_millis(5)));
+            continue;
+        }
+        let ms = wait.as_millis().clamp(1, 50) as libc::c_int;
+        // SAFETY: `fds` is a live, writable array of `fds.len()` pollfds.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
 }
 
 /// stdout of a CUPS tool, or "" on any failure (Python `printers._run`).
@@ -671,16 +747,23 @@ fn probe_hosts(
     let workers = max_workers.clamp(1, candidates.len());
     let next = AtomicUsize::new(0);
     let open = Mutex::new(Vec::new());
-    thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(ip) = candidates.get(i) else { break };
-                if port_open(ip, port, timeout) {
-                    open.lock().unwrap().push(ip.clone());
-                }
-            });
+    let worker = || loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        let Some(ip) = candidates.get(i) else { break };
+        if port_open(ip, port, timeout) {
+            open.lock().unwrap().push(ip.clone());
         }
+    };
+    thread::scope(|s| {
+        // Helpers share the queue with this thread, which also works it, so
+        // the scan finishes (slower) even when no helper can start.
+        for _ in 1..workers {
+            if let Err(e) = thread::Builder::new().spawn_scoped(s, worker) {
+                log::warn!(target: LOG, "port scan continuing with fewer threads: {e}");
+                break;
+            }
+        }
+        worker();
     });
     let mut open = open.into_inner().unwrap();
     open.sort_by_key(|s| {
@@ -739,14 +822,25 @@ pub fn parse_zebra_http_identity(body: &str) -> Option<String> {
 /// Injectable HTTP fetch for Zebra identification: `(url) -> bytes`.
 pub type FetchFn = Arc<dyn Fn(&str) -> Result<Vec<u8>, BoxError> + Send + Sync>;
 
-/// GET `url` with a timeout, reading at most 16 KiB of the body.
+/// GET `url` like Python's `urlopen(req, timeout=…)`, reading at most 16 KiB
+/// of the body.
+///
+/// - `timeout` bounds each phase (connect, response head, body) the way
+///   urllib bounds each socket operation, not the exchange as a whole: an old
+///   ZebraNet server that takes 1.2 s for the head and 1.2 s more for the
+///   body is still identified.
+/// - The environment's `http_proxy` / `no_proxy` apply, as with urllib.
+/// - Redirects are followed and a non-2xx status is a failure (`HTTPError`).
+///
+/// There is no overall deadline on top: ureq starts a DNS thread per request
+/// when one is set, and the per-phase budgets already cap a probe at a few
+/// times `timeout`, which a byte-at-a-time server cannot stretch.
 fn http_fetch_head(url: &str, timeout: Duration) -> Result<Vec<u8>, BoxError> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .user_agent("vesyl-print-agent")
-        .build()
-        .into();
+    let agent = net::agent(url, net::Timeouts::lan(timeout), net::Redirects::Follow);
     let mut resp = agent.get(url).header("Accept", "text/html, */*").call()?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()).into());
+    }
     let mut buf = Vec::new();
     resp.body_mut()
         .as_reader()
@@ -1364,7 +1458,12 @@ fn parse_ipp_attr_values(text: &str, attr_name: &str) -> Vec<String> {
 struct IppPrinterAttrs {
     status: String,
     status_reasons: Vec<String>,
+    /// Display text: the printer's own message, else labels for the reasons.
     status_message: Option<String>,
+    /// The raw `printer-state-message`, if the printer sent one. Merges that
+    /// add reasons rebuild the display text from this, not from labels for
+    /// the old reasons.
+    state_message: Option<String>,
     queued_job_count: i64,
     base_status: String,
 }
@@ -1392,6 +1491,7 @@ fn parse_ipp_printer_attrs(text: &str) -> IppPrinterAttrs {
     IppPrinterAttrs {
         status: status_from_state_and_reasons(&base, &reasons),
         status_message: human_status_message(&reasons, state_message.as_deref()),
+        state_message,
         status_reasons: reasons,
         queued_job_count,
         base_status: base,
@@ -1500,7 +1600,9 @@ fn ipp_query_queue_with(
         if !job_reasons.is_empty() {
             let merged = dedupe_reasons(parsed.status_reasons.iter().cloned().chain(job_reasons));
             parsed.status = status_from_state_and_reasons(&parsed.base_status, &merged);
-            parsed.status_message = human_status_message(&merged, parsed.status_message.as_deref());
+            // Relabel from the raw message: the old label ("Toner low") would
+            // hide the job's blocking reason ("Out of paper").
+            parsed.status_message = human_status_message(&merged, parsed.state_message.as_deref());
             parsed.status_reasons = merged;
         }
     }
@@ -1527,7 +1629,9 @@ fn ipp_query_queue_with(
                     );
                     // Prefer device base state when more severe / informative.
                     parsed.status = status_from_state_and_reasons(&dev.base_status, &merged);
-                    let msg = dev.status_message.or(parsed.status_message);
+                    // Raw messages only, as above: a derived label for either
+                    // side's reasons would drop the other side's.
+                    let msg = dev.state_message.or(parsed.state_message.clone());
                     parsed.status_message = human_status_message(&merged, msg.as_deref());
                     parsed.status_reasons = merged;
                 }
@@ -1745,17 +1849,17 @@ pub fn inventory_payload() -> Vec<Value> {
     let mut items = Vec::with_capacity(queues.len());
     for chunk in queues.chunks(INVENTORY_PARALLELISM) {
         thread::scope(|scope| {
-            let handles: Vec<_> = chunk
+            let tasks: Vec<_> = chunk
                 .iter()
                 .map(|(queue, uri)| {
-                    scope.spawn(move || {
+                    spawn_or_run(scope, thread::Builder::new(), move || {
                         let st = cups_queue_status(queue, Some(uri));
                         let opts = run("lpoptions", &["-p", queue], 3);
                         inventory_entry(queue, uri, &opts, st)
                     })
                 })
                 .collect();
-            items.extend(handles.into_iter().filter_map(|h| h.join().ok()));
+            items.extend(tasks.into_iter().filter_map(|t| t.join().ok()));
         });
     }
     items
@@ -1763,6 +1867,41 @@ pub fn inventory_payload() -> Vec<Value> {
 
 /// Max queues queried at once by [`inventory_payload`].
 const INVENTORY_PARALLELISM: usize = 8;
+
+/// Work started by [`spawn_or_run`]: on a scoped thread, or already done.
+enum Task<'scope, T> {
+    Thread(thread::ScopedJoinHandle<'scope, T>),
+    Done(T),
+}
+
+impl<T> Task<'_, T> {
+    fn join(self) -> thread::Result<T> {
+        match self {
+            Task::Thread(handle) => handle.join(),
+            Task::Done(value) => Ok(value),
+        }
+    }
+}
+
+/// Run `f` on a new scoped thread from `builder`, or right here when the OS
+/// refuses one (`Scope::spawn` would panic the heartbeat at the task limit).
+fn spawn_or_run<'scope, T, F>(
+    scope: &'scope thread::Scope<'scope, '_>,
+    builder: thread::Builder,
+    f: F,
+) -> Task<'scope, T>
+where
+    T: Send + 'scope,
+    F: FnOnce() -> T + Send + Clone + 'scope,
+{
+    match builder.spawn_scoped(scope, f.clone()) {
+        Ok(handle) => Task::Thread(handle),
+        Err(e) => {
+            log::warn!(target: LOG, "no thread for a printer query ({e}); running it inline");
+            Task::Done(f())
+        }
+    }
+}
 
 /// One inventory item from a queue's `lpoptions -p` output and status.
 fn inventory_entry(queue: &str, uri: &str, lpoptions_out: &str, st: QueueStatus) -> Value {
@@ -1925,6 +2064,101 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// Threads of this process whose name (`comm`) is `name`.
+    fn threads_named(name: &str) -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .flatten()
+            .filter(|t| {
+                std::fs::read_to_string(t.path().join("comm")).is_ok_and(|c| c.trim_end() == name)
+            })
+            .count()
+    }
+
+    #[test]
+    fn run_with_timeout_starts_no_threads() {
+        // A thread inherits its creator's name, so helper threads started by
+        // run_with_timeout would show up under this unique caller name. It
+        // must start none: at the task limit that spawn panicked the agent.
+        const NAME: &str = "rwt-no-helpers";
+        let caller = thread::Builder::new()
+            .name(NAME.into())
+            .spawn(|| {
+                run_with_timeout(
+                    "sh",
+                    &["-c", "echo out; echo err >&2; sleep 0.4"],
+                    Duration::from_secs(10),
+                )
+            })
+            .unwrap();
+        let mut most = 0;
+        while !caller.is_finished() {
+            most = most.max(threads_named(NAME));
+            thread::sleep(Duration::from_millis(5));
+        }
+        let out = caller.join().unwrap().unwrap();
+        assert_eq!(
+            (out.stdout.as_str(), out.stderr.as_str()),
+            ("out\n", "err\n")
+        );
+        assert!(out.success);
+        assert_eq!(most, 1, "run_with_timeout started helper threads");
+    }
+
+    #[test]
+    fn run_with_timeout_drains_both_pipes_past_their_buffers() {
+        // 1 MiB on each pipe, interleaved: far more than a 64 KiB pipe holds,
+        // so the child only finishes if both are read while it runs.
+        let script = "i=0; while [ $i -lt 16 ]; do \
+                      head -c 65536 /dev/zero | tr '\\0' o; \
+                      head -c 65536 /dev/zero | tr '\\0' e >&2; i=$((i+1)); done; exit 3";
+        let out = run_with_timeout("sh", &["-c", script], Duration::from_secs(30)).unwrap();
+        assert!(!out.success);
+        assert_eq!(out.stdout.len(), 1 << 20);
+        assert_eq!(out.stderr.len(), 1 << 20);
+        assert!(out.stdout.bytes().all(|b| b == b'o'));
+        assert!(out.stderr.bytes().all(|b| b == b'e'));
+    }
+
+    #[test]
+    fn run_with_timeout_returns_when_the_child_exits() {
+        // A background grandchild keeps the pipes open for 5 s; the result
+        // is the child's, as soon as it exits.
+        let start = Instant::now();
+        let out = run_with_timeout(
+            "sh",
+            &["-c", "sleep 5 & echo queued"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(out.success);
+        assert_eq!(out.stdout, "queued\n");
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        // Missing commands are plain errors.
+        let err = run_with_timeout("/nonexistent/lp", &[], Duration::from_secs(1))
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn printer_queries_run_inline_when_no_thread_can_start() {
+        // A stack nobody can map fails like a full TasksMax does (EAGAIN).
+        let refused = || thread::Builder::new().stack_size(1 << (usize::BITS - 2));
+        let caller = thread::current().id();
+        thread::scope(|s| {
+            let inline = spawn_or_run(s, refused(), move || thread::current().id());
+            assert!(matches!(inline, Task::Done(_)));
+            assert_eq!(inline.join().unwrap(), caller);
+            let threaded = spawn_or_run(s, thread::Builder::new(), || thread::current().id());
+            assert_ne!(threaded.join().unwrap(), caller);
+        });
     }
 
     // --- lpstat status parsing (tests/test_printer_status.py) ---
@@ -2168,6 +2402,81 @@ mod tests {
     }
 
     #[test]
+    fn job_reasons_relabel_the_status_message() {
+        // A laser with a standing toner warning runs out of paper mid-job;
+        // only the job carries media-empty-error.
+        let local = "
+        printer-state (enum) = processing
+        printer-state-reasons (keyword) = toner-low-report
+        printer-state-message (textWithoutLanguage) =
+        ";
+        let jobs = "
+        job-id (integer) = 7
+        job-printer-state-reasons (keyword) = media-empty-error
+        ";
+        let ipp = |_: &str, body: &str, _: f64| {
+            if body.contains("Get-Jobs") {
+                jobs
+            } else {
+                local
+            }
+            .to_string()
+        };
+        let st = cups_queue_status_with("Laser", None, &ipp, &|_| String::new());
+        assert_eq!(st.status, "stopped");
+        assert_eq!(st.status_reasons, ["toner-low-report", "media-empty-error"]);
+        assert_eq!(
+            st.status_message.as_deref(),
+            Some("Toner low; Out of paper")
+        );
+
+        // The printer's own message still wins when it sent one.
+        let worded = local.replace(
+            "message (textWithoutLanguage) =",
+            "message (text) = Add paper",
+        );
+        let ipp = |_: &str, body: &str, _: f64| {
+            if body.contains("Get-Jobs") {
+                jobs.to_string()
+            } else {
+                worded.clone()
+            }
+        };
+        let st = cups_queue_status_with("Laser", None, &ipp, &|_| String::new());
+        assert_eq!(st.status_message.as_deref(), Some("Add paper"));
+    }
+
+    #[test]
+    fn device_reasons_relabel_the_status_message() {
+        let local = "
+        printer-state (enum) = processing
+        printer-state-reasons (keyword) = toner-low-report
+        ";
+        let device = "
+        printer-state (enum) = stopped
+        printer-state-reasons (keyword) = media-empty
+        ";
+        let ipp = |uri: &str, body: &str, _: f64| {
+            if body.contains("Get-Jobs") {
+                String::new()
+            } else if uri.contains("localhost") {
+                local.to_string()
+            } else {
+                device.to_string()
+            }
+        };
+        let st =
+            cups_queue_status_with("Laser", Some("ipp://laser.local/ipp/print"), &ipp, &|_| {
+                String::new()
+            });
+        assert_eq!(st.status, "stopped");
+        assert_eq!(
+            st.status_message.as_deref(),
+            Some("Toner low; Out of paper")
+        );
+    }
+
+    #[test]
     fn inventory_item_shape() {
         let item = inventory_item(
             "Zebra_1",
@@ -2375,6 +2684,59 @@ Device: uri = dnssd://Brother%20HL-L3280CDW%20series._ipp._tcp.local/
         assert_eq!(identify_zebra_url(&url, Duration::from_secs(2), None), None);
         let reqs = srv.requests.lock().unwrap();
         assert_eq!(reqs[0].header("User-Agent"), Some("vesyl-print-agent"));
+    }
+
+    /// One-shot HTTP server that sends the response head after `head_delay`
+    /// and the body `body_delay` later; returns `host:port`.
+    fn slow_http(head_delay: Duration, body_delay: Duration, body: &'static str) -> String {
+        use std::io::BufRead as _;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            thread::sleep(head_delay);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.flush();
+            thread::sleep(body_delay);
+            let _ = stream.write_all(body.as_bytes());
+        });
+        addr
+    }
+
+    #[test]
+    fn zebra_identify_times_each_phase_like_urllib() {
+        // Head after 1.2 s, body 1.2 s later: each step is inside urllib's
+        // 2 s per-operation timeout although the exchange takes 2.4 s.
+        let slow = Duration::from_millis(1200);
+        let ip = slow_http(slow, slow, ZEBRA_HOME_HTML);
+        assert_eq!(
+            identify_zebra_http(&ip, Duration::from_secs(2), None).as_deref(),
+            Some("Zebra ZD421-203dpi ZPL")
+        );
+        // A single phase over budget still fails, promptly.
+        let ip = slow_http(Duration::from_secs(3), Duration::ZERO, ZEBRA_HOME_HTML);
+        let start = Instant::now();
+        assert_eq!(
+            identify_zebra_http(&ip, Duration::from_millis(300), None),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

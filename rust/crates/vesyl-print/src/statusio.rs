@@ -1,13 +1,13 @@
 //! Agent ↔ LCD status file (JSON under state_dir).
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::util::{opt_str, utc_now_iso};
+use crate::util::{opt_str, utc_now_iso, write_durable};
 use crate::JsonObject;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -69,21 +69,12 @@ impl AgentStatus {
 }
 
 pub fn write_status(path: &Path, status: &mut AgentStatus) -> io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir)?;
     status.updated_at = Some(utc_now_iso());
     let mut raw = serde_json::to_string_pretty(&status.to_dict()).map_err(io::Error::other)?;
     raw.push('\n');
-    // Atomic write so LCD never reads a partial file.
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".status.")
-        .suffix(".tmp")
-        .tempfile_in(dir)?;
-    tmp.write_all(raw.as_bytes())?;
-    tmp.flush()?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    // Atomic write so LCD never reads a partial file. 0600 like Python's
+    // mkstemp; a root CLI run leaves it owned by the service user.
+    write_durable(path, raw.as_bytes(), 0o600, false)
 }
 
 pub fn read_status(path: &Path) -> Option<AgentStatus> {
@@ -144,6 +135,20 @@ mod tests {
         assert_eq!(loaded.pairing, PairingState::Paired);
         assert_eq!(loaded.organization_name.as_deref(), Some("Acme"));
         assert!(loaded.updated_at.is_some());
+    }
+
+    #[test]
+    fn status_is_private_and_leaves_no_temp_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("status.json");
+        for _ in 0..2 {
+            write_status(&path, &mut AgentStatus::default()).unwrap();
+        }
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let names: Vec<_> = fs::read_dir(td.path()).unwrap().collect();
+        assert_eq!(names.len(), 1, "temp file left behind");
     }
 
     #[test]
