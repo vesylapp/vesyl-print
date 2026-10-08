@@ -502,9 +502,10 @@ pub fn manifest_public_key(cfg: &Config) -> Result<Option<String>, UpdateError> 
 
 /// Open a URL for streaming. `file://` is supported for lab installs/tests.
 ///
-/// HTTP goes through [`net::agent`]: per-phase timeouts (a slow but steady
-/// download is not cut off at a fixed deadline, as with urllib), urllib's
-/// proxy rules, redirects followed, and no transparent decompression, so the
+/// HTTP goes through [`net::agent`]: urllib's timeouts (every read waits at
+/// most `timeouts.idle`, so a dead connection fails while a slow but steady
+/// download is not cut off at a fixed deadline), urllib's proxy rules chosen
+/// again on every redirect hop, and no transparent decompression, so the
 /// SHA-256 always covers the bytes the server sent.
 fn open_url(
     url: &str,
@@ -539,9 +540,10 @@ fn open_url(
     Ok(Box::new(resp.into_body().into_reader()))
 }
 
+/// GET `url` (the release manifest) into memory, Python's timeout=120.
 pub fn http_get_bytes(url: &str) -> Result<Vec<u8>, UpdateError> {
     let mut out = Vec::new();
-    open_url(url, Timeouts::ARTIFACT, &format!("fetching {url}"))?
+    open_url(url, Timeouts::MANIFEST, &format!("fetching {url}"))?
         .read_to_end(&mut out)
         .map_err(|e| UpdateError::new(format!("network error: {e}"), "download_failed"))?;
     Ok(out)
@@ -2743,6 +2745,7 @@ mod tests {
         let timeouts = Timeouts {
             connect: Duration::from_secs(1),
             response: Duration::from_secs(1),
+            idle: Duration::from_secs(1),
             body: Duration::from_secs(30),
         };
         let mut got = Vec::new();
@@ -2767,6 +2770,7 @@ mod tests {
         let timeouts = Timeouts {
             connect: Duration::from_secs(1),
             response: Duration::from_secs(1),
+            idle: Duration::from_secs(1),
             body: Duration::from_millis(500),
         };
         let started = std::time::Instant::now();
@@ -2776,5 +2780,33 @@ mod tests {
             .read_to_end(&mut got);
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// N15: a download whose connection goes silent fails after the idle
+    /// timeout (Python's per-read 300 s), not the 30-minute body budget.
+    #[test]
+    fn dead_connection_fails_after_the_idle_timeout() {
+        let srv = http_stub::serve(|_, s| {
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc");
+            let _ = s.flush();
+            std::thread::sleep(Duration::from_secs(20));
+        });
+        let timeouts = Timeouts {
+            idle: Duration::from_secs(1),
+            ..Timeouts::ARTIFACT
+        };
+        let started = std::time::Instant::now();
+        let mut got = Vec::new();
+        let err = open_url(&srv.base_url, timeouts, "downloading artifact")
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap_err();
+        let took = started.elapsed();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(took >= Duration::from_millis(900), "{took:?}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        // Python's per-operation values: manifest 120 s, artifact 300 s.
+        assert_eq!(Timeouts::MANIFEST.idle, Duration::from_secs(120));
+        assert_eq!(Timeouts::ARTIFACT.idle, Duration::from_secs(300));
     }
 }
