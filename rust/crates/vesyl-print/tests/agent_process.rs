@@ -127,7 +127,10 @@ impl Node {
             let _ = stderr.read_to_string(&mut text);
             text
         });
-        Agent { child, log }
+        Agent {
+            child,
+            log: Some(log),
+        }
     }
 
     fn status(&self) -> Value {
@@ -165,10 +168,34 @@ impl Node {
     }
 }
 
-/// A running `vesyl-print agent`.
+/// A running `vesyl-print agent`. Dropped before [`Agent::finish`] (a
+/// failed assertion) it kills the agent and prints its log: std leaves a
+/// child running, and an agent left behind outlives its temp dir.
 struct Agent {
     child: Child,
-    log: thread::JoinHandle<String>,
+    /// Collects the agent's log (its stderr); taken by `finish`.
+    log: Option<thread::JoinHandle<String>>,
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        // The log ends when the agent's stderr closes: never wait long for
+        // it, as a drop must not hang the test.
+        let Some(log) = self.log.take() else { return };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !log.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if log.is_finished() {
+            if let Ok(log) = log.join() {
+                eprintln!("log of the agent the test left running:\n{log}");
+            }
+        }
+    }
 }
 
 impl Agent {
@@ -216,7 +243,8 @@ impl Agent {
             }
             thread::sleep(Duration::from_millis(20));
         };
-        (status, self.log.join().unwrap())
+        let log = self.log.take().expect("the log is taken once");
+        (status, log.join().unwrap())
     }
 }
 
@@ -393,12 +421,57 @@ fn a_second_signal_quits_at_once() {
     let mut agent = agent_in_heartbeat(&node, &api);
     agent.signal(libc::SIGTERM);
     thread::sleep(Duration::from_millis(300));
-    assert!(agent.running(), "the first signal must not end the agent");
+    if !agent.running() {
+        // How it ended tells an exit (its heartbeat ended?) from death by a
+        // signal (one sent from elsewhere?).
+        let (status, log) = agent.finish(Duration::ZERO);
+        let _ = api.release.send(());
+        let status = status.expect("the agent has exited");
+        panic!(
+            "the first signal must not end the agent: exit code {:?}, signal {:?}\n{log}",
+            status.code(),
+            status.signal()
+        );
+    }
     agent.signal(libc::SIGINT);
     let (status, log) = agent.finish(Duration::from_secs(10));
     api.release.send(()).unwrap();
     let status = status.unwrap_or_else(|| panic!("still running after a second signal\n{log}"));
     assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}\n{log}");
+}
+
+/// A test that fails between starting the agent and `finish()` must not
+/// leave it running: it would outlive its temp dir, recreate the state
+/// there, and run the machine's real CUPS tools once the fake ones are gone.
+#[test]
+fn a_failing_test_leaves_no_agent_behind() {
+    if skip_as_root() {
+        return;
+    }
+    let api = held_heartbeat_api();
+    let node = Node::new(&api.base_url);
+    let agent = agent_in_heartbeat(&node, &api);
+    let pid = agent.child.id() as libc::pid_t;
+    // What a failed assertion's unwinding does.
+    drop(agent);
+    // Killed and reaped, it is no child of ours any more: -1 (ECHILD). A
+    // child's pid stays ours until it is reaped, so no other process can
+    // answer here.
+    // SAFETY: waitpid(2) for one pid, with no status to write.
+    let found = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+    if found == 0 {
+        // Still running: not leaked by this test either.
+        // SAFETY: kill(2) and waitpid(2) on our own child, not yet reaped.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+    }
+    let _ = api.release.send(());
+    assert_eq!(
+        found, -1,
+        "the agent outlived its handle (0: running, its pid: unreaped)"
+    );
 }
 
 /// The name of `uid` in /etc/passwd.
