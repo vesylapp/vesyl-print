@@ -1,0 +1,44 @@
+.github/workflows/release.yml
+  s_2883cba6969ed7::t_b68df1d3c97727 3-15,20-21,30,33,35-36,39-41,45-46,50-51,55,58,60,64,69-70,74-83,90-126,139-164,172-182,187,189-190,200-212,219
+  s_2883cba6969ed7::t_b09a9b865a2088 165-171,195-199,213-218,220-221
+tests/test_apply_update.py
+  s_2883cba6969ed7::t_3cecb3f2b40098 1-313
+tests/test_build_release.py
+  s_2883cba6969ed7::t_c23eb3e22b162a 319
+  s_2883cba6969ed7::t_f0596c0fa6e7ed 145-154
+  s_2883cba6969ed7::t_78a1ee8ac7b439 231-237,239-245
+  s_2883cba6969ed7::t_b041ec6e32bff7 1-144,155-230,238,246-318,320-428
+cli.py
+  s_2883cba6969ed7::t_3959a5732b7e09 607-609
+scripts/build-release.sh
+  s_2883cba6969ed7::t_4b814373aae447 10-18,22-25,30-31,36-40,44,51-55,66-71,82-83,90-116,118-143,149-158,164-165,167-168,170-176,178-210,214-218,221-225,259-276
+  s_2883cba6969ed7::t_9a7d0c849e1729 211-213
+  s_2883cba6969ed7::t_bdc4b3da5510d1 282,291
+scripts/apply-update
+  s_2883cba6969ed7::t_568a974d722c93 21-25
+  s_2883cba6969ed7::t_3600ae5ac88b20 10-12,15,20,26-40,47-72,78-86,89,99-105,108
+  s_2883cba6969ed7::t_99b65fcc9819d2 13-14,16-18
+tests/test_rust_bridge.py
+  s_2883cba6969ed7::t_24724e1cee98c2 1-6,10-11,13-14,17,19,30-65,97-192,195-197,208-288,306-352
+  s_2883cba6969ed7::t_45f311c16bdaa0 353-354
+agent.py
+  s_2883cba6969ed7::t_d4cddf2dff85b5 918-919
+  s_2883cba6969ed7::t_d2d366f221d1c5 9-10
+  s_2883cba6969ed7::t_1533359353b2ef 823-830,833-837,844,850-917,920-926
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e68e3d4569173bc6abb41b09a62bf08a930ce07f",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
