@@ -152,6 +152,10 @@ const PERMANENT_CODES: &[&str] = &[
     // CUPS canceled or aborted the job: it is final, and printing it again
     // on the next start would surprise whoever canceled it.
     "cups_job_failed",
+    // Image / PDF → ZPL: a PDF page, or the label graphic the options ask
+    // for, too large to rasterize within the conversion's memory limits.
+    "pdf_page_too_large",
+    "label_too_large",
 ];
 
 impl JobError {
