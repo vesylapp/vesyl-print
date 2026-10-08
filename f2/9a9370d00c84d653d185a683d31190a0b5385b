@@ -1,0 +1,30 @@
+rust/crates/vesyl-print/src/cloud.rs
+  s_2883cba6969ed7::t_7fbfef5672cd67 829-836
+  s_2883cba6969ed7::t_6c9d07ca1c4467 7-8
+  s_2883cba6969ed7::t_50939328ad365f 163-171,174,179
+  s_2883cba6969ed7::t_04e3be6ff585f9 845-857,859,862-863,868-869
+  s_2883cba6969ed7::t_ad587d5fdf2f44 960-969,973-977,981,984
+  s_2883cba6969ed7::t_96113158544e1d 970-972,978-980,982-983
+  s_2883cba6969ed7::t_1decc2024c637c 858,860-861,865-867
+  s_2883cba6969ed7::t_cfd62c331bf725 30-32
+  s_2883cba6969ed7::t_dc7dcfba39bd22 90-93
+  s_2883cba6969ed7::t_b737485ef5a08f 253
+  s_2883cba6969ed7::t_b2740b57b7df06 864
+  s_2883cba6969ed7::t_9b4a62bcd6cabb 178,180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f29a9370d00c84d653d185a683d31190a0b5385b",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
