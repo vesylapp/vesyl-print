@@ -16,6 +16,8 @@
 //! A failed job is reported **error**. When a retry cannot help (see
 //! [`JobError::is_permanent`]) its queue file moves to `queue/failed/`, out of
 //! [`JobStore::list_queued_ids`]; other failures keep it for the next drain.
+//! A retired file goes once the job finishes after all (a redelivery), or
+//! when [`JobStore::prune_processed`] finds it past the retention.
 //!
 //! On agent start: [`Pipeline::drain`] recovers queue/*.json left from crashes.
 //!
@@ -27,9 +29,12 @@
 
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -907,9 +912,12 @@ impl JobStore {
         JobStore::new(cfg.queue_dir(), cfg.processed_dir())
     }
 
+    /// Create queue/ and processed/. One that root (an operator's CLI run)
+    /// has to create goes to the owner of the closest directory above it, as
+    /// the files root writes there do, so the non-root agent can still use it.
     pub fn ensure(&self) -> std::io::Result<()> {
-        fs::create_dir_all(&self.queue_dir)?;
-        fs::create_dir_all(&self.processed_dir)
+        crate::util::create_dir_all_owned(&self.queue_dir)?;
+        crate::util::create_dir_all_owned(&self.processed_dir)
     }
 
     pub fn queue_path(&self, job_id: &str) -> PathBuf {
@@ -952,15 +960,18 @@ impl JobStore {
         Ok(path)
     }
 
+    /// Write the processed/<job_id> marker (a timestamp). It goes through
+    /// [`write_durable`]: the service user owns processed/, and a symlink it
+    /// put at that name is replaced by the rename, never written or chmodded
+    /// through, when root (an operator's print-test) writes the marker; root
+    /// also hands the marker to the directory's owner.
     pub fn mark_processed(&self, job_id: &str) -> std::io::Result<()> {
         if !valid_job_id(job_id) {
             return Err(invalid_id_error());
         }
         self.ensure()?;
-        let path = self.processed_path(job_id);
-        fs::write(&path, utc_now_iso() + "\n")?;
-        let _ = crate::util::set_mode(&path, 0o644);
-        Ok(())
+        let stamp = utc_now_iso() + "\n";
+        write_durable(&self.processed_path(job_id), stamp.as_bytes(), 0o644, false)
     }
 
     pub fn delete_queue(&self, job_id: &str) {
@@ -969,34 +980,64 @@ impl JobStore {
         }
     }
 
+    /// Remove `queue/failed/<job_id>.json`, left by an earlier permanent
+    /// failure, once the job has finished after all (say a redelivery
+    /// printed it to a queue that was fixed meanwhile).
+    pub fn delete_failed(&self, job_id: &str) {
+        if !valid_job_id(job_id) {
+            return;
+        }
+        if let Ok(dir) = FailedDir::open(&self.failed_dir()) {
+            let _ = dir.remove(&format!("{job_id}.json"));
+        }
+    }
+
     /// Move `queue/<name>.json` to `queue/failed/<name>.json` (atomic rename,
-    /// both directories fsynced). `name` is a queue file stem, normally the
-    /// job id. Returns the new path, or `None` when there was no queue file.
+    /// both directories fsynced) and set its mtime to now, so
+    /// [`JobStore::prune_failed`] keeps it for the full retention after the
+    /// failure. `name` is a queue file stem, normally the job id. Returns the
+    /// new path, or `None` when there was no queue file.
+    ///
+    /// The service user owns queue/, so when root runs this (an operator's
+    /// print-test) it could put a symlink where failed/ is, beforehand or
+    /// right after root makes it. failed/ is created with
+    /// [`crate::util::create_dir_all_owned`], which hands a new one to
+    /// queue/'s owner through a descriptor, never by path; then it is opened
+    /// without following a symlink and the file is moved relative to that
+    /// descriptor. A link there fails the call: nothing is chowned in, or
+    /// moved into, its target, and the queue file stays where it was.
     pub fn retire_queue(&self, name: &str) -> std::io::Result<Option<PathBuf>> {
+        self.retire_queue_with(name, &|_| {})
+    }
+
+    /// [`JobStore::retire_queue`]. `after_mkdir` runs once failed/ exists,
+    /// so tests can swap it for a symlink the way the service user could.
+    fn retire_queue_with(
+        &self,
+        name: &str,
+        after_mkdir: &dyn Fn(&Path),
+    ) -> std::io::Result<Option<PathBuf>> {
         if !plain_file_stem(name) {
             return Err(invalid_id_error());
         }
-        let src = self.queue_dir.join(format!("{name}.json"));
+        let file = format!("{name}.json");
+        let src = self.queue_dir.join(&file);
         if !src.is_file() {
             return Ok(None);
         }
         let dir = self.failed_dir();
-        if !dir.is_dir() {
-            fs::create_dir_all(&dir)?;
-            // A root CLI run (print-test) must not leave a root-owned failed/
-            // in the service user's queue: the agent could not retire into it.
-            if let Ok(q) = fs::metadata(&self.queue_dir) {
-                let _ = std::os::unix::fs::chown(&dir, Some(q.uid()), Some(q.gid()));
-            }
+        crate::util::create_dir_all_owned(&dir)?;
+        after_mkdir(&dir);
+        let failed = FailedDir::open(&dir)?;
+        failed.rename_into(&src, &file)?;
+        if let Err(e) = failed.touch(&file) {
+            log::debug!(target: LOG, "could not restart the retention of failed/{file}: {e}");
         }
-        let dst = dir.join(format!("{name}.json"));
-        fs::rename(&src, &dst)?;
-        for d in [&self.queue_dir, &dir] {
-            if let Ok(f) = File::open(d) {
-                let _ = f.sync_all();
-            }
+        if let Ok(f) = File::open(&self.queue_dir) {
+            let _ = f.sync_all();
         }
-        Ok(Some(dst))
+        let _ = failed.0.sync_all();
+        Ok(Some(dir.join(file)))
     }
 
     pub fn load_queued(&self, job_id: &str) -> Result<PrintJob, JobError> {
@@ -1057,21 +1098,29 @@ impl JobStore {
     /// many went. A marker whose queue file still exists is kept: the startup
     /// drain relies on it to skip re-printing a job that finished just before
     /// a crash. Per-file errors are ignored.
+    ///
+    /// The same pass prunes `queue/failed/` with the same retention (see
+    /// [`JobStore::prune_failed`]); those are logged here, not counted.
     pub fn prune_processed(&self, max_age: Duration) -> usize {
+        let failed = self.prune_failed(max_age);
+        if failed > 0 {
+            log::info!(
+                target: LOG,
+                "pruned {failed} file(s) from {} older than {} day(s)",
+                self.failed_dir().display(),
+                max_age.as_secs() / (24 * 60 * 60)
+            );
+        }
         let Ok(entries) = fs::read_dir(&self.processed_dir) else {
             return 0;
         };
         let now = SystemTime::now();
         let mut removed = 0;
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            let expired = meta.is_file()
-                && meta
-                    .modified()
-                    .ok()
-                    .and_then(|m| now.duration_since(m).ok())
-                    .is_some_and(|age| age >= max_age);
-            if !expired {
+            if !entry
+                .metadata()
+                .is_ok_and(|m| expired_file(&m, now, max_age))
+            {
                 continue;
             }
             let name = entry.file_name();
@@ -1083,6 +1132,106 @@ impl JobStore {
             }
         }
         removed
+    }
+
+    /// Delete `queue/failed/*.json` older than `max_age` (by mtime, which
+    /// [`JobStore::retire_queue`] sets when it retires a file) and return how
+    /// many went. Every permanently failed job keeps its whole payload there,
+    /// inline base64 content included, so without this the directory only
+    /// grows. Per-file errors are ignored.
+    pub fn prune_failed(&self, max_age: Duration) -> usize {
+        let Ok(entries) = fs::read_dir(self.failed_dir()) else {
+            return 0;
+        };
+        let now = SystemTime::now();
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let json = entry.file_name().as_bytes().ends_with(b".json");
+            if json
+                && entry
+                    .metadata()
+                    .is_ok_and(|m| expired_file(&m, now, max_age))
+                && fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        removed
+    }
+}
+
+/// True for a regular file (not followed if a symlink: `DirEntry::metadata`
+/// does not) last modified at least `max_age` before `now`.
+fn expired_file(meta: &fs::Metadata, now: SystemTime, max_age: Duration) -> bool {
+    meta.is_file()
+        && meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= max_age)
+}
+
+/// `queue/failed/`, opened without following a symlink at that name: the
+/// service user owns queue/ and could put one there while root (an operator's
+/// print-test) works in it. Names are resolved relative to this descriptor.
+struct FailedDir(File);
+
+impl FailedDir {
+    /// Open the directory; a symlink there fails (ENOTDIR or ELOOP).
+    fn open(path: &Path) -> io::Result<Self> {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .map(FailedDir)
+    }
+
+    /// rename(2) `src` to `name` in this directory.
+    fn rename_into(&self, src: &Path, name: &str) -> io::Result<()> {
+        let from = CString::new(src.as_os_str().as_bytes())?;
+        let to = CString::new(name)?;
+        // SAFETY: the descriptor is open and both strings are NUL-terminated.
+        let rc = unsafe {
+            libc::renameat(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                self.0.as_raw_fd(),
+                to.as_ptr(),
+            )
+        };
+        os_result(rc)
+    }
+
+    /// Set `name`'s times to now (a symlink's own, never its target's).
+    fn touch(&self, name: &str) -> io::Result<()> {
+        let name = CString::new(name)?;
+        // SAFETY: as above; a null `times` means "now" for both.
+        let rc = unsafe {
+            libc::utimensat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                std::ptr::null(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        os_result(rc)
+    }
+
+    /// unlink(2) `name` in this directory.
+    fn remove(&self, name: &str) -> io::Result<()> {
+        let name = CString::new(name)?;
+        // SAFETY: as above.
+        let rc = unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) };
+        os_result(rc)
+    }
+}
+
+/// A libc return code as an `io::Result` (errno on failure).
+fn os_result(rc: libc::c_int) -> io::Result<()> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -1372,10 +1521,12 @@ impl Pipeline {
         let io_err = |e: std::io::Error| JobError::new(e.to_string(), "job_error");
         store.ensure().map_err(io_err)?;
 
-        // 1. Already finished — idempotent success (drop any leftover queue file)
+        // 1. Already finished — idempotent success (drop any leftover queue
+        // file, and a failed/ copy from before it finished)
         if store.is_processed(job_id) {
             log::info!(target: LOG, "job {job_id} already processed — skip");
             store.delete_queue(job_id);
+            store.delete_failed(job_id);
             self.report(job, JobState::Printed, Some("already_processed"));
             return Ok(JobOutcome::Printed);
         }
@@ -1528,6 +1679,9 @@ impl Pipeline {
             .mark_processed(job_id)
             .map_err(|e| JobError::new(e.to_string(), "job_error"))?;
         store.delete_queue(job_id);
+        // An earlier delivery may have failed permanently (say before its
+        // queue was fixed); that copy describes a failure that is now moot.
+        store.delete_failed(job_id);
         log::info!(target: LOG, "job {job_id} {} → {}", outcome.as_str(), job.cups_name);
         Ok(outcome)
     }
@@ -1625,6 +1779,7 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
 
@@ -2314,6 +2469,293 @@ mod tests {
         assert!(st.is_processed("old-queued"));
         assert!(st.is_processed("new1"));
         assert_eq!(st.prune_processed(thirty_days), 0);
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// Move `path`'s mtime `age` into the past.
+    fn backdate(path: &Path, age: Duration) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// N07: a symlink planted at processed/<id> (the service user owns
+    /// processed/), here while the job is with CUPS as during a root
+    /// print-test, is replaced by the marker, never written or chmodded
+    /// through.
+    #[test]
+    fn marker_replaces_a_planted_symlink() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("victim");
+        fs::write(&victim, "keep\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+        let (link, target) = (st.processed_path("p-1"), victim.clone());
+        let p = Pipeline {
+            lp: Arc::new(move |_, _, _| {
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                Ok(None)
+            }),
+            ..test_pipeline()
+        };
+        assert_eq!(
+            p.process(&png_job("p-1"), &st).unwrap(),
+            JobOutcome::Delivered
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep\n");
+        assert_eq!(fs::metadata(&victim).unwrap().mode() & 0o777, 0o600);
+        let marker = st.processed_path("p-1");
+        assert!(fs::symlink_metadata(&marker).unwrap().is_file());
+        assert_eq!(fs::metadata(&marker).unwrap().mode() & 0o777, 0o644);
+        assert!(fs::read_to_string(&marker).unwrap().ends_with("+00:00\n"));
+        assert!(st.is_processed("p-1"));
+        let names: Vec<_> = fs::read_dir(&st.processed_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["p-1"], "no temp file left behind");
+    }
+
+    /// N07 as root (an operator's print-test): the victim is a root-owned
+    /// file, and the marker goes to the owner of processed/.
+    ///
+    /// Needs root: `sudo cargo test`, or unprivileged with
+    /// `unshare --map-root-user --map-auto <test binary> --include-ignored root_`.
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_marker_replaces_a_planted_symlink() {
+        if !is_root() {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        // Directories root creates go to the service user too.
+        let st = store(td.path());
+        for d in [&st.queue_dir, &st.processed_dir] {
+            assert_eq!(fs::metadata(d).unwrap().uid(), 1000, "{}", d.display());
+        }
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("shadow");
+        fs::write(&victim, "root:secret-hash\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+        let (link, target) = (st.processed_path("p-1"), victim.clone());
+        let p = Pipeline {
+            lp: Arc::new(move |_, _, _| {
+                std::os::unix::fs::symlink(&target, &link).unwrap();
+                std::os::unix::fs::lchown(&link, Some(1000), Some(1000)).unwrap();
+                Ok(None)
+            }),
+            ..test_pipeline()
+        };
+        assert_eq!(
+            p.process(&png_job("p-1"), &st).unwrap(),
+            JobOutcome::Delivered
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "root:secret-hash\n");
+        let v = fs::metadata(&victim).unwrap();
+        assert_eq!((v.uid(), v.mode() & 0o777), (0, 0o600));
+        let m = fs::symlink_metadata(st.processed_path("p-1")).unwrap();
+        assert!(m.is_file());
+        assert_eq!((m.uid(), m.gid(), m.mode() & 0o777), (1000, 1000, 0o644));
+    }
+
+    /// N08: queue/failed/ is pruned in the same pass as the markers, with
+    /// the same retention. Only `*.json` files go.
+    #[test]
+    fn prune_processed_also_prunes_old_failed_files() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        for id in ["f-old", "f-new"] {
+            st.write_queue(&png_job(id)).unwrap();
+            st.retire_queue(id).unwrap().unwrap();
+        }
+        let failed = st.failed_dir();
+        fs::write(failed.join("notes.txt"), "kept").unwrap();
+        fs::create_dir(failed.join("dir.json")).unwrap();
+        st.mark_processed("m-old").unwrap();
+        for p in [
+            failed.join("f-old.json"),
+            failed.join("notes.txt"),
+            st.processed_path("m-old"),
+        ] {
+            backdate(&p, 31 * DAY);
+        }
+        let retention = 30 * DAY;
+        // Counts the markers only (the agent logs it as such).
+        assert_eq!(st.prune_processed(retention), 1);
+        assert!(!st.is_processed("m-old"));
+        assert!(!failed.join("f-old.json").exists());
+        assert!(failed.join("f-new.json").is_file());
+        assert!(failed.join("notes.txt").is_file());
+        assert!(failed.join("dir.json").is_dir());
+
+        backdate(&failed.join("f-new.json"), 31 * DAY);
+        assert_eq!(st.prune_failed(retention), 1);
+        assert!(!failed.join("f-new.json").exists());
+        assert_eq!(st.prune_failed(retention), 0);
+        // No failed/ at all is fine.
+        let fresh = store(&td.path().join("fresh"));
+        assert_eq!(fresh.prune_failed(retention), 0);
+    }
+
+    /// A job can sit in queue/ for weeks (retried on each start) before it
+    /// fails for good; its failed/ copy still gets the whole retention.
+    #[test]
+    fn retiring_restarts_the_retention_clock() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        st.write_queue(&png_job("slow")).unwrap();
+        backdate(&st.queue_path("slow"), 40 * DAY);
+        let path = st.retire_queue("slow").unwrap().unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default();
+        assert!(age < DAY, "{age:?}");
+        assert_eq!(st.prune_failed(30 * DAY), 0);
+        assert!(path.is_file());
+    }
+
+    /// N08: a job retired after a permanent failure that prints later (a
+    /// redelivery once its queue is fixed) leaves no failed/ copy behind;
+    /// nor does one that turns out to be processed already.
+    #[test]
+    fn finishing_a_job_drops_its_failed_copy() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let j = png_job("r-1");
+        let no_queue = Pipeline {
+            lp: Arc::new(|_, _, _| {
+                Err(lp_failure(
+                    "lp: Error - The printer or class does not exist.",
+                ))
+            }),
+            ..test_pipeline()
+        };
+        assert_eq!(no_queue.process(&j, &st).unwrap_err().code, "unknown_queue");
+        no_queue.process(&png_job("other"), &st).unwrap_err();
+        let copy = st.failed_dir().join("r-1.json");
+        assert!(copy.is_file());
+
+        assert_eq!(
+            test_pipeline().process(&j, &st).unwrap(),
+            JobOutcome::Delivered
+        );
+        assert!(st.is_processed("r-1") && !st.has_queue_file("r-1"));
+        assert!(!copy.exists());
+        // Another job's copy stays.
+        assert!(st.failed_dir().join("other.json").is_file());
+
+        fs::write(&copy, "{}").unwrap();
+        assert_eq!(
+            test_pipeline().process(&j, &st).unwrap(),
+            JobOutcome::Printed
+        );
+        assert!(!copy.exists());
+
+        // Ids that are not file names are ignored: queue/x.json is not failed/../x.
+        fs::write(st.queue_dir.join("x.json"), "{}").unwrap();
+        st.delete_failed("../x");
+        assert!(st.queue_dir.join("x.json").is_file());
+    }
+
+    /// Swaps failed/, just made, for a symlink to `target`, as the service
+    /// user (which owns queue/) could while root works there.
+    fn swap_failed_for(target: &Path) -> impl Fn(&Path) + '_ {
+        move |made: &Path| {
+            fs::rename(made, made.with_extension("moved")).unwrap();
+            std::os::unix::fs::symlink(target, made).unwrap();
+        }
+    }
+
+    /// The open met a symlink and refused it: ENOTDIR on Linux, where
+    /// O_DIRECTORY is checked before O_NOFOLLOW's ELOOP.
+    fn refused_link(e: &io::Error) -> bool {
+        matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
+    }
+
+    /// N09: retiring never goes through a symlink at queue/failed, whether
+    /// swapped in right after failed/ was made or planted beforehand: nothing
+    /// lands in (or is removed from) the link's target, and the queue file
+    /// stays put.
+    #[test]
+    fn retire_never_follows_a_symlink_at_failed() {
+        let td = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        st.write_queue(&png_job("s-1")).unwrap();
+        let moved_into_target = || fs::read_dir(elsewhere.path()).unwrap().count() > 0;
+        let result = st.retire_queue_with("s-1", &swap_failed_for(elsewhere.path()));
+        assert!(!moved_into_target(), "moved into the link's target");
+        assert!(refused_link(&result.unwrap_err()));
+        assert!(st.has_queue_file("s-1"));
+
+        // The link is still there for the next call.
+        let result = st.retire_queue("s-1");
+        assert!(!moved_into_target(), "moved into the link's target");
+        assert!(refused_link(&result.unwrap_err()));
+        assert!(st.has_queue_file("s-1"));
+        fs::write(elsewhere.path().join("s-1.json"), "{}").unwrap();
+        st.delete_failed("s-1");
+        assert!(elsewhere.path().join("s-1.json").is_file());
+
+        // Without the link, retiring works again.
+        fs::remove_file(st.failed_dir()).unwrap();
+        assert!(st.retire_queue("s-1").unwrap().unwrap().is_file());
+        assert!(!st.has_queue_file("s-1"));
+    }
+
+    /// N09 as root (an operator's print-test that fails for good): failed/
+    /// goes to the owner of queue/ without a chown by path, so a link
+    /// swapped in for it never gets its target handed to the service user.
+    ///
+    /// Needs root: `sudo cargo test`, or unprivileged with
+    /// `unshare --map-root-user --map-auto <test binary> --include-ignored root_`.
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_retire_hands_failed_to_the_queue_owner_never_a_link_target() {
+        if !is_root() {
+            return;
+        }
+        let owner = |p: &Path| {
+            let m = fs::symlink_metadata(p).unwrap();
+            (m.uid(), m.gid())
+        };
+        let td = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        let st = store(td.path());
+        assert_eq!(owner(&st.queue_dir), (1000, 1000));
+        st.write_queue(&png_job("t-1")).unwrap();
+        let moved = st.retire_queue("t-1").unwrap().unwrap();
+        // The agent can retire into, and prune, what root made.
+        assert_eq!(owner(&st.failed_dir()), (1000, 1000));
+        assert_eq!(owner(&moved), (1000, 1000));
+
+        let rooted = tempfile::tempdir().unwrap();
+        let before = owner(rooted.path());
+        assert_eq!(before.0, 0);
+        fs::remove_dir_all(st.failed_dir()).unwrap();
+        st.write_queue(&png_job("t-2")).unwrap();
+        let result = st.retire_queue_with("t-2", &swap_failed_for(rooted.path()));
+        assert_eq!(owner(rooted.path()), before, "link target chowned");
+        assert_eq!(fs::read_dir(rooted.path()).unwrap().count(), 0);
+        assert!(refused_link(&result.unwrap_err()));
+        assert!(st.has_queue_file("t-2"));
+        // Planted beforehand: the same.
+        let result = st.retire_queue("t-2");
+        assert_eq!(owner(rooted.path()), before, "link target chowned");
+        assert_eq!(fs::read_dir(rooted.path()).unwrap().count(), 0);
+        assert!(refused_link(&result.unwrap_err()));
     }
 
     fn no_fetch() -> FetchFn {

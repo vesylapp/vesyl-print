@@ -40,7 +40,11 @@ const LOG: &str = "vesyl-print.cable";
 
 pub const CHANNEL_NAME: &str = "PrintNodeChannel";
 
-/// Keepalive like websocket-client `run_forever(ping_interval=25, ping_timeout=10)`.
+/// Keepalive like websocket-client `run_forever(ping_interval=25, ping_timeout=10)`:
+/// a WebSocket ping every PING_INTERVAL, and the session ends when no Pong
+/// has come back PING_TIMEOUT later. Only a Pong counts. ActionCable's own
+/// `{"type":"ping"}` text frames (every 3 s) and any other frame show that
+/// the server still writes, not that it still reads what we send.
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -145,6 +149,8 @@ struct Settings {
     env: EnvFn,
     perform_timeout: Duration,
     subscribe_timeout: Duration,
+    ping_interval: Duration,
+    ping_timeout: Duration,
 }
 
 impl Default for Settings {
@@ -153,6 +159,8 @@ impl Default for Settings {
             env: Box::new(|key| std::env::var(key).ok()),
             perform_timeout: PERFORM_TIMEOUT,
             subscribe_timeout: SUBSCRIBE_TIMEOUT,
+            ping_interval: PING_INTERVAL,
+            ping_timeout: PING_TIMEOUT,
         }
     }
 }
@@ -634,6 +642,8 @@ impl Inner {
         queued: &mpsc::Receiver<Outgoing>,
         wake: &UnixStream,
     ) -> Result<(), BoxError> {
+        let (ping_interval, ping_timeout) =
+            (self.settings.ping_interval, self.settings.ping_timeout);
         let mut last_ping = Instant::now();
         let mut awaiting_pong: Option<Instant> = None;
         // poll() cannot see frames the handshake (or the previous read)
@@ -646,17 +656,19 @@ impl Inner {
             let now = Instant::now();
             let mut wake_at = now + MAX_IDLE;
             match awaiting_pong {
-                Some(sent) if now >= sent + PING_TIMEOUT => {
+                // Judged only once everything received so far has been read:
+                // a pong that came in while a callback ran is not missing.
+                Some(sent) if now >= sent + ping_timeout && !maybe_buffered => {
                     return Err("ping/pong timed out".into())
                 }
-                Some(sent) => wake_at = wake_at.min(sent + PING_TIMEOUT),
-                None if now >= last_ping + PING_INTERVAL => {
+                Some(sent) => wake_at = wake_at.min(sent + ping_timeout),
+                None if now >= last_ping + ping_interval => {
                     ws.send(Message::Ping(Default::default()))?;
                     last_ping = now;
                     awaiting_pong = Some(now);
-                    wake_at = wake_at.min(now + PING_TIMEOUT);
+                    wake_at = wake_at.min(now + ping_timeout);
                 }
-                None => wake_at = wake_at.min(last_ping + PING_INTERVAL),
+                None => wake_at = wake_at.min(last_ping + ping_interval),
             }
             if let Some(deadline) = self.confirm_deadline() {
                 if now >= deadline {
@@ -684,19 +696,21 @@ impl Inner {
             }
 
             match read_nonblocking(ws) {
+                // Text (ActionCable's pings included), Ping and Binary frames
+                // leave the pong wait alone; see PING_INTERVAL.
                 Ok(Message::Text(text)) => {
                     maybe_buffered = true;
-                    awaiting_pong = None;
                     self.handle_text(text.as_str());
+                }
+                Ok(Message::Pong(_)) => {
+                    maybe_buffered = true;
+                    awaiting_pong = None;
                 }
                 Ok(Message::Close(frame)) => {
                     maybe_buffered = true;
                     log::info!(target: LOG, "cable closed status={:?}", frame.map(|f| f.code));
                 }
-                Ok(_) => {
-                    maybe_buffered = true;
-                    awaiting_pong = None;
-                }
+                Ok(_) => maybe_buffered = true,
                 Err(tungstenite::Error::Io(e))
                     if matches!(
                         e.kind(),
@@ -1831,6 +1845,127 @@ mod tests {
         );
         assert!(!client.connected());
         server.join().unwrap();
+    }
+
+    /// N05: a server that stopped reading (so it never answers our WebSocket
+    /// ping, nor sees a perform) but still sends ActionCable pings. Every text
+    /// frame used to reset the pong wait, so the session stayed "subscribed"
+    /// while each perform vanished into the socket buffer instead of falling
+    /// back to REST.
+    #[test]
+    fn server_that_stopped_reading_is_dropped_despite_its_pings() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut ws, _, _) = accept_ws(&listener);
+            welcome_and_confirm(&mut ws);
+            // Never reads again; pings until told to stop or the client is gone.
+            let ping = r#"{"type":"ping","message":1700000000}"#;
+            while done_rx.recv_timeout(Duration::from_millis(20)).is_err() {
+                if ws.send(Message::text(ping)).is_err() {
+                    break;
+                }
+            }
+        });
+        let disconnected = Arc::new(Flag::default());
+        let d = disconnected.clone();
+        let client = ActionCableClient::new(
+            &format!("ws://{addr}/print/cable"),
+            ClientCallbacks {
+                on_disconnected: Some(Arc::new(move || d.set())),
+                ..Default::default()
+            },
+        )
+        .tuned(|s| {
+            s.ping_interval = Duration::from_millis(200);
+            s.ping_timeout = Duration::from_millis(300);
+        });
+        client.start().unwrap();
+        assert!(client.wait_subscribed(Duration::from_secs(5)));
+        let t = Instant::now();
+        // Until the session drops, a perform only has to reach the socket buffer.
+        assert!(client
+            .perform("job_status", obj(json!({ "job_id": "j1" })))
+            .is_ok());
+        assert!(
+            disconnected.wait(Duration::from_secs(5)),
+            "a server that never pongs is dropped"
+        );
+        // One ping interval plus the timeout: 0.5 s here, at most 35 s by default.
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(!client.connected() && !client.subscribed());
+        // So the agent's performs fail and it falls back to REST.
+        assert!(client
+            .perform("job_status", obj(json!({ "job_id": "j1" })))
+            .is_err());
+        let _ = done_tx.send(());
+        server.join().unwrap();
+    }
+
+    /// The pong wait is judged only after reading what has already arrived:
+    /// a pong that came in while a slow callback ran keeps the session, and a
+    /// server that answers every ping stays connected across many of them.
+    #[test]
+    fn pong_that_arrived_during_a_slow_callback_counts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut ws, _, _) = accept_ws(&listener);
+            welcome_and_confirm(&mut ws);
+            ws.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(5)))
+                .unwrap();
+            let mut pings = 0;
+            while done_rx.try_recv().is_err() {
+                match ws.read() {
+                    // tungstenite writes the frame we send ahead of the pong it
+                    // owes, so the first pong sits behind a slow message.
+                    Ok(Message::Ping(_)) => {
+                        pings += 1;
+                        if pings == 1 {
+                            let slow = json!({
+                                "identifier": channel_identifier(),
+                                "message": {"type": "slow"},
+                            });
+                            ws.send(Message::text(slow.to_string())).unwrap();
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                }
+            }
+            pings
+        });
+        let disconnected = Arc::new(Flag::default());
+        let d = disconnected.clone();
+        let client = ActionCableClient::new(
+            &format!("ws://{addr}/print/cable"),
+            ClientCallbacks {
+                // Outlasts the pong timeout while the pong is already buffered.
+                on_message: Some(Arc::new(|_| thread::sleep(Duration::from_millis(1500)))),
+                on_disconnected: Some(Arc::new(move || d.set())),
+                ..Default::default()
+            },
+        )
+        .tuned(|s| {
+            s.ping_interval = Duration::from_millis(100);
+            s.ping_timeout = Duration::from_millis(800);
+        });
+        client.start().unwrap();
+        assert!(client.wait_subscribed(Duration::from_secs(5)));
+        assert!(
+            !disconnected.wait(Duration::from_millis(2800)),
+            "session dropped"
+        );
+        assert!(client.subscribed());
+        let _ = done_tx.send(());
+        client.stop(Duration::from_secs(2));
+        let pings = server.join().unwrap();
+        assert!(pings >= 4, "only {pings} ping(s) answered");
     }
 
     /// C21: an IPv6-literal cable URL connects (the bracketed host used to go
