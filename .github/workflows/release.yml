@@ -48,8 +48,13 @@ jobs:
         with:
           workspaces: rust
 
+      # Own venv: the runner's system Python is externally managed (PEP 668),
+      # and $RUNNER_TEMP keeps it out of the rsync'd release tree.
       - name: Install cargo-zigbuild
-        run: pip install ziglang cargo-zigbuild
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet ziglang cargo-zigbuild
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
 
       - name: Test Rust agent
         working-directory: rust
