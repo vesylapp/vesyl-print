@@ -191,7 +191,8 @@ pub struct Deps {
     pub cfg: Config,
     pub update_env: UpdateEnv,
     pub inventory: Box<dyn Fn() -> Result<Vec<Value>, String>>,
-    /// The job pipeline `test-print` runs (with `wait_cups` off).
+    /// The job pipeline `print-test` runs, and `test-print` with
+    /// `wait_cups` off.
     pub pipeline: Pipeline,
     /// Holds `test-labels/` (see [`default_assets_dir`]).
     pub assets_dir: PathBuf,
@@ -739,6 +740,27 @@ fn hb_str(hb: &JsonObject, a: &str, b: &str) -> Option<String> {
         .map(crate::util::py_str)
 }
 
+/// `--version` as given: a release version, a leading `v` allowed (`v0.5.0`
+/// is 0.5.0, as in the release tags).
+fn version_arg(raw: &str) -> Result<String, Die> {
+    let v = update::normalize_version(raw);
+    if !update::is_version(v) {
+        return die(format!(
+            "invalid --version {raw:?}: expected a release version such as 0.5.0"
+        ));
+    }
+    Ok(v.to_string())
+}
+
+/// A file argument with a leading `~/` taken from `$HOME`, as a shell
+/// expands it in a word of its own but not in `--file=~/…`.
+fn expand_path(p: &Path) -> PathBuf {
+    match p.to_str() {
+        Some(s) => jobs::expand_user(s),
+        None => p.to_path_buf(),
+    }
+}
+
 fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResult {
     let cfg = &deps.cfg;
     cfg.ensure_dirs()?;
@@ -798,7 +820,14 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
             let pem = update::manifest_public_key(cfg)?;
             let manifest = update::fetch_manifest(&url)?;
             let previous = update::slot_before_activation(env);
-            update::apply_release(&manifest, env, pem.as_deref(), cfg.update_require_signature)?;
+            // No stop to honor: a signal ends the CLI outright.
+            update::apply_release(
+                &manifest,
+                env,
+                pem.as_deref(),
+                cfg.update_require_signature,
+                &AtomicBool::new(false),
+            )?;
             writeln!(out, "applied {}", manifest.version)?;
             after_manual_activation(deps, out, &manifest.version, previous, restart)?;
             Ok(0)
@@ -806,6 +835,7 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
 
         UpdateAction::Apply { version, .. } => {
             // Online: heartbeat desired + update_url, or explicit --version.
+            let version = version.as_deref().map(version_arg).transpose()?;
             let Some(creds) = auth::load_credentials(&cfg.credentials_path()) else {
                 return die("not paired and no --manifest-url / --file");
             };
@@ -813,13 +843,25 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
             if let Some(v) = version {
                 // The heartbeat's update_url is the manifest of the server's
                 // desired version: it serves for `v` only when that is `v` as
-                // written (version_cmp would take 0.9.1-rc.1 for 0.9.1). Any
-                // other version's manifest comes from releases_base_url.
-                let server_wants_v =
-                    hb_str(&hb, "desired_agent_version", "desired_version").as_deref() == Some(&v);
-                let url = hb_str(&hb, "update_url", "manifest_url")
-                    .filter(|_| server_wants_v)
-                    .unwrap_or_else(|| update::default_manifest_url(&cfg.releases_base_url, &v));
+                // written, a leading `v` aside (version_cmp would take
+                // 0.9.1-rc.1 for 0.9.1). Any other version's manifest comes
+                // from releases_base_url. Either way, a manifest for another
+                // version is refused before anything is installed.
+                let server_wants_v = hb_str(&hb, "desired_agent_version", "desired_version")
+                    .is_some_and(|d| update::normalize_version(&d) == v);
+                let offered = hb_str(&hb, "update_url", "manifest_url").filter(|_| server_wants_v);
+                let url = match offered {
+                    Some(url) => url,
+                    None if !cfg.releases_base_url.trim().is_empty() => {
+                        update::default_manifest_url(&cfg.releases_base_url, &v)
+                    }
+                    None => {
+                        return die(format!(
+                            "no manifest URL for {v}: releases_base_url is not set, and the \
+                             server does not offer {v} (pass --manifest-url)"
+                        ))
+                    }
+                };
                 hb.insert("desired_agent_version".into(), json!(v));
                 hb.insert("update_url".into(), json!(url));
             }
@@ -836,8 +878,17 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
                 auto_update_enabled: true,
                 ..cfg.clone()
             };
-            let ust =
-                update::maybe_update_from_heartbeat(&hb, &manual, &apply_env, None, None, false);
+            // From a fresh status: what holds or backs off the agent's own
+            // attempts does not apply to one asked for here.
+            let ust = update::maybe_update_from_heartbeat(
+                &hb,
+                &manual,
+                &apply_env,
+                None,
+                None,
+                false,
+                &AtomicBool::new(false),
+            );
             update::write_update_status(&cfg.update_status_path(), &ust)?;
             if ust.status == update::STATUS_PENDING_HEALTH && env.restart {
                 update::restart_services(env.apply_helper.as_deref());
@@ -851,14 +902,35 @@ fn cmd_update(deps: &Deps, out: &mut dyn Write, action: UpdateAction) -> CmdResu
         }
 
         UpdateAction::Rollback { version, restart } => {
+            let version = version.as_deref().map(version_arg).transpose()?;
+            let left = update::current_release_version(&env.install_root);
             let ver = update::rollback(
                 &env.install_root,
                 version.as_deref(),
                 env.apply_helper.as_deref(),
             )?;
             writeln!(out, "rolled back to {ver}")?;
-            if restart {
+            // Recorded, or the agent installs the version left again at its
+            // next heartbeat while the server still asks for it.
+            if let Some(left) = left.filter(|l| *l != ver) {
+                update::record_manual_rollback(&cfg.update_status_path(), &left, &ver).map_err(
+                    |e| {
+                        Die(format!(
+                            "rolled back to {ver} but could not record it ({e}): the agent may \
+                             install {left} again; services not restarted"
+                        ))
+                    },
+                )?;
+                writeln!(
+                    out,
+                    "holding {left}: the agent will not install it again until the server \
+                     asks for another version (or `update apply` does)"
+                )?;
+            }
+            // `restart` is false only in tests (UpdateEnv::detect always sets it).
+            if restart && env.restart {
                 update::restart_services(env.apply_helper.as_deref());
+                writeln!(out, "services restarted")?;
             }
             Ok(0)
         }
@@ -875,6 +947,7 @@ fn apply_local(
     restart: bool,
 ) -> CmdResult {
     let cfg = &deps.cfg;
+    let (file, manifest) = (expand_path(file), manifest.map(expand_path));
     let Some(manifest_path) = manifest.filter(|p| p.is_file()) else {
         return die("--manifest PATH required with --file");
     };
@@ -883,7 +956,7 @@ fn apply_local(
         return die("manifest must be a JSON object");
     };
     let manifest = ReleaseManifest::from_dict(&data)?;
-    let tarball = fs::canonicalize(file)
+    let tarball = fs::canonicalize(&file)
         .ok()
         .filter(|p| p.is_file())
         .ok_or_else(|| Die(format!("file not found: {}", file.display())))?;
@@ -959,8 +1032,9 @@ fn after_manual_activation(
 fn cmd_print_test(deps: &Deps, out: &mut dyn Write, args: PrintTestArgs) -> CmdResult {
     let cfg = &deps.cfg;
     cfg.ensure_dirs()?;
-    if !args.file.is_file() {
-        return die(format!("file not found: {}", args.file.display()));
+    let file = expand_path(&args.file);
+    if !file.is_file() {
+        return die(format!("file not found: {}", file.display()));
     }
     let queue = match args.queue {
         Some(q) => q,
@@ -974,7 +1048,7 @@ fn cmd_print_test(deps: &Deps, out: &mut dyn Write, args: PrintTestArgs) -> CmdR
         }
     };
     let job = jobs::job_from_local_file(
-        &args.file,
+        &file,
         &queue,
         None,
         args.title.as_deref(),
@@ -984,7 +1058,7 @@ fn cmd_print_test(deps: &Deps, out: &mut dyn Write, args: PrintTestArgs) -> CmdR
     .map_err(|e| Die(e.message))?;
     let store = JobStore::from_config(cfg);
     writeln!(out, "job_id:     {}", job.id)?;
-    writeln!(out, "file:       {}", args.file.display())?;
+    writeln!(out, "file:       {}", file.display())?;
     writeln!(out, "cups_name:  {queue}")?;
     writeln!(
         out,
@@ -994,7 +1068,8 @@ fn cmd_print_test(deps: &Deps, out: &mut dyn Write, args: PrintTestArgs) -> CmdR
     writeln!(out, "queue_dir:  {}", store.queue_dir.display())?;
     out.flush()?;
 
-    let state = Pipeline::default()
+    let state = deps
+        .pipeline
         .process(&job, &store)
         .map_err(|e| Die(format!("print failed: {} ({})", e.message, e.code)))?;
     writeln!(out, "result:     {}", state.as_str())?;
@@ -1875,7 +1950,11 @@ mod tests {
         );
         let (r, out) = run_args(&d, &["update", "rollback"]);
         assert_eq!(r.unwrap(), 0);
-        assert_eq!(out, "rolled back to 0.3.0\n");
+        assert_eq!(
+            out,
+            "rolled back to 0.3.0\nholding 0.4.0: the agent will not install it again \
+             until the server asks for another version (or `update apply` does)\n"
+        );
         assert_eq!(
             update::current_release_version(root).as_deref(),
             Some("0.3.0")
@@ -2216,7 +2295,7 @@ mod tests {
             running_from_slot: false,
             restart: false,
         };
-        update::apply_release(&manifest, &env, None, false).unwrap();
+        update::apply_release(&manifest, &env, None, false, &AtomicBool::new(false)).unwrap();
         assert_eq!(
             update::current_release_version(&env.install_root).as_deref(),
             Some("0.9.0")
@@ -2329,6 +2408,7 @@ mod tests {
             update::WhoamiResult::Error,
             Some("timeout"),
             None,
+            &AtomicBool::new(false),
         );
         assert_eq!(after.status, update::STATUS_ROLLED_BACK);
         assert_eq!(
@@ -2648,6 +2728,500 @@ mod tests {
             update::current_release_version(&d.update_env.install_root).as_deref(),
             Some("0.8.0")
         );
+    }
+
+    // --- update apply --version, update rollback, holds, the agent's stop -------
+
+    /// Save credentials: `d`'s node is paired.
+    fn pair(d: &Deps) {
+        let creds = auth::credentials_from_pair_response(
+            json!({"node_id": "n1", "device_token": "tok"})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        auth::save_credentials(&d.cfg.credentials_path(), &creds).unwrap();
+    }
+
+    /// The version `current` points at in `d`'s install root.
+    fn current(d: &Deps) -> Option<String> {
+        update::current_release_version(&d.update_env.install_root)
+    }
+
+    /// `update apply --version` takes a leading `v` (`v0.9.1` is 0.9.1) and
+    /// refuses anything else that is not a version before it does anything
+    /// (`v1.2.3` used to read as 0.2.3, and reinstall a running 1.2.3). A
+    /// manifest of another version is refused before anything is installed;
+    /// with no manifest URL, it says so rather than fetch a relative one.
+    #[test]
+    fn update_apply_version_is_checked() {
+        use std::os::unix::fs::MetadataExt;
+        let td = tempfile::tempdir().unwrap();
+        let cdn = td.path().join("cdn");
+        fs::create_dir_all(&cdn).unwrap();
+        let (_, m091) = release(td.path(), "0.9.1");
+        fs::copy(&m091, cdn.join("vesyl-print-0.9.1.manifest.json")).unwrap();
+        // Published under 0.9.2's name: the manifest of 0.9.3.
+        let (_, m093) = release(td.path(), "0.9.3");
+        fs::copy(&m093, cdn.join("vesyl-print-0.9.2.manifest.json")).unwrap();
+        let srv = http_stub::serve(|_, s| respond(s, 200, &[], br#"{"ok": true}"#));
+        let node = |releases_base_url: String, running: &str| {
+            let d = deps(td.path(), &srv.base_url);
+            Deps {
+                cfg: Config {
+                    update_require_signature: false,
+                    releases_base_url,
+                    ..d.cfg
+                },
+                update_env: UpdateEnv {
+                    running_version: running.into(),
+                    ..d.update_env
+                },
+                ..d
+            }
+        };
+        let d = node(file_url(&cdn), "0.8.0");
+        installed_slot(&d, "0.8.0");
+        pair(&d);
+
+        for bad in ["latest", "0.9", "v", "1.2.3.staging", ""] {
+            let (r, out) = run_args(&d, &["update", "apply", "--version", bad]);
+            assert_eq!(
+                r.unwrap_err().0,
+                format!("invalid --version {bad:?}: expected a release version such as 0.5.0")
+            );
+            assert_eq!(out, "");
+        }
+        assert!(srv.requests().is_empty(), "a heartbeat was sent");
+
+        let (r, out) = run_args(&d, &["update", "apply", "--version", "v0.9.1"]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        let st: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(st["status"], update::STATUS_PENDING_HEALTH, "{out}");
+        assert_eq!(st["target_version"], "0.9.1");
+        assert_eq!(current(&d).as_deref(), Some("0.9.1"));
+
+        let (r, out) = run_args(&d, &["update", "apply", "--version", "0.9.2"]);
+        assert_eq!(r.unwrap(), 1, "{out}");
+        let st: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(st["status"], update::STATUS_FAILED);
+        assert_eq!(st["last_error"], "manifest is for version 0.9.3, not 0.9.2");
+        assert_eq!(st["last_error_code"], "version_mismatch");
+        let releases = d.update_env.install_root.join("releases");
+        assert!(!releases.join("0.9.2").exists() && !releases.join("0.9.3").exists());
+        assert_eq!(current(&d).as_deref(), Some("0.9.1"));
+
+        // Running 0.9.1: nothing to do.
+        let running = node(file_url(&cdn), "0.9.1");
+        let slot = fs::metadata(releases.join("0.9.1")).unwrap().ino();
+        let (r, out) = run_args(&running, &["update", "apply", "--version", "v0.9.1"]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        let st: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(st["status"], update::STATUS_IDLE, "{out}");
+        assert_eq!(fs::metadata(releases.join("0.9.1")).unwrap().ino(), slot);
+
+        let nowhere = node(String::new(), "0.9.1");
+        let (r, out) = run_args(&nowhere, &["update", "apply", "--version", "0.9.4"]);
+        assert_eq!(
+            r.unwrap_err().0,
+            "no manifest URL for 0.9.4: releases_base_url is not set, and the server \
+             does not offer 0.9.4 (pass --manifest-url)"
+        );
+        assert_eq!(out, "");
+    }
+
+    /// The node runs 0.9.0, the server's desired version, whose manifest the
+    /// heartbeat's update_url is: `update apply --version 0.8.5` installs
+    /// 0.8.5 from releases_base_url, with 0.9.0 to roll back to, and leaves
+    /// the 0.9.0 slot alone. (It reinstalled 0.9.0 in place, with nothing to
+    /// roll back to, before the update_url was kept for its own version.)
+    #[test]
+    fn update_apply_version_moves_off_the_servers_version() {
+        use std::os::unix::fs::MetadataExt;
+        let td = tempfile::tempdir().unwrap();
+        let (_, m090) = release(td.path(), "0.9.0");
+        let (_, m085) = release(td.path(), "0.8.5");
+        let cdn = td.path().join("cdn");
+        fs::create_dir_all(&cdn).unwrap();
+        fs::copy(&m085, cdn.join("vesyl-print-0.8.5.manifest.json")).unwrap();
+        let hb =
+            json!({"ok": true, "desired_agent_version": "0.9.0", "update_url": file_url(&m090)})
+                .to_string();
+        let srv = http_stub::serve(move |_, s| respond(s, 200, &[], hb.as_bytes()));
+        let base = deps(td.path(), &srv.base_url);
+        let d = Deps {
+            cfg: Config {
+                update_require_signature: false,
+                releases_base_url: file_url(&cdn),
+                ..base.cfg
+            },
+            update_env: UpdateEnv {
+                running_version: "0.9.0".into(),
+                running_from_slot: true,
+                ..base.update_env
+            },
+            ..base
+        };
+        installed_slot(&d, "0.8.0");
+        installed_slot(&d, "0.9.0");
+        pair(&d);
+        let releases = d.update_env.install_root.join("releases");
+        let slot = fs::metadata(releases.join("0.9.0")).unwrap().ino();
+        let (r, out) = run_args(&d, &["update", "apply", "--version", "0.8.5"]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert_eq!(current(&d).as_deref(), Some("0.8.5"));
+        let st = update::read_update_status(&d.cfg.update_status_path()).unwrap();
+        assert_eq!(st.status, update::STATUS_PENDING_HEALTH);
+        assert_eq!(st.target_version.as_deref(), Some("0.8.5"));
+        assert_eq!(st.previous_version.as_deref(), Some("0.9.0"));
+        assert_eq!(fs::metadata(releases.join("0.9.0")).unwrap().ino(), slot);
+    }
+
+    /// `update rollback` away from 0.9.0, which the server still asks for,
+    /// sticks: the restarted agent's heartbeats do not install 0.9.0 again,
+    /// nor even fetch its manifest, until the server asks for another
+    /// version. (They did: the rollback recorded nothing.)
+    #[test]
+    fn update_rollback_is_not_undone_by_the_next_heartbeat() {
+        let td = tempfile::tempdir().unwrap();
+        let (_, m090) = release(td.path(), "0.9.0");
+        let (_, m091) = release(td.path(), "0.9.1");
+        let desired = Arc::new(Mutex::new("0.9.0"));
+        let asked = desired.clone();
+        let srv = http_stub::serve(move |req, s| match req.path.as_str() {
+            "/print/v1/whoami" => respond(s, 200, &[], br#"{"node_id":"n1"}"#),
+            "/print/v1/heartbeat" => {
+                let v = *asked.lock().unwrap();
+                let url = format!("http://127.0.0.1:{}/manifests/{v}.json", req.port());
+                let hb = json!({"ok": true, "desired_agent_version": v, "update_url": url});
+                respond(s, 200, &[], hb.to_string().as_bytes());
+            }
+            "/manifests/0.9.0.json" => respond(s, 200, &[], &fs::read(&m090).unwrap()),
+            "/manifests/0.9.1.json" => respond(s, 200, &[], &fs::read(&m091).unwrap()),
+            _ => respond(s, 404, &[], b"{}"),
+        });
+        let manifests = || {
+            srv.requests()
+                .iter()
+                .filter(|r| r.path.starts_with("/manifests/"))
+                .count()
+        };
+        let d = unsigned_deps(td.path());
+        let d = Deps {
+            cfg: Config {
+                api_base_url: srv.base_url.clone(),
+                ..d.cfg
+            },
+            ..d
+        };
+        d.cfg.ensure_dirs().unwrap();
+        installed_slot(&d, "0.8.0");
+        installed_slot(&d, "0.9.0");
+        pair(&d);
+        let path = d.cfg.update_status_path();
+        // 0.9.0 passed its gate long ago.
+        let idle = update::UpdateStatus {
+            current_version: "0.9.0".into(),
+            ..Default::default()
+        };
+        update::write_update_status(&path, &idle).unwrap();
+
+        let (r, out) = run_args(&d, &["update", "rollback", "--version", "v0.8.0"]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert!(
+            out.starts_with("rolled back to 0.8.0\nholding 0.9.0: "),
+            "{out}"
+        );
+        let st = update::read_update_status(&path).unwrap();
+        assert_eq!(st.status, update::STATUS_ROLLED_BACK);
+        assert_eq!(st.target_version.as_deref(), Some("0.9.0"));
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("manual rollback from 0.9.0 to 0.8.0")
+        );
+        assert_eq!((st.previous_version, st.health_deadline_at), (None, None));
+
+        // The 0.8.0 agent the rollback restarts.
+        let agent = slot_agent(&d, "0.8.0", Arc::new(|| Some(Vec::new())));
+        for _ in 0..2 {
+            assert_eq!(agent.run_once(false).last_error, None);
+            assert_eq!(current(&d).as_deref(), Some("0.8.0"));
+        }
+        assert_eq!(manifests(), 0, "0.9.0 fetched again");
+        let st = update::read_update_status(&path).unwrap();
+        assert_eq!(st.status, update::STATUS_ROLLED_BACK);
+        assert_eq!(st.target_version.as_deref(), Some("0.9.0"));
+
+        // The server asks for another version: installed.
+        *desired.lock().unwrap() = "0.9.1";
+        agent.run_once(false);
+        assert_eq!(current(&d).as_deref(), Some("0.9.1"));
+        let st = update::read_update_status(&path).unwrap();
+        assert_eq!(st.status, update::STATUS_PENDING_HEALTH, "{st:?}");
+    }
+
+    /// `update rollback` while the gate of the version it leaves is open
+    /// closes the gate at once: jobs resume, and the version is held, with
+    /// no wait for the agent's next cycle to notice `current` moved.
+    #[test]
+    fn update_rollback_closes_an_open_gate_at_once() {
+        let td = tempfile::tempdir().unwrap();
+        let d = unsigned_deps(td.path());
+        installed_slot(&d, "0.8.0");
+        let (tarball, manifest) = release(td.path(), "0.9.0");
+        let (t, m) = (tarball.to_str().unwrap(), manifest.to_str().unwrap());
+        let (r, out) = run_args(
+            &d,
+            &["update", "apply", "--file", t, "--manifest", m, "--restart"],
+        );
+        assert_eq!(r.unwrap(), 0, "{out}");
+        let path = d.cfg.update_status_path();
+        assert!(update::should_pause_jobs_from_path(&path));
+
+        let (r, out) = run_args(&d, &["update", "rollback"]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert_eq!(current(&d).as_deref(), Some("0.8.0"));
+        let st = update::read_update_status(&path).unwrap();
+        assert_eq!(st.status, update::STATUS_ROLLED_BACK);
+        assert_eq!(st.target_version.as_deref(), Some("0.9.0"));
+        assert_eq!(
+            (st.health_deadline_at, st.previous_version),
+            (None, None),
+            "the gate is still armed"
+        );
+        assert!(!update::should_pause_jobs_from_path(&path));
+    }
+
+    /// `update rollback --restart` restarts the services as the apply arms
+    /// do: only when the environment says so, which a test's never does.
+    /// (It ran systemctl or sudo for real.)
+    #[test]
+    fn update_rollback_restart_honors_the_environment() {
+        let td = tempfile::tempdir().unwrap();
+        let mut d = deps(td.path(), "http://127.0.0.1:9");
+        let root = d.update_env.install_root.clone();
+        for v in ["0.3.0", "0.4.0"] {
+            runnable_slot(&root, v);
+        }
+        update::flip_current(&root, "0.4.0").unwrap();
+        let rollback = |d: &Deps, argv: &[&str]| update::restarts_during(|| run_args(d, argv));
+
+        let ((r, out), restarts) = rollback(&d, &["update", "rollback", "--restart"]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert_eq!(restarts, 0, "restarted with UpdateEnv::restart off");
+        assert!(!out.contains("services restarted"), "{out}");
+
+        d.update_env.restart = true;
+        let ((r, out), restarts) = rollback(&d, &["update", "rollback", "--restart"]);
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert_eq!(restarts, 1);
+        assert!(out.ends_with("services restarted\n"), "{out}");
+        let ((r, out), restarts) = rollback(&d, &["update", "rollback"]);
+        assert_eq!((r.unwrap(), restarts), (0, 0), "{out}");
+    }
+
+    /// A version the agent holds (it cannot be installed) or waits to retry
+    /// (after a failure that may pass) is installed all the same by `update
+    /// apply`, which starts from a fresh status.
+    #[test]
+    fn update_apply_overrides_the_agents_holds_and_backoff() {
+        let td = tempfile::tempdir().unwrap();
+        let (_, m090) = release(td.path(), "0.9.0");
+        let hb =
+            json!({"ok": true, "desired_agent_version": "0.9.0", "update_url": file_url(&m090)})
+                .to_string();
+        let srv = http_stub::serve(move |_, s| respond(s, 200, &[], hb.as_bytes()));
+        let base = unsigned_deps(td.path());
+        let d = Deps {
+            cfg: Config {
+                api_base_url: srv.base_url.clone(),
+                ..base.cfg
+            },
+            ..base
+        };
+        d.cfg.ensure_dirs().unwrap();
+        installed_slot(&d, "0.8.0");
+        pair(&d);
+        let failed = |code: &str, attempts: i64, retry_at: Option<String>| update::UpdateStatus {
+            status: update::STATUS_FAILED.into(),
+            target_version: Some("0.9.0".into()),
+            last_error: Some("an earlier attempt failed".into()),
+            last_error_code: Some(code.into()),
+            attempts,
+            retry_at,
+            ..Default::default()
+        };
+        for held in [
+            failed("bad_archive", 1, None),
+            failed("download_failed", 3, Some(update::utc_now_plus(3000))),
+        ] {
+            update::flip_current(&d.update_env.install_root, "0.8.0").unwrap();
+            update::write_update_status(&d.cfg.update_status_path(), &held).unwrap();
+            let (r, out) = run_args(&d, &["update", "apply"]);
+            assert_eq!(r.unwrap(), 0, "{held:?}: {out}");
+            let st = update::read_update_status(&d.cfg.update_status_path()).unwrap();
+            assert_eq!(st.status, update::STATUS_PENDING_HEALTH, "{held:?}");
+            assert_eq!(
+                (st.last_error_code, st.attempts, st.retry_at),
+                (None, 0, None)
+            );
+            assert_eq!(current(&d).as_deref(), Some("0.9.0"));
+        }
+    }
+
+    const TILDE_TD: &str = "VESYL_TEST_CLI_TILDE_TD";
+
+    /// `~/` in `print-test --file` and `update apply --file` / `--manifest`
+    /// is the home directory, as in a job's own path: bash leaves it alone
+    /// in `--file=~/…`, and in quotes. Run in a child process with its own
+    /// $HOME.
+    #[test]
+    fn tilde_paths_are_the_home_directory() {
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("label.pdf"), "%PDF-1.4\n").unwrap();
+        let (tarball, manifest) = release(td.path(), "0.9.0");
+        fs::rename(tarball, home.join("rel.tar.gz")).unwrap();
+        fs::rename(manifest, home.join("m.json")).unwrap();
+        let out = std::process::Command::new("/proc/self/exe")
+            .args([
+                "--exact",
+                "cli::tests::tilde_paths_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(TILDE_TD, td.path())
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "child process of tilde_paths_are_the_home_directory"]
+    fn tilde_paths_child() {
+        let Some(td) = std::env::var_os(TILDE_TD).map(PathBuf::from) else {
+            return;
+        };
+        let home = td.join("home");
+        let (d, cups) = test_print_deps(&td, Ok(Some("Brother_HL-9".into())));
+        let (r, out) = run_args(
+            &d,
+            &["print-test", "--file=~/label.pdf", "--queue", "Brother_HL"],
+        );
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert!(
+            out.contains(&format!(
+                "file:       {}\n",
+                home.join("label.pdf").display()
+            )),
+            "{out}"
+        );
+        let label = fs::canonicalize(home.join("label.pdf")).unwrap();
+        assert_eq!(cups.calls()[0].file, label);
+
+        let d = unsigned_deps(&td);
+        installed_slot(&d, "0.8.0");
+        let (r, out) = run_args(
+            &d,
+            &[
+                "update",
+                "apply",
+                "--file=~/rel.tar.gz",
+                "--manifest",
+                "~/m.json",
+            ],
+        );
+        assert_eq!(r.unwrap(), 0, "{out}");
+        assert_eq!(current(&d).as_deref(), Some("0.9.0"));
+    }
+
+    /// The agent's stop reaches an update in progress: a `systemctl stop`
+    /// mid-download ends `Agent::run` within a read, not when the download
+    /// is done, with nothing activated and nothing that holds the retry at
+    /// the next start.
+    #[test]
+    fn the_agents_stop_ends_an_update_download() {
+        let td = tempfile::tempdir().unwrap();
+        let (tarball, _) = release(td.path(), "0.9.0");
+        let body = fs::read(&tarball).unwrap();
+        let sha = update::sha256_file(&tarball).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        // The artifact trickles: 40 pieces 200 ms apart, 8 s in all; the
+        // stop comes once the first is out.
+        let srv = http_stub::serve(move |req, s| {
+            let base = format!("http://127.0.0.1:{}", req.port());
+            match req.path.as_str() {
+                "/print/v1/whoami" => respond(s, 200, &[], br#"{"node_id":"n1"}"#),
+                "/print/v1/heartbeat" => {
+                    let hb = json!({"ok": true, "desired_agent_version": "0.9.0",
+                                    "update_url": format!("{base}/m.json")});
+                    respond(s, 200, &[], hb.to_string().as_bytes());
+                }
+                "/m.json" => {
+                    let m = json!({"version": "0.9.0", "artifact_sha256": sha,
+                                   "artifact_url": format!("{base}/a.tar.gz")});
+                    respond(s, 200, &[], m.to_string().as_bytes());
+                }
+                "/a.tar.gz" => {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let pieces: Vec<&[u8]> = body.chunks(body.len().div_ceil(40)).collect();
+                    let _ = s.write_all(pieces[0]);
+                    let _ = s.flush();
+                    stopping.store(true, Ordering::SeqCst);
+                    for piece in &pieces[1..] {
+                        thread::sleep(Duration::from_millis(200));
+                        if s.write_all(piece).and_then(|()| s.flush()).is_err() {
+                            return;
+                        }
+                    }
+                }
+                _ => respond(s, 404, &[], b"{}"),
+            }
+        });
+        let base = unsigned_deps(td.path());
+        let d = Deps {
+            cfg: Config {
+                api_base_url: srv.base_url.clone(),
+                cable_enabled: false,
+                pull_jobs_enabled: false,
+                ..base.cfg
+            },
+            ..base
+        };
+        d.cfg.ensure_dirs().unwrap();
+        installed_slot(&d, "0.8.0");
+        pair(&d);
+        let mut agent = slot_agent(&d, "0.8.0", Arc::new(|| Some(Vec::new())));
+        // Never real CUPS (lpinfo, lpadmin, a LAN scan) from a test.
+        agent.provision_printers = Arc::new(Vec::new);
+
+        let started = std::time::Instant::now();
+        agent.run(stop);
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+        let st = update::read_update_status(&d.cfg.update_status_path()).unwrap();
+        assert_eq!(st.status, update::STATUS_IDLE, "{st:?}");
+        assert_eq!(
+            st.last_error.as_deref(),
+            Some("update stopped while downloading: the agent is stopping")
+        );
+        assert_eq!(current(&d).as_deref(), Some("0.8.0"));
+        let root = &d.update_env.install_root;
+        assert_eq!(file_names(&root.join("update")), Vec::<String>::new());
+        assert_eq!(file_names(&root.join("releases")), ["0.8.0"]);
     }
 
     #[test]

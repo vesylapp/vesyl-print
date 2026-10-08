@@ -557,10 +557,13 @@ impl Agent {
 
     /// Run the post-update health gate if an OTA is pending (or stuck "failed").
     /// Returns the (possibly updated) update status and whether the gate ran.
+    /// Once `stop` is set, a rollback restarts nothing (see
+    /// [`update::process_pending_health`]).
     fn health_gate(
         &self,
         whoami: WhoamiResult,
         whoami_error: Option<&str>,
+        stop: &AtomicBool,
     ) -> (Option<UpdateStatus>, bool) {
         let Some(st) = update::read_update_status(&self.cfg.update_status_path()) else {
             return (None, false);
@@ -575,6 +578,7 @@ impl Agent {
             whoami,
             whoami_error,
             None,
+            stop,
         );
         self.write_update_status(&out);
         (Some(out), true)
@@ -609,7 +613,7 @@ impl Agent {
 
         let Some(mut creds) = creds else {
             // Unpaired: still complete post-update health (local slot checks only).
-            self.health_gate(WhoamiResult::Skipped, None);
+            self.health_gate(WhoamiResult::Skipped, None, stop);
             if let Some(mut existing) = statusio::read_status(&self.cfg.status_path()) {
                 if existing.pairing == PairingState::Revoked {
                     existing.cloud = CloudState::Offline;
@@ -642,7 +646,7 @@ impl Agent {
             },
             Err(e) if e.unauthorized() => {
                 // Still run health gate (API reached) before clearing credentials.
-                self.health_gate(WhoamiResult::Unauthorized, Some(&e.message));
+                self.health_gate(WhoamiResult::Unauthorized, Some(&e.message), stop);
                 self.handle_unauthorized(Some(&creds));
                 return self.revoked_status();
             }
@@ -653,7 +657,7 @@ impl Agent {
         };
 
         // Post-update health gate: declare OTA success only after whoami.
-        let (update_status, gate_ran) = self.health_gate(whoami, whoami_error.as_deref());
+        let (update_status, gate_ran) = self.health_gate(whoami, whoami_error.as_deref(), stop);
         if let Some(us) = update_status.as_ref().filter(|_| gate_ran) {
             if us.status == update::STATUS_ROLLED_BACK {
                 log::warn!(target: LOG, "OTA health gate rolled back: {}", us.last_error.as_deref().unwrap_or(""));
@@ -710,6 +714,7 @@ impl Agent {
                     update_status,
                     Some(&self.cfg.update_status_path()),
                     jobs_busy,
+                    stop,
                 );
                 self.write_update_status(&ust);
                 st
@@ -1692,6 +1697,7 @@ mod tests {
         let slot = agent.update_env.install_root.join("releases").join(ver);
         std::fs::create_dir_all(&slot).unwrap();
         std::fs::write(slot.join("vesyl-print"), b"bin").unwrap();
+        crate::util::set_mode(&slot.join("vesyl-print"), 0o755).unwrap();
         update::flip_current(&agent.update_env.install_root, ver).unwrap();
         let mut pending = UpdateStatus::default();
         update::mark_pending_health(&mut pending, ver, Some("0.0.1".into()), 120, None);
