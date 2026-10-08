@@ -1,3 +1,5 @@
+# setup.sh installs this unit with User= set to the service account and
+# /opt/vesyl-print replaced by its INSTALL_ROOT.
 [Unit]
 Description=VESYL Print — cloud agent (heartbeat / pairing / OTA)
 After=network-online.target cups.service
@@ -7,11 +9,10 @@ Wants=network-online.target
 Type=simple
 User=vesyl
 WorkingDirectory=/opt/vesyl-print/current
-ExecStart=/usr/bin/python3 /opt/vesyl-print/current/agent.py
+ExecStart=/opt/vesyl-print/current/vesyl-print agent
 Restart=on-failure
 RestartSec=5
 # Do not put secrets in Environment= lines.
-Environment=PYTHONUNBUFFERED=1
 Environment=VESYL_PRINT_INSTALL_ROOT=/opt/vesyl-print
 
 [Install]
