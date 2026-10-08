@@ -1,0 +1,21 @@
+rust/crates/vesyl-print/src/lib.rs
+  s_2883cba6969ed7::t_c7797b5ba82cae 21
+rust/crates/vesyl-print/Cargo.toml
+  s_2883cba6969ed7::t_5a2f67886947ca 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2c295e0d18a2d7c4b5dbbc86770903764bf6ad8b",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
