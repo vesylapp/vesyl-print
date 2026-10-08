@@ -42,6 +42,11 @@ const CABLE_RETRY_MAX: Duration = Duration::from_secs(60);
 /// `last_error` for an OTA download / install that never finished: the
 /// previous agent process died during it, or the heartbeat running it panicked.
 pub const UPDATE_INTERRUPTED: &str = "update interrupted before it finished";
+/// How long the agent takes no job once its health gate has asked for its
+/// own restart (see [`requested_own_restart`]): `systemctl restart
+/// --no-block` stops it within seconds. Past this the restart is taken to
+/// have failed, and jobs are taken again rather than never.
+const OWN_RESTART_GRACE: Duration = Duration::from_secs(120);
 
 /// The bits of a cable session the job hooks need (mockable in tests).
 pub trait CableChannel: Send + Sync {
@@ -279,6 +284,14 @@ struct Shared {
     /// Starts the inventory refresher and printer setup threads (injectable
     /// for tests).
     spawn: SpawnFn,
+    /// The stop flag of the [`Agent::run`] in progress (a fresh one between
+    /// runs): job pipelines stop draining, printing and waiting on CUPS
+    /// once it is set (see [`Pipeline::stop`]).
+    stop: Mutex<Arc<AtomicBool>>,
+    /// When this process asked for its own restart, while it waits for it.
+    own_restart: Mutex<Option<Instant>>,
+    /// [`OWN_RESTART_GRACE`] (tests shorten it).
+    own_restart_grace: Duration,
 }
 
 impl Default for Shared {
@@ -288,6 +301,9 @@ impl Default for Shared {
             wait_tick: Mutex::default(),
             printer_setup: AtomicBool::new(false),
             spawn: Arc::new(jobs::spawn_thread),
+            stop: Mutex::default(),
+            own_restart: Mutex::default(),
+            own_restart_grace: OWN_RESTART_GRACE,
         }
     }
 }
@@ -486,11 +502,54 @@ impl Agent {
     /// so tests can make it unwind) with panics contained. Once it has
     /// returned or unwound no update is downloading or installing, so a
     /// status still saying so (a panic mid-download, say) is cleared before
-    /// the loop reads it to decide whether to hold jobs.
+    /// the loop reads it to decide whether to hold jobs. And when its health
+    /// gate asked for this process's restart, jobs wait for that restart
+    /// (see [`Agent::awaiting_own_restart`]).
     fn heartbeat_step(&self, run_once: impl FnOnce() -> AgentStatus) -> Option<AgentStatus> {
+        let root = &self.update_env.install_root;
+        let slot_before = update::current_release_version(root);
         let st = contained("heartbeat", run_once);
         self.recover_interrupted_update();
+        let after = update::read_update_status(&self.cfg.update_status_path());
+        if requested_own_restart(
+            self.update_env.restart,
+            slot_before.as_deref(),
+            update::current_release_version(root).as_deref(),
+            after.as_ref(),
+        ) {
+            log::warn!(target: LOG, "health gate rolled back and restarted the services — taking no job until this agent is stopped");
+            *lock(&self.shared.own_restart) = Some(Instant::now());
+        }
         st
+    }
+
+    /// True while this process waits for the restart its health gate asked
+    /// for: a job started now could be cut short by the SIGTERM. One that
+    /// has not come within [`OWN_RESTART_GRACE`] is taken to have failed,
+    /// and jobs go on.
+    fn awaiting_own_restart(&self) -> bool {
+        let mut asked = lock(&self.shared.own_restart);
+        match *asked {
+            Some(t) if t.elapsed() < self.shared.own_restart_grace => true,
+            Some(t) => {
+                log::warn!(target: LOG, "the restart asked for {:.0}s ago has not come — taking jobs again", t.elapsed().as_secs_f64());
+                *asked = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// True while jobs must wait: an OTA is downloading, installing or in
+    /// its health gate, or this process waits for its own restart. The
+    /// update status counts as the next heartbeat will find it: a `failed`
+    /// one that heartbeat turns back into a health gate (an install cut off
+    /// after its flip, see [`update::recover_false_update_failure`], which
+    /// writes nothing) pauses jobs already.
+    fn jobs_paused(&self) -> bool {
+        let st = update::read_update_status(&self.cfg.update_status_path())
+            .map(|st| update::recover_false_update_failure(st, &self.cfg, &self.update_env));
+        update::should_pause_jobs(st.as_ref()) || self.awaiting_own_restart()
     }
 
     fn prune_processed_markers(&self) {
@@ -748,7 +807,9 @@ impl Agent {
     /// detection) and refreshes printer inventory over the cable when
     /// available. Every tick of this agent shares one schedule, inventory is
     /// the background snapshot (read only when something is due), and no lock
-    /// is held while sending.
+    /// is held while sending. A REST heartbeat carries the update status as
+    /// the loop's does; its reply starts no update (only the loop's does,
+    /// between jobs).
     pub fn inventory_wait_tick(&self, cable: Cable, device_token: Option<&str>) -> TickFn {
         // Match configured heartbeat (default 30s); never slower than 10s for liveness.
         let rest_interval = Duration::from_secs_f64((self.cfg.heartbeat_seconds as f64).max(10.0));
@@ -793,12 +854,13 @@ impl Agent {
                 );
             }
             if let Some(token) = token.as_deref().filter(|_| send_rest) {
+                let update = update::read_update_status(&agent.cfg.update_status_path());
                 let body = HeartbeatBody {
                     agent_version: Some(agent_version().into()),
                     hostname: Some(sysinfo::hostname()),
                     printers: inv,
                     platform: Some(default_platform()),
-                    update: None,
+                    update: update.as_ref().map(UpdateStatus::to_dict),
                 };
                 if let Err(e) = agent.client.heartbeat(token, &body) {
                     log::debug!(target: LOG, "wait-tick REST heartbeat failed: {e}");
@@ -819,6 +881,9 @@ impl Agent {
         // async jobs go to the pipeline's shared watcher while the loop runs on.
         p.on_wait_tick =
             (p.wait_cups == WaitCups::Sync).then(|| self.inventory_wait_tick(cable, device_token));
+        // A stop (SIGTERM) ends a drain or a CUPS wait instead of waiting for
+        // systemd's SIGKILL, which would leave a printed job queued.
+        p.stop = lock(&self.shared.stop).clone();
         p
     }
 
@@ -902,6 +967,8 @@ impl Agent {
             cfg.heartbeat_seconds,
             cfg.pull_interval_seconds
         );
+        // Job pipelines follow this run's stop from here on.
+        *lock(&self.shared.stop) = stop.clone();
 
         self.recover_interrupted_update();
         // CUPS inventory runs off this loop from here on.
@@ -958,8 +1025,7 @@ impl Agent {
                 }),
                 handlers,
             ));
-            if sess.start() {
-                *lock(&holder) = Some(sess.clone());
+            if start_cable_session(&holder, &sess) {
                 return (Some(sess), true);
             }
             (None, true)
@@ -971,10 +1037,20 @@ impl Agent {
             }
         };
 
-        let token = auth::load_credentials(&cfg.credentials_path()).map(|c| c.device_token);
-        self.drain_local_queue(token.as_deref(), None);
-        // After the drain: it relies on markers of jobs still queued.
-        self.prune_processed_markers();
+        // Jobs left queued print now, unless jobs are paused: after an OTA
+        // restart (or an install cut off after its flip, whose gate the
+        // first heartbeat reopens) the health gate has not judged this slot
+        // yet. Then the loop drains them once the pause is over, before any
+        // new job.
+        let mut drain_pending = self.jobs_paused();
+        if drain_pending {
+            log::info!(target: LOG, "update in progress — queued jobs wait until it is done");
+        } else {
+            let token = auth::load_credentials(&cfg.credentials_path()).map(|c| c.device_token);
+            self.drain_local_queue(token.as_deref(), None);
+            // After the drain: it relies on markers of jobs still queued.
+            self.prune_processed_markers();
+        }
         let mut last_prune = Instant::now();
 
         let secs = |s: f64| Duration::from_secs_f64(s.max(0.0));
@@ -1014,6 +1090,8 @@ impl Agent {
 
             // Pause pull/push while OTA is downloading, installing, or in health gate.
             let mut ota_pause = update::should_pause_jobs_from_path(&cfg.update_status_path());
+            // And while the restart this process asked for is on its way.
+            ota_pause |= self.awaiting_own_restart();
 
             // Drain push jobs on the main thread (lp must not run on the WS thread).
             // Skip while OTA is active so we never start a print a restart would kill.
@@ -1034,14 +1112,17 @@ impl Agent {
 
             // REST heartbeat first — cable must never block liveness / LCD status.
             // Defer OTA only for job work in flight. Jobs run synchronously on
-            // this thread, so that is the buffered push jobs; leftover queue
-            // files (retryable failures) must not hold off every OTA.
-            let jobs_busy = !lock(&push_jobs).is_empty();
+            // this thread, so that is the buffered push jobs, and the startup
+            // drain still to run: the heartbeat that closes the health gate
+            // must not start the next OTA before it. Leftover queue files
+            // (retryable failures) must not hold off every OTA.
+            let jobs_busy = !lock(&push_jobs).is_empty() || drain_pending;
             let st = if elapsed_since(last_hb, hb_interval) {
                 let st = self.heartbeat_step(|| self.run_once_with_stop(jobs_busy, &stop));
                 last_hb = Some(Instant::now());
                 // Re-read: an OTA may have activated (pending_health) or failed.
                 ota_pause = update::should_pause_jobs_from_path(&cfg.update_status_path());
+                ota_pause |= self.awaiting_own_restart();
                 match &st {
                     Some(s) if s.cloud == CloudState::Online => backoff = 1.0,
                     Some(s)
@@ -1055,6 +1136,17 @@ impl Agent {
             } else {
                 statusio::read_status(&cfg.status_path())
             };
+
+            // The startup drain the pause held back, once it is over: the
+            // gate passed, or closed without restarting this process (a gate
+            // that restarts it leaves the queue to the agent it starts).
+            if drain_pending && !ota_pause && !stop.load(Ordering::SeqCst) {
+                drain_pending = false;
+                let token = creds.as_ref().map(|c| c.device_token.as_str());
+                self.drain_local_queue(token, current_cable(&holder));
+                self.prune_processed_markers();
+                last_prune = Instant::now();
+            }
 
             // Maintain cable in the background when paired (non-blocking).
             if creds.is_some() && cfg.cable_enabled {
@@ -1138,7 +1230,7 @@ impl Agent {
                 }
             }
 
-            if last_prune.elapsed() >= PRUNE_EVERY {
+            if !drain_pending && last_prune.elapsed() >= PRUNE_EVERY {
                 self.prune_processed_markers();
                 last_prune = Instant::now();
             }
@@ -1173,6 +1265,8 @@ impl Agent {
 
         stop_cable();
         self.shared.inventory.end(inventory_refresher);
+        // Calls made after this run (one-off ones) are not stopping.
+        *lock(&self.shared.stop) = Arc::default();
         log::info!(target: LOG, "agent stopped");
     }
 
@@ -1220,6 +1314,40 @@ impl Agent {
             on_disconnected: Some(Arc::new(|| log::info!(target: LOG, "cable disconnected"))),
         }
     }
+}
+
+/// True when a heartbeat asked for this process's own restart: its health
+/// gate rolled back (the update status is now `rolled_back`, and `current`
+/// moved from `slot_before` to `slot_after`), and `restarts` (the update env
+/// restarts the services after a rollback, as `update::close_failed_gate`
+/// does). A gate closed because `current` was switched by hand is
+/// `rolled_back` too, but flips and restarts nothing; an activation leaves
+/// `pending_health`, which pauses jobs on its own.
+fn requested_own_restart(
+    restarts: bool,
+    slot_before: Option<&str>,
+    slot_after: Option<&str>,
+    status: Option<&UpdateStatus>,
+) -> bool {
+    restarts
+        && slot_before != slot_after
+        && status.is_some_and(|s| s.status == update::STATUS_ROLLED_BACK)
+}
+
+/// Start `sess` as the agent's cable session. It goes into `holder` first:
+/// its socket thread can subscribe before `start` returns, and the
+/// on_subscribed handler looks it up there to report the printers. One that
+/// does not start (no ticket) is taken out again.
+fn start_cable_session(
+    holder: &Mutex<Option<Arc<PrintCableSession>>>,
+    sess: &Arc<PrintCableSession>,
+) -> bool {
+    *lock(holder) = Some(sess.clone());
+    if sess.start() {
+        return true;
+    }
+    lock(holder).take();
+    false
 }
 
 fn classify_pull_error(e: &CloudError) -> PullResult {
@@ -1515,6 +1643,7 @@ mod tests {
                 lp: Arc::new(|_, _, _| Ok(None)),
                 supports_raw: Arc::new(|_| Ok(false)),
                 wait_cups_job: Arc::new(|_, _| CupsOutcome::Printed),
+                cups_lookup: Arc::new(|_| Err("no CUPS in tests".into())),
                 ..Pipeline::default()
             },
             shared: Arc::default(),
@@ -2113,6 +2242,351 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         handle.join().unwrap();
         assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    // --- jobs around OTA restarts and stops ---------------------------------
+
+    fn queue_png(agent: &Agent, id: &str) {
+        let job = PrintJob::from_dict(&obj(json!({"id": id, "cups_name": "P",
+            "content_type": "png_base64", "content": PNG_1X1_B64})))
+        .unwrap();
+        agent.store.write_queue(&job).unwrap();
+    }
+
+    /// A release slot for `version` the units could run.
+    fn install_slot(agent: &Agent, version: &str) {
+        let slot = agent.update_env.install_root.join("releases").join(version);
+        fs::create_dir_all(&slot).unwrap();
+        fs::write(slot.join("vesyl-print"), b"#!/bin/sh\n").unwrap();
+        crate::util::set_mode(&slot.join("vesyl-print"), 0o755).unwrap();
+    }
+
+    /// Times `lp` ran, each with whether jobs were paused then.
+    type Prints = Arc<Mutex<Vec<(Instant, bool)>>>;
+
+    fn recording_lp(agent: &mut Agent) -> Prints {
+        let prints: Prints = Arc::default();
+        let (p, status) = (prints.clone(), agent.cfg.update_status_path());
+        agent.pipeline.lp = Arc::new(move |_, _, _| {
+            let paused = update::should_pause_jobs_from_path(&status);
+            lock(&p).push((Instant::now(), paused));
+            Ok(None)
+        });
+        prints
+    }
+
+    /// The health gate an activation of the running version arms.
+    fn gate_for_this_version() -> UpdateStatus {
+        let mut pending = UpdateStatus::default();
+        update::mark_pending_health(
+            &mut pending,
+            agent_version(),
+            Some("0.0.1".into()),
+            120,
+            None,
+        );
+        pending
+    }
+
+    /// An agent an OTA just restarted into the running version: paired,
+    /// `current` on a runnable slot of that version, `status` in
+    /// update_status.json and job `q1` left queued. Its loop runs without
+    /// the cable.
+    fn agent_after_an_ota_restart(td: &Path, base_url: &str, status: &UpdateStatus) -> Agent {
+        let mut agent = test_agent(td, base_url);
+        agent.cfg.cable_enabled = false;
+        pair(&agent);
+        let ver = agent_version();
+        install_slot(&agent, ver);
+        update::flip_current(&agent.update_env.install_root, ver).unwrap();
+        update::write_update_status(&agent.cfg.update_status_path(), status).unwrap();
+        queue_png(&agent, "q1");
+        agent
+    }
+
+    /// J1: after an OTA restart the health gate is open (pending_health) and
+    /// jobs wait for it, but the startup drain did not: queued jobs printed
+    /// before the gate had judged the new slot. They now wait for the gate,
+    /// then print once, before the gate's heartbeat can start another OTA.
+    #[test]
+    fn queued_jobs_wait_for_the_health_gate_then_print_once() {
+        queued_job_waits_for_the_gate(&gate_for_this_version());
+    }
+
+    /// J1 after a power loss: an install cut off after its flip leaves
+    /// `installing`, which the agent's start marks failed and its first
+    /// heartbeat turns back into the health gate
+    /// (`update::recover_false_update_failure`). The startup drain went by
+    /// the `failed` on disk and printed before that gate had run.
+    #[test]
+    fn an_install_cut_off_after_its_flip_holds_queued_jobs_for_its_gate() {
+        let mut installing = UpdateStatus::with_status(update::STATUS_INSTALLING);
+        installing.target_version = Some(agent_version().into());
+        installing.previous_version = Some("0.0.1".into());
+        queued_job_waits_for_the_gate(&installing);
+    }
+
+    /// Run [`agent_after_an_ota_restart`] with `status` until `q1` prints:
+    /// it prints once, after the health gate's whoami and with jobs no
+    /// longer paused, and the gate passes.
+    fn queued_job_waits_for_the_gate(status: &UpdateStatus) {
+        let td = tempfile::tempdir().unwrap();
+        let srv = stub(|_, path| match path {
+            "/print/v1/whoami" => (200, WHOAMI.into()),
+            "/print/v1/jobs/pending" => (200, r#"{"jobs":[]}"#.into()),
+            _ => (200, "{}".into()),
+        });
+        let mut agent = agent_after_an_ota_restart(td.path(), &srv.base_url, status);
+        let prints = recording_lp(&mut agent);
+
+        let (stop, handle) = start_run(&agent);
+        let printed = eventually(Duration::from_secs(10), || !lock(&prints).is_empty());
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(printed, "the queued job never printed");
+        let prints = lock(&prints).clone();
+        assert_eq!(prints.len(), 1, "printed once");
+        let (at, paused) = prints[0];
+        assert!(!paused, "printed while the gate was open");
+        let whoami = srv.times("/print/v1/whoami");
+        assert!(
+            whoami.first().is_some_and(|w| *w < at),
+            "printed before the gate's whoami"
+        );
+        let ust = update::read_update_status(&agent.cfg.update_status_path()).unwrap();
+        assert_eq!(ust.status, update::STATUS_IDLE);
+        assert!(agent.store.is_processed("q1"));
+        assert!(!agent.store.has_pending_work());
+    }
+
+    /// J1: the heartbeat that closes the health gate must not start the
+    /// next OTA ahead of the drain the gate held back. While that drain is
+    /// still to run the update its reply asks for is deferred (`jobs_busy`),
+    /// as for buffered push jobs: the job prints first, and the update waits
+    /// for a later heartbeat.
+    #[test]
+    fn the_gates_heartbeat_defers_an_update_until_the_held_back_drain_ran() {
+        let td = tempfile::tempdir().unwrap();
+        // Every heartbeat reply asks for 99.0.0, its manifest on this stub.
+        let base: Arc<OnceLock<String>> = Arc::default();
+        let b = base.clone();
+        let srv = stub(move |_, path| match path {
+            "/print/v1/whoami" => (200, WHOAMI.into()),
+            "/print/v1/jobs/pending" => (200, r#"{"jobs":[]}"#.into()),
+            "/print/v1/heartbeat" => {
+                let url = format!("{}/m.json", b.get().unwrap());
+                let reply =
+                    json!({"ok": true, "desired_agent_version": "99.0.0", "update_url": url});
+                (200, reply.to_string())
+            }
+            "/m.json" => (404, "{}".into()),
+            _ => (200, "{}".into()),
+        });
+        base.set(srv.base_url.clone()).unwrap();
+        let mut agent =
+            agent_after_an_ota_restart(td.path(), &srv.base_url, &gate_for_this_version());
+        assert!(agent.cfg.auto_update_enabled);
+        // The update status when `lp` ran.
+        type AtPrint = Arc<Mutex<Vec<(Instant, Option<UpdateStatus>)>>>;
+        let at_print: AtPrint = Arc::default();
+        let (p, status) = (at_print.clone(), agent.cfg.update_status_path());
+        agent.pipeline.lp = Arc::new(move |_, _, _| {
+            lock(&p).push((Instant::now(), update::read_update_status(&status)));
+            Ok(None)
+        });
+
+        let (stop, handle) = start_run(&agent);
+        let printed = eventually(Duration::from_secs(10), || !lock(&at_print).is_empty());
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(printed, "the queued job never printed");
+        let at_print = lock(&at_print).clone();
+        assert_eq!(at_print.len(), 1, "printed once");
+        let (at, ust) = at_print[0].clone();
+        let ust = ust.expect("no update status when the job printed");
+        assert_eq!(
+            (ust.status.as_str(), ust.last_error.as_deref()),
+            (update::STATUS_IDLE, None),
+            "an update started before the drain: {ust:?}"
+        );
+        let heartbeats = srv.times("/print/v1/heartbeat");
+        assert!(
+            heartbeats.first().is_some_and(|h| *h < at),
+            "printed before the gate's heartbeat"
+        );
+        assert!(
+            srv.times("/m.json").iter().all(|m| *m > at),
+            "the update's manifest was fetched before the job printed"
+        );
+    }
+
+    /// J4: a health gate that rolls back restarts the services, this agent
+    /// with them. `rolled_back` does not pause jobs, so the loop took pushed
+    /// and pulled jobs until the SIGTERM came, which could end a print
+    /// midway. Such a heartbeat now holds jobs until the restart; a gate
+    /// closed because `current` was switched by hand restarts nothing.
+    #[test]
+    fn a_rollback_that_restarts_this_agent_holds_its_jobs() {
+        let td = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(td.path(), "http://127.0.0.1:9");
+        let root = agent.update_env.install_root.clone();
+        let status = agent.cfg.update_status_path();
+        for v in ["9.9.8", "9.9.9"] {
+            install_slot(&agent, v);
+        }
+        // A heartbeat whose gate closed 9.9.9 as rolled back, switching
+        // `current` back to 9.9.8 (`flip`) or finding it switched by hand.
+        let gate = |agent: &Agent, flip: bool| {
+            update::flip_current(&root, "9.9.9").unwrap();
+            *lock(&agent.shared.own_restart) = None;
+            agent.heartbeat_step(|| {
+                if flip {
+                    update::flip_current(&root, "9.9.8").unwrap();
+                }
+                let mut st = UpdateStatus::with_status(update::STATUS_ROLLED_BACK);
+                st.target_version = Some("9.9.9".into());
+                update::write_update_status(&status, &st).unwrap();
+                agent.run_once(false)
+            });
+            agent.jobs_paused()
+        };
+        assert!(!gate(&agent, true), "no restart without env.restart");
+        agent.update_env.restart = true;
+        assert!(!gate(&agent, false), "switched by hand: nothing restarted");
+        assert!(
+            gate(&agent, true),
+            "jobs taken while the restart is on its way"
+        );
+        assert!(!update::should_pause_jobs_from_path(&status));
+    }
+
+    /// J4 in the loop: while its restart is on its way the agent takes no
+    /// job (no drain, no pull). One that does not come within the grace is
+    /// taken to have failed: jobs go on rather than never.
+    #[test]
+    fn the_loop_takes_no_job_until_its_restart_or_the_grace_is_over() {
+        let td = tempfile::tempdir().unwrap();
+        let srv = stub(|_, path| match path {
+            "/print/v1/whoami" => (200, WHOAMI.into()),
+            "/print/v1/jobs/pending" => (200, r#"{"jobs":[]}"#.into()),
+            _ => (200, "{}".into()),
+        });
+        let mut agent = test_agent(td.path(), &srv.base_url);
+        agent.cfg.cable_enabled = false;
+        agent.cfg.pull_interval_seconds = 1;
+        let grace = Duration::from_millis(1500);
+        agent.shared = Arc::new(Shared {
+            own_restart_grace: grace,
+            ..Shared::default()
+        });
+        pair(&agent);
+        let prints = recording_lp(&mut agent);
+        queue_png(&agent, "q1");
+        let asked = Instant::now();
+        *lock(&agent.shared.own_restart) = Some(asked);
+
+        let (stop, handle) = start_run(&agent);
+        let resumed = eventually(Duration::from_secs(10), || {
+            !lock(&prints).is_empty() && srv.count("/print/v1/jobs/pending") > 0
+        });
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        assert!(resumed, "jobs never went on after the grace");
+        let first_pull = srv.times("/print/v1/jobs/pending")[0];
+        let (printed, _) = lock(&prints)[0];
+        for (what, at) in [("printed", printed), ("pulled", first_pull)] {
+            assert!(
+                at.duration_since(asked) >= grace,
+                "{what} while waiting for the restart"
+            );
+        }
+        assert_eq!(lock(&prints).len(), 1);
+    }
+
+    /// The pipeline used in the stop tests: CUPS keeps `Q-1` printing (out
+    /// of paper) until the agent stops, or 10 s have passed (as the real
+    /// wait gives up after its timeout).
+    fn out_of_paper_until_stopped(agent: &mut Agent) -> mpsc::Receiver<()> {
+        let (waiting_tx, waiting) = mpsc::channel();
+        let waiting_tx = Mutex::new(waiting_tx);
+        agent.cfg.wait_cups = WaitCups::Sync;
+        agent.pipeline.lp = Arc::new(|_, _, _| Ok(Some("Q-1".into())));
+        agent.pipeline.wait_cups_job = Arc::new(move |_, ctx| {
+            let _ = lock(&waiting_tx).send(());
+            let gives_up = Instant::now() + Duration::from_secs(10);
+            while !ctx.stop.load(Ordering::SeqCst) && Instant::now() < gives_up {
+                thread::sleep(Duration::from_millis(10));
+            }
+            CupsOutcome::Unknown
+        });
+        waiting
+    }
+
+    /// J3: a stop (SIGTERM) during the startup drain's CUPS wait (printer out
+    /// of paper) used to wait for CUPS for up to 24 h, so systemd killed the
+    /// agent after 90 s and the next start printed the label again. The
+    /// wait ends at once now, the rest of the queue waits, and the next
+    /// start finishes the job without printing it again.
+    #[test]
+    fn a_stop_during_the_drain_leaves_the_rest_and_never_prints_twice() {
+        let td = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(td.path(), "http://127.0.0.1:9");
+        agent.cfg.cable_enabled = false;
+        let waiting = out_of_paper_until_stopped(&mut agent);
+        queue_png(&agent, "q1");
+        queue_png(&agent, "q2");
+
+        let (stop, handle) = start_run(&agent);
+        let in_wait = waiting.recv_timeout(Duration::from_secs(10)).is_ok();
+        let stopped_at = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        assert!(in_wait, "the drain never waited on CUPS");
+        assert!(
+            stopped_at.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            stopped_at.elapsed()
+        );
+        assert_eq!(agent.store.list_queued_ids(), ["q1", "q2"]);
+        assert!(!agent.store.is_processed("q1"));
+
+        // The next start: q1 is finished from what CUPS says, q2 printed.
+        let printed: Arc<Mutex<Vec<String>>> = Arc::default();
+        let pr = printed.clone();
+        agent.pipeline.lp = Arc::new(move |_, path, _| {
+            let id = path.file_stem().unwrap().to_string_lossy().to_string();
+            lock(&pr).push(id);
+            Ok(None)
+        });
+        agent.pipeline.cups_lookup = Arc::new(|key| {
+            assert_eq!(key, "Q-1");
+            Ok(jobs::CupsJobState::Printed)
+        });
+        agent.drain_local_queue(None, None);
+        assert_eq!(*lock(&printed), ["q2"], "q1 must not print again");
+        assert!(agent.store.is_processed("q1") && agent.store.is_processed("q2"));
+        assert!(!agent.store.has_pending_work());
+    }
+
+    /// J10: the REST heartbeats a long CUPS wait sends carried no update
+    /// status (the loop's do), so the cloud saw none while a job waited.
+    #[test]
+    fn wait_tick_heartbeats_carry_the_update_status() {
+        let td = tempfile::tempdir().unwrap();
+        let srv = serve(vec![(200, "{}")]);
+        let agent = test_agent(td.path(), &srv.base_url);
+        let mut st = UpdateStatus::with_status(update::STATUS_FAILED);
+        st.target_version = Some("9.9.9".into());
+        st.last_error = Some("download failed".into());
+        update::write_update_status(&agent.cfg.update_status_path(), &st).unwrap();
+        agent.inventory_wait_tick(None, Some("tok"))();
+        let body: Value = serde_json::from_slice(&srv.requests.lock().unwrap()[0].body).unwrap();
+        assert_eq!(body["update"]["status"], "failed");
+        assert_eq!(body["update"]["target_version"], "9.9.9");
+        assert_eq!(body["update"]["last_error"], "download failed");
     }
 
     /// A queue file kept for retry (transient failure) is not work in
@@ -2784,6 +3258,8 @@ mod tests {
         url: String,
         /// When `message` was sent.
         pushed: mpsc::Receiver<Instant>,
+        /// The text frames the client sent once subscribed, in order.
+        frames: mpsc::Receiver<String>,
         /// When the client hung up.
         closed: mpsc::Receiver<Instant>,
         server: thread::JoinHandle<()>,
@@ -2793,6 +3269,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/print/cable", listener.local_addr().unwrap());
         let (pushed_tx, pushed) = mpsc::channel();
+        let (frames_tx, frames) = mpsc::channel();
         let (closed_tx, closed) = mpsc::channel();
         let server = thread::spawn(move || {
             // Never wait forever: a test that failed early stops the agent.
@@ -2823,15 +3300,67 @@ mod tests {
             ws.send(Message::text(push.to_string())).unwrap();
             let _ = pushed_tx.send(Instant::now());
             // Acks, job statuses and heartbeats, until the agent hangs up.
-            while ws.read().is_ok() {}
+            while let Ok(frame) = ws.read() {
+                if let Message::Text(text) = frame {
+                    let _ = frames_tx.send(text.to_string());
+                }
+            }
             let _ = closed_tx.send(Instant::now());
         });
         CableEndpoint {
             url,
             pushed,
+            frames,
             closed,
             server,
         }
+    }
+
+    /// The channel action and data of a client frame.
+    fn performed(frame: &str) -> (String, Value) {
+        let frame: Value = serde_json::from_str(frame).unwrap();
+        let data: Value = serde_json::from_str(frame["data"].as_str().unwrap_or("{}")).unwrap();
+        (py_str(&data["action"]), data)
+    }
+
+    /// J2: the cable can subscribe before the session's `start` returns
+    /// (here it lingers 300 ms once its socket thread runs, as if preempted
+    /// there). The agent put the session where its on_subscribed handler
+    /// looks for it only once `start` had returned, so the first
+    /// report_printers was never sent.
+    #[test]
+    fn the_first_report_printers_goes_out_however_soon_the_cable_subscribes() {
+        let td = tempfile::tempdir().unwrap();
+        let cable = cable_endpoint(json!({"type": "noop"}), Duration::ZERO);
+        let mut agent = test_agent(td.path(), "http://127.0.0.1:9");
+        agent.inventory = Arc::new(|| Some(vec![json!({"cups_name": "Zebra"})]));
+        let holder: Arc<Mutex<Option<Arc<PrintCableSession>>>> = Arc::default();
+        let handlers = agent.session_handlers(
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+            holder.clone(),
+            Arc::default(),
+        );
+        let sess = Arc::new(
+            PrintCableSession::new(
+                &cable.url,
+                Box::new(|| Ok(obj(json!({"ticket": "t"})))),
+                handlers,
+            )
+            .with_start_pause(Duration::from_millis(300)),
+        );
+        assert!(start_cable_session(&holder, &sess));
+        let report = cable
+            .frames
+            .recv_timeout(Duration::from_secs(5))
+            .map(|f| performed(&f));
+        sess.stop();
+        lock(&holder).take();
+        cable.server.join().unwrap();
+        let (action, data) = report.expect("no frame after the subscription");
+        assert_eq!(action, "report_printers");
+        assert_eq!(data["printers"], json!([{"cups_name": "Zebra"}]));
     }
 
     fn pushed_job(id: &str) -> Value {

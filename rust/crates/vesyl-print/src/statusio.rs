@@ -40,9 +40,26 @@ pub struct AgentStatus {
     pub last_error: Option<String>,
     pub agent_version: Option<String>,
     pub updated_at: Option<String>,
-    /// Merged into the top level of the JSON file (printers, jobs, update, …).
+    /// The file's other top-level keys: [`read_status`] keeps them here and
+    /// [`write_status`] writes them back, so a read-modify-write keeps what
+    /// it does not know (keys a newer agent added, after a rollback). The
+    /// fields above win over a key of the same name.
     pub extra: JsonObject,
 }
+
+/// The top-level keys [`AgentStatus`] has fields for.
+const SCHEMA_KEYS: &[&str] = &[
+    "pairing",
+    "cloud",
+    "node_id",
+    "name",
+    "organization_name",
+    "warehouse_name",
+    "last_heartbeat_at",
+    "last_error",
+    "agent_version",
+    "updated_at",
+];
 
 impl AgentStatus {
     pub fn to_dict(&self) -> JsonObject {
@@ -62,7 +79,7 @@ impl AgentStatus {
         d.insert("agent_version".into(), s(&self.agent_version));
         d.insert("updated_at".into(), s(&self.updated_at));
         for (k, v) in &self.extra {
-            d.insert(k.clone(), v.clone());
+            d.entry(k.clone()).or_insert_with(|| v.clone());
         }
         d
     }
@@ -94,7 +111,7 @@ pub fn read_status(path: &Path) -> Option<AgentStatus> {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
     let s = |k: &str| opt_str(data.get(k));
-    Some(AgentStatus {
+    let mut st = AgentStatus {
         pairing,
         cloud,
         node_id: s("node_id"),
@@ -106,7 +123,12 @@ pub fn read_status(path: &Path) -> Option<AgentStatus> {
         agent_version: s("agent_version"),
         updated_at: s("updated_at"),
         extra: JsonObject::new(),
-    })
+    };
+    st.extra = data
+        .into_iter()
+        .filter(|(k, _)| !SCHEMA_KEYS.contains(&k.as_str()))
+        .collect();
+    Some(st)
 }
 
 #[cfg(test)]
@@ -135,6 +157,38 @@ mod tests {
         assert_eq!(loaded.pairing, PairingState::Paired);
         assert_eq!(loaded.organization_name.as_deref(), Some("Acme"));
         assert!(loaded.updated_at.is_some());
+        assert_eq!(loaded.extra, st.extra);
+    }
+
+    /// J7: read_status dropped every key it has no field for, so a
+    /// read-modify-write (the revoked heartbeat) lost them: keys a newer
+    /// agent wrote, after a rollback. They come back in `extra`, schema keys
+    /// never do, and a field wins over an extra of the same name.
+    #[test]
+    fn unknown_keys_survive_a_read_modify_write() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("status.json");
+        fs::write(
+            &path,
+            r#"{"pairing": "revoked", "cloud": "online", "x": 1, "printers": ["Zebra"]}"#,
+        )
+        .unwrap();
+        let mut st = read_status(&path).unwrap();
+        assert_eq!(st.pairing, PairingState::Revoked);
+        assert_eq!(
+            Value::Object(st.extra.clone()),
+            json!({"x": 1, "printers": ["Zebra"]})
+        );
+        st.cloud = CloudState::Offline;
+        write_status(&path, &mut st).unwrap();
+        let raw: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["x"], 1);
+        assert_eq!(raw["printers"], json!(["Zebra"]));
+        assert_eq!(raw["cloud"], "offline");
+        assert_eq!(raw["pairing"], "revoked");
+
+        st.extra.insert("cloud".into(), json!("online"));
+        assert_eq!(st.to_dict()["cloud"], "offline");
     }
 
     #[test]

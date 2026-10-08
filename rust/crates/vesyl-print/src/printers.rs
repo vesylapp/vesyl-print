@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -114,6 +114,23 @@ pub struct CmdOutput {
 /// The child starts with no signal blocked (see [`unblocked_signals`]).
 pub fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> std::io::Result<CmdOutput> {
     run_with_timeout_env(cmd, args, &[], timeout)
+}
+
+/// The environment every CUPS tool runs with: the C locale, in UTF-8.
+///
+/// CUPS translates what its tools print into the locale's language: in
+/// German `lpstat -v` says "Gerät für" for "device for", `lpinfo -l` says
+/// "Gerät: URI =", and `lp` says "Anfrage-ID ist" for "request id is". This
+/// module and the job pipeline read the untranslated text. CUPS treats the
+/// C locale, or one that is not installed, as unset and then reads
+/// LC_MESSAGES, LC_ALL and LANG in that order (so LC_ALL=C alone still gets
+/// German under LC_MESSAGES=de_DE.UTF-8): both are set. UTF-8 keeps printer
+/// names and descriptions intact.
+pub const CUPS_ENV: &[(&str, &str)] = &[("LC_ALL", "C.UTF-8"), ("LC_MESSAGES", "C.UTF-8")];
+
+/// [`run_with_timeout`] for a CUPS tool: untranslated (see [`CUPS_ENV`]).
+pub fn run_cups(cmd: &str, args: &[&str], timeout: Duration) -> std::io::Result<CmdOutput> {
+    run_with_timeout_env(cmd, args, CUPS_ENV, timeout)
 }
 
 /// [`run_with_timeout`] with `env` added to the child's environment.
@@ -275,9 +292,10 @@ fn collect_output(child: &mut Child, deadline: Instant) -> std::io::Result<Optio
     }
 }
 
-/// stdout of a CUPS tool, or "" on any failure (Python `printers._run`).
+/// stdout of a CUPS tool (untranslated), or "" on any failure (Python
+/// `printers._run`).
 fn run(cmd: &str, args: &[&str], timeout_s: u64) -> String {
-    run_with_timeout(&cups_cmd(cmd), args, Duration::from_secs(timeout_s))
+    run_cups(&cups_cmd(cmd), args, Duration::from_secs(timeout_s))
         .map(|o| o.stdout)
         .unwrap_or_default()
 }
@@ -1020,7 +1038,7 @@ fn lpadmin_raw_args(queue: &str, uri: &str, model: &str, location: Option<&str>)
 
 fn lpadmin(args: &[String]) -> std::io::Result<CmdOutput> {
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_with_timeout(&cups_cmd("lpadmin"), &argv, Duration::from_secs(30))
+    run_cups(&cups_cmd("lpadmin"), &argv, Duration::from_secs(30))
 }
 
 /// Add a driverless (IPP Everywhere) queue named after the model.
@@ -1087,28 +1105,6 @@ pub fn add_usb_printer(uri: &str, model: &str, queue: Option<&str>) -> Option<St
     }
     log::info!(target: LOG, "USB everywhere failed for {uri} — trying raw");
     add_raw_printer(uri, model, Some(&queue_name), Some("USB"))
-}
-
-/// Test page sent to a printer right after the app auto-provisions it:
-/// `base.jpg` next to the executable, else in the installed `current` slot.
-pub fn test_image() -> PathBuf {
-    let beside_exe = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|d| d.join("base.jpg")));
-    match beside_exe {
-        Some(p) if p.is_file() => p,
-        _ => PathBuf::from("/opt/vesyl-print/current/base.jpg"),
-    }
-}
-
-/// Send the test image to a queue. Returns true if the job was accepted.
-pub fn print_test_page(queue: &str) -> bool {
-    let img = test_image();
-    if !img.exists() {
-        return false;
-    }
-    let img = img.display().to_string();
-    run_with_timeout("lp", &["-d", queue, &img], Duration::from_secs(30)).is_ok_and(|o| o.success)
 }
 
 /// The CUPS operations [`ensure_printers_with`] needs (real: [`SystemCups`]).
@@ -1591,7 +1587,7 @@ fn ipptool(uri: &str, test_body: &str, timeout_s: f64) -> String {
     };
     let t = (timeout_s as i64).max(1).to_string();
     let path = file.path().display().to_string();
-    match run_with_timeout(
+    match run_cups(
         "ipptool",
         &["-tv", "-T", &t, uri, &path],
         Duration::from_secs_f64(timeout_s + 2.0),
@@ -2230,6 +2226,60 @@ mod tests {
             "the caller blocks them"
         );
         assert_eq!(sig_blk(&child), 0, "the child started with signals blocked");
+    }
+
+    /// A shell script in `dir` that prints `english`, or `german` unless
+    /// both LC_ALL and LC_MESSAGES name the C locale: CUPS on a node whose
+    /// locale is German. Run it as `sh <script>`, so no test executes a file
+    /// it has just written (ETXTBSY while another test forks).
+    fn german_cups_tool(dir: &Path, english: &str, german: &str) -> String {
+        let script = dir.join("cups-tool");
+        let text = format!(
+            "case \"${{LC_ALL:-}}\" in C|C.*) all=C ;; *) all= ;; esac\n\
+             case \"${{LC_MESSAGES:-}}\" in C|C.*) msgs=C ;; *) msgs= ;; esac\n\
+             if [ \"$all$msgs\" = CC ]; then cat <<'EOF'\n{english}\nEOF\n\
+             else cat <<'EOF'\n{german}\nEOF\nfi\n"
+        );
+        std::fs::write(&script, text).unwrap();
+        script.display().to_string()
+    }
+
+    /// J6: on a node with a German locale CUPS answered in German, so
+    /// `lpstat -v` ("Gerät für …") and `lpinfo -l` ("Gerät: URI = …") were
+    /// read as listing no queue and no printer. Every CUPS tool now runs in
+    /// the C locale (ipptool and lpadmin through `run_cups` too).
+    #[test]
+    fn cups_tools_run_untranslated() {
+        let td = tempfile::tempdir().unwrap();
+        let lpstat = german_cups_tool(
+            td.path(),
+            "device for Zebra_ZD421: socket://10.0.0.5:9100",
+            "Gerät für Zebra_ZD421: socket://10.0.0.5:9100",
+        );
+        assert_eq!(
+            parse_lpstat_v(&run("sh", &[&lpstat, "-v"], 10)),
+            [(
+                "Zebra_ZD421".to_string(),
+                "socket://10.0.0.5:9100".to_string()
+            )]
+        );
+        let german_lpinfo = "\
+Gerät: URI = usb://Zebra%20Technologies/ZTC%20ZD220-203dpi%20ZPL?serial=D4N261201258
+       Klasse = direct
+       Info = Zebra Technologies ZTC ZD220-203dpi ZPL
+       Hersteller-und-Modell = Zebra Technologies ZTC ZD220-203dpi ZPL";
+        let td = tempfile::tempdir().unwrap();
+        let lpinfo = german_cups_tool(td.path(), LPINFO_USB_SNIPPET.trim_end(), german_lpinfo);
+        let found = usb_printers_from_lpinfo(&run("sh", &[&lpinfo, "-l", "-v"], 10));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].1.contains("ZD220"), "{found:?}");
+        let out = run_cups(
+            "sh",
+            &["-c", "echo \"$LC_ALL $LC_MESSAGES\""],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(out.stdout, "C.UTF-8 C.UTF-8\n");
     }
 
     #[test]

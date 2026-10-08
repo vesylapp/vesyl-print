@@ -964,6 +964,10 @@ pub struct PrintCableSession {
     client: Mutex<Option<Arc<ActionCableClient>>>,
     /// Serializes start/stop (Python used an RLock around both).
     lifecycle: Mutex<()>,
+    /// How long `start` lingers once the socket thread runs, as if the
+    /// starting thread lost the CPU there (tests).
+    #[cfg(test)]
+    start_pause: Duration,
 }
 
 impl PrintCableSession {
@@ -974,7 +978,16 @@ impl PrintCableSession {
             handlers: Arc::new(handlers),
             client: Mutex::new(None),
             lifecycle: Mutex::new(()),
+            #[cfg(test)]
+            start_pause: Duration::ZERO,
         }
+    }
+
+    /// Have `start` linger `pause` after the socket thread starts.
+    #[cfg(test)]
+    pub(crate) fn with_start_pause(mut self, pause: Duration) -> Self {
+        self.start_pause = pause;
+        self
     }
 
     fn current(&self) -> Option<Arc<ActionCableClient>> {
@@ -1034,11 +1047,16 @@ impl PrintCableSession {
                 on_disconnected: self.handlers.on_disconnected.clone(),
             },
         ));
+        // In place before the socket thread starts: it may subscribe before
+        // start() returns, and on_subscribed's perform() needs the client.
+        *self.client.lock().unwrap() = Some(client.clone());
         if let Err(e) = client.start() {
             log::warn!(target: LOG, "cable: start failed: {e}");
+            self.client.lock().unwrap().take();
             return false;
         }
-        *self.client.lock().unwrap() = Some(client);
+        #[cfg(test)]
+        thread::sleep(self.start_pause);
         true
     }
 
@@ -1684,6 +1702,53 @@ mod tests {
         sess.stop();
         slot.lock().unwrap().take();
         server.join().unwrap();
+    }
+
+    /// J2: the socket thread can subscribe before start() returns (here
+    /// start() lingers 300 ms once the thread runs, as if preempted). The
+    /// client used to be stored only after that, so on_subscribed's
+    /// report_printers found no client and was dropped.
+    #[test]
+    fn on_subscribed_can_perform_before_start_returns() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        let server = thread::spawn(move || {
+            let (mut ws, _, _) = accept_ws(&listener);
+            welcome_and_confirm(&mut ws);
+            serve_pings(&mut ws, Duration::from_millis(100), |t| {
+                let _ = tx.send(t);
+            });
+        });
+        let slot: Arc<Mutex<Option<Arc<PrintCableSession>>>> = Arc::default();
+        let (s2, (done_tx, done_rx)) = (slot.clone(), mpsc::channel());
+        let sess = Arc::new(
+            PrintCableSession::new(
+                &format!("ws://{addr}/print/cable"),
+                ticket("abc"),
+                SessionHandlers {
+                    on_subscribed: Some(Arc::new(move || {
+                        let s = s2.lock().unwrap().clone().unwrap();
+                        let ok = s.perform("report_printers", obj(json!({ "printers": [] })));
+                        done_tx.send(ok).unwrap();
+                    })),
+                    ..Default::default()
+                },
+            )
+            .with_start_pause(Duration::from_millis(300)),
+        );
+        *slot.lock().unwrap() = Some(sess.clone());
+        assert!(sess.start());
+
+        let performed = done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let frame = rx.recv_timeout(Duration::from_secs(5));
+        sess.stop();
+        slot.lock().unwrap().take();
+        server.join().unwrap();
+        assert!(performed, "on_subscribed's perform found no client");
+        let frame: Value = serde_json::from_str(&frame.unwrap()).unwrap();
+        let data: Value = serde_json::from_str(frame["data"].as_str().unwrap()).unwrap();
+        assert_eq!(data["action"], "report_printers");
     }
 
     /// A perform() that times out while the socket thread is busy is dropped,
