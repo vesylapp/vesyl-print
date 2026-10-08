@@ -1,0 +1,45 @@
+.github/workflows/release.yml
+  s_2883cba6969ed7::t_4f7945d625b9e7 24-26,56-59,63,79-81,86
+rust/crates/vesyl-print/tests/build_release.rs
+  s_2883cba6969ed7::t_deb98da11609c9 371-374
+  s_2883cba6969ed7::t_d9d490f333679a 499-508
+  s_2883cba6969ed7::t_e9fd0deac5579c 930-939,942-1004,1007-1012
+  s_2883cba6969ed7::t_33e8586a4eb21e 1155-1173,1176-1209,1211-1237
+  s_2883cba6969ed7::t_e7a9cf7323990e 1569-1641
+  s_2883cba6969ed7::t_b438e8b8401cd1 1005-1006,1174-1175,1210
+  s_2883cba6969ed7::t_189d7a50e3299a 940-941
+  s_2883cba6969ed7::t_4bfacbf4a76986 2-5
+  s_2883cba6969ed7::t_c77cf2c332efba 62-81
+  s_2883cba6969ed7::t_341ec5f43f93d8 109
+  s_2883cba6969ed7::t_188ea7b244313f 252-255
+  s_2883cba6969ed7::t_423994c3673625 9-12
+  s_2883cba6969ed7::t_1faf7ca99d4543 23
+  s_2883cba6969ed7::t_3b8e44853d0d88 44
+.github/zigbuild-requirements.txt
+  s_2883cba6969ed7::t_c97d7ba7ef2912 1-14
+scripts/build-release.sh
+  s_2883cba6969ed7::t_1fcca65c6e225e 351-353
+  s_2883cba6969ed7::t_0803a594d77883 135,138-139,141-147
+  s_2883cba6969ed7::t_81007e690c6539 40-41,48-52
+  s_2883cba6969ed7::t_fa86a8e549d3f5 74,77,80-83,85-88,140,148,237-240,303-306,313-347,363,367,372
+  s_2883cba6969ed7::t_7a3488eb39be1d 348
+.github/workflows/rust.yml
+  s_2883cba6969ed7::t_ae39909d395629 122,126
+  s_2883cba6969ed7::t_80d2e5acd074a0 5-7,9-15,33-34,48-49,65-73,91-121,123-125,127-157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2ca6f0dddaf6f957a702f34368a0043a8b4fb98b",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
