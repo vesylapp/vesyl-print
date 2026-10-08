@@ -1,7 +1,7 @@
 //! HTTP client for VESYL print/v1 REST API.
 //!
-//! Transport comes from [`crate::net`] (urllib-style per-phase timeouts and
-//! proxy rules). Redirects are handled here rather than by ureq: ureq drops
+//! Transport comes from [`crate::net`] (urllib-style timeouts and proxy
+//! rules). Redirects are handled here rather than by ureq: ureq drops
 //! `Authorization` on every hop, and the unauthenticated follow-up's 401 would
 //! make the agent delete its credentials.
 
@@ -162,7 +162,6 @@ fn redirect_error(resp: &Response<Body>) -> CloudError {
 #[derive(Clone)]
 pub struct CloudClient {
     api_base_url: String,
-    timeouts: Timeouts,
     agent: Agent,
 }
 
@@ -171,15 +170,17 @@ impl CloudClient {
         Self::with_timeouts(api_base_url, Timeouts::API)
     }
 
-    /// Python `CloudClient(timeout=...)`: `timeout` bounds connecting and
-    /// waiting for the response (per phase, not end to end). Reading the body
-    /// keeps the API body budget, so a slow but steady download completes.
+    /// Python `CloudClient(timeout=...)`: like urllib's `timeout`, it bounds
+    /// connecting, the response head and every single read, so a connection
+    /// that goes silent fails after `timeout` while a slow but steady body
+    /// completes (within the API body budget).
     pub fn with_timeout(api_base_url: &str, timeout: Duration) -> Self {
         Self::with_timeouts(
             api_base_url,
             Timeouts {
                 connect: timeout,
                 response: timeout,
+                idle: timeout,
                 body: Timeouts::API.body.max(timeout),
             },
         )
@@ -190,7 +191,6 @@ impl CloudClient {
         let agent = net::agent(&api_base_url, timeouts, Redirects::Manual);
         CloudClient {
             api_base_url,
-            timeouts,
             agent,
         }
     }
@@ -204,10 +204,12 @@ impl CloudClient {
     fn get(&self, url: &str, auth: Option<&str>) -> Result<Response<Body>, CloudError> {
         let mut current = Url::parse(url)
             .map_err(|e| CloudError::new(format!("network error: invalid URL {url:?}: {e}"), 0))?;
-        let mut agent = self.agent.clone();
         let mut hops = 0;
         loop {
-            let mut req = agent
+            // The agent picks the proxy per connection, so an http→https hop
+            // gets https_proxy without a new agent.
+            let mut req = self
+                .agent
                 .get(current.as_str())
                 .header("Accept", "application/json");
             if let Some(a) = auth {
@@ -226,10 +228,6 @@ impl CloudClient {
             }
             hops += 1;
             log::debug!(target: LOG, "following HTTP {status} redirect to {}", next.path());
-            if next.scheme() != current.scheme() {
-                // http→https upgrade: the proxy choice depends on the scheme.
-                agent = net::agent(next.as_str(), self.timeouts, Redirects::Manual);
-            }
             current = next;
         }
     }
@@ -841,6 +839,7 @@ mod tests {
         let timeouts = Timeouts {
             connect: Duration::from_secs(1),
             response: Duration::from_secs(1),
+            idle: Duration::from_secs(1),
             body: Duration::from_millis(500),
         };
         let started = Instant::now();
@@ -849,6 +848,28 @@ mod tests {
             .unwrap_err();
         assert_eq!((err.status, err.message.as_str()), (0, "request timed out"));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// N15: a connection that dies after the headers fails after the client
+    /// timeout (urllib's per-read timeout), not the 10-minute body budget.
+    #[test]
+    fn stalled_body_fails_after_the_client_timeout() {
+        let srv = http_stub::serve(|_, s| {
+            use std::io::Write;
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"jobs\"");
+            let _ = s.flush();
+            std::thread::sleep(Duration::from_secs(20));
+        });
+        let started = Instant::now();
+        let err = CloudClient::with_timeout(&srv.base_url, Duration::from_secs(1))
+            .pending_jobs("tok")
+            .unwrap_err();
+        let took = started.elapsed();
+        assert_eq!((err.status, err.message.as_str()), (0, "request timed out"));
+        assert!(took >= Duration::from_millis(900), "{took:?}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        // The API defaults use Python's 30 s per read.
+        assert_eq!(Timeouts::API.idle, Duration::from_secs(30));
     }
 
     const PROXY_CHILD_BASE: &str = "VESYL_TEST_PROXY_CHILD_BASE";
@@ -907,13 +928,34 @@ mod tests {
         // HTTP_PROXY does not apply to https.
         run("https://127.0.0.1:9", &[("HTTP_PROXY", p)]);
         assert_eq!(proxy.requests().len(), 0);
-        // Without a bypass, http_proxy does apply to http.
+        // Without a bypass, http_proxy does apply to http, in absolute form
+        // like urllib (not CONNECT).
         run(&api.base_url, &[("http_proxy", p)]);
         let via = proxy.requests();
         assert_eq!(via.len(), 1);
-        assert_eq!(via[0].method, "CONNECT");
-        assert_eq!(via[0].path, api.base_url.trim_start_matches("http://"));
+        assert_eq!(via[0].method, "GET");
+        assert_eq!(via[0].path, format!("{}/print/v1/whoami", api.base_url));
         assert_eq!(api.requests().len(), 2);
+        // https tunnels with a plain CONNECT, also for an https:// proxy URL,
+        // with the credentials percent-decoded (N20).
+        let authed = p.replace("http://", "https://dev%40corp:p%3As%25s@");
+        run(
+            "https://wms-api.example.test",
+            &[("https_proxy", authed.as_str())],
+        );
+        let via = proxy.requests();
+        assert_eq!(via.len(), 2);
+        assert_eq!(
+            (via[1].method.as_str(), via[1].path.as_str()),
+            ("CONNECT", "wms-api.example.test:443")
+        );
+        let auth = via[1].header("Proxy-Authorization").unwrap();
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            auth.trim_start_matches("Basic "),
+        )
+        .unwrap();
+        assert_eq!(decoded, b"dev@corp:p:s%s");
     }
 
     #[test]

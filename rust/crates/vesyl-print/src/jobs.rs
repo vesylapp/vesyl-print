@@ -1260,9 +1260,11 @@ fn expand_user(p: &str) -> PathBuf {
 
 /// Default content fetcher for `*_uri` jobs.
 ///
-/// Per-phase timeouts like Python's urllib `timeout=60` ([`net::Timeouts::CONTENT`]):
-/// a slow download that keeps making progress is not cut off at 60 s. An HTTP
-/// error status comes back as [`HttpStatusError`].
+/// Timeouts like Python's urllib `timeout=60` ([`net::Timeouts::CONTENT`]):
+/// a slow download that keeps making progress is not cut off at 60 s, and one
+/// that goes silent fails after 60 s without data. Proxies follow urllib,
+/// chosen again on every redirect hop. An HTTP error status comes back as
+/// [`HttpStatusError`].
 pub fn http_get(url: &str) -> Result<Vec<u8>, BoxError> {
     http_get_with(url, net::Timeouts::CONTENT)
 }
@@ -2401,6 +2403,7 @@ mod tests {
         let short = net::Timeouts {
             connect: Duration::from_secs(1),
             response: Duration::from_secs(1),
+            idle: Duration::from_secs(1),
             body: Duration::from_secs(30),
         };
         let started = Instant::now();
@@ -2408,6 +2411,27 @@ mod tests {
         assert!(started.elapsed() > Duration::from_millis(1500));
         assert_eq!(data.len(), 8192);
         assert_eq!(&data[7 * 1024..], &[7u8; 1024][..]);
+    }
+
+    /// N15: a content host whose connection goes silent after the headers
+    /// fails after the per-read timeout (Python's 60 s), not the 15-minute
+    /// body budget, so the agent loop gets back to printing and heartbeating.
+    #[test]
+    fn stalled_download_fails_after_the_idle_timeout() {
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 8192\r\n\r\n".to_string();
+        // The body would only start 10 s after the headers.
+        let url = trickle_server(head, vec![vec![1u8; 1024]], Duration::from_secs(10));
+        let short = net::Timeouts {
+            idle: Duration::from_secs(1),
+            ..net::Timeouts::CONTENT
+        };
+        let started = Instant::now();
+        let err = http_get_with(&url, short).unwrap_err();
+        let took = started.elapsed();
+        assert!(err.to_string().contains("timeout"), "{err}");
+        assert!(took >= Duration::from_millis(900), "{took:?}");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert_eq!(net::Timeouts::CONTENT.idle, Duration::from_secs(60));
     }
 
     #[test]
