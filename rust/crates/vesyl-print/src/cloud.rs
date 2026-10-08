@@ -1,16 +1,25 @@
 //! HTTP client for VESYL print/v1 REST API.
+//!
+//! Transport comes from [`crate::net`] (urllib-style per-phase timeouts and
+//! proxy rules). Redirects are handled here rather than by ureq: ureq drops
+//! `Authorization` on every hop, and the unauthenticated follow-up's 401 would
+//! make the agent delete its credentials.
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use ureq::tls::{RootCerts, TlsConfig};
-use ureq::Agent;
+use ureq::http::{header, Response};
+use ureq::{Agent, Body};
+use url::Url;
 
+use crate::net::{self, Redirects, Timeouts};
 use crate::JsonObject;
 
 const LOG: &str = "vesyl-print.cloud";
 /// Pending-jobs payloads can carry base64 PDFs; ureq's default cap is 10 MB.
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+/// Same-host GET redirects followed per request (urllib allows 10).
+const MAX_REDIRECTS: usize = 5;
 
 /// API or transport error. `status` is the HTTP code or 0 for network failure.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -88,40 +97,141 @@ fn quote_segment(s: &str) -> String {
     out
 }
 
+fn transport_error(e: ureq::Error) -> CloudError {
+    match e {
+        ureq::Error::Timeout(_) => CloudError::new("request timed out", 0),
+        other => CloudError::new(format!("network error: {other}"), 0),
+    }
+}
+
+/// Redirect codes urllib's `HTTPRedirectHandler` follows.
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn location(resp: &Response<Body>) -> Option<&str> {
+    resp.headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+}
+
+/// Whether the device token may follow a redirect from `from` to `to`: same
+/// host, and either the same scheme and port or an http→https upgrade on the
+/// default ports. Another host or port, or a downgrade, never gets the token.
+fn same_host_redirect(from: &Url, to: &Url) -> bool {
+    if from.host_str().is_none() || from.host_str() != to.host_str() {
+        return false;
+    }
+    match (from.scheme(), to.scheme()) {
+        (a, b) if a == b => from.port_or_known_default() == to.port_or_known_default(),
+        ("http", "https") => from.port().is_none() && to.port().is_none(),
+        _ => false,
+    }
+}
+
+/// Where a GET to `current` should be re-sent, if `resp` is a redirect the
+/// token may follow.
+fn follow_target(current: &Url, resp: &Response<Body>) -> Option<Url> {
+    if !is_redirect(resp.status().as_u16()) {
+        return None;
+    }
+    let mut to = current.join(location(resp)?).ok()?;
+    to.set_fragment(None);
+    same_host_redirect(current, &to).then_some(to)
+}
+
+/// A 3xx we did not follow. Its status stays 3xx so it can never read as a
+/// rejected token (401), whatever the redirect target would have answered.
+fn redirect_error(resp: &Response<Body>) -> CloudError {
+    let status = resp.status().as_u16();
+    match location(resp) {
+        Some(loc) => CloudError::new(
+            format!(
+                "unexpected redirect to {}",
+                loc.chars().take(200).collect::<String>()
+            ),
+            status,
+        ),
+        None => CloudError::new(format!("unexpected HTTP {status}"), status),
+    }
+}
+
 /// Thin REST client. Callers must never log Authorization headers or tokens.
 #[derive(Clone)]
 pub struct CloudClient {
     api_base_url: String,
+    timeouts: Timeouts,
     agent: Agent,
 }
 
 impl CloudClient {
     pub fn new(api_base_url: &str) -> Self {
-        Self::with_timeout(api_base_url, Duration::from_secs(30))
+        Self::with_timeouts(api_base_url, Timeouts::API)
     }
 
+    /// Python `CloudClient(timeout=...)`: `timeout` bounds connecting and
+    /// waiting for the response (per phase, not end to end). Reading the body
+    /// keeps the API body budget, so a slow but steady download completes.
     pub fn with_timeout(api_base_url: &str, timeout: Duration) -> Self {
-        let agent: Agent = Agent::config_builder()
-            .timeout_global(Some(timeout))
-            // We map 4xx/5xx bodies into CloudError ourselves.
-            .http_status_as_error(false)
-            .user_agent("vesyl-print-agent")
-            // OS trust store, like Python urllib (sites may add a TLS-inspection CA).
-            .tls_config(
-                TlsConfig::builder()
-                    .root_certs(RootCerts::PlatformVerifier)
-                    .build(),
-            )
-            .build()
-            .into();
+        Self::with_timeouts(
+            api_base_url,
+            Timeouts {
+                connect: timeout,
+                response: timeout,
+                body: Timeouts::API.body.max(timeout),
+            },
+        )
+    }
+
+    pub fn with_timeouts(api_base_url: &str, timeouts: Timeouts) -> Self {
+        let api_base_url = format!("{}/", api_base_url.trim_end_matches('/'));
+        let agent = net::agent(&api_base_url, timeouts, Redirects::Manual);
         CloudClient {
-            api_base_url: format!("{}/", api_base_url.trim_end_matches('/')),
+            api_base_url,
+            timeouts,
             agent,
         }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.api_base_url, path.trim_start_matches('/'))
+    }
+
+    /// GET `url`, re-sending the headers (token included) across same-host
+    /// redirects as urllib does. Any other 3xx comes back unfollowed.
+    fn get(&self, url: &str, auth: Option<&str>) -> Result<Response<Body>, CloudError> {
+        let mut current = Url::parse(url)
+            .map_err(|e| CloudError::new(format!("network error: invalid URL {url:?}: {e}"), 0))?;
+        let mut agent = self.agent.clone();
+        let mut hops = 0;
+        loop {
+            let mut req = agent
+                .get(current.as_str())
+                .header("Accept", "application/json");
+            if let Some(a) = auth {
+                req = req.header("Authorization", a);
+            }
+            let resp = req.call().map_err(transport_error)?;
+            let Some(next) = follow_target(&current, &resp) else {
+                return Ok(resp);
+            };
+            let status = resp.status().as_u16();
+            if hops == MAX_REDIRECTS {
+                return Err(CloudError::new(
+                    format!("too many redirects (last to {next})"),
+                    status,
+                ));
+            }
+            hops += 1;
+            log::debug!(target: LOG, "following HTTP {status} redirect to {}", next.path());
+            if next.scheme() != current.scheme() {
+                // http→https upgrade: the proxy choice depends on the scheme.
+                agent = net::agent(next.as_str(), self.timeouts, Redirects::Manual);
+            }
+            current = next;
+        }
     }
 
     fn request(
@@ -138,14 +248,8 @@ impl CloudClient {
             .map(|t| format!("Bearer {t}"));
         // Always send a body for POST so the server never sees a bodiless request
         // (a GET on /heartbeat yields Rails RoutingError "Not Found").
-        let result = match method {
-            "GET" => {
-                let mut req = self.agent.get(&url).header("Accept", "application/json");
-                if let Some(a) = &auth {
-                    req = req.header("Authorization", a);
-                }
-                req.call()
-            }
+        let mut resp = match method {
+            "GET" => self.get(&url, auth.as_deref())?,
             _ => {
                 let empty = json!({});
                 let payload = serde_json::to_vec(body.unwrap_or(&empty)).expect("json");
@@ -157,21 +261,21 @@ impl CloudClient {
                 if let Some(a) = &auth {
                     req = req.header("Authorization", a);
                 }
-                req.send(&payload[..])
+                req.send(&payload[..]).map_err(transport_error)?
             }
         };
 
-        let mut resp = result.map_err(|e| match e {
-            ureq::Error::Timeout(_) => CloudError::new("request timed out", 0),
-            other => CloudError::new(format!("network error: {other}"), 0),
-        })?;
         let status = resp.status().as_u16();
+        // POSTs are never re-sent, and GETs only within the same host (above).
+        if (300..400).contains(&status) {
+            return Err(redirect_error(&resp));
+        }
         let raw = resp
             .body_mut()
             .with_config()
             .limit(MAX_RESPONSE_BYTES)
             .read_to_vec()
-            .map_err(|e| CloudError::new(format!("network error: {e}"), 0))?;
+            .map_err(transport_error)?;
 
         if status >= 400 {
             return Err(parse_error_body(&raw, status));
@@ -329,10 +433,148 @@ pub struct HeartbeatBody {
     pub update: Option<JsonObject>,
 }
 
+/// Loopback HTTP server for tests that need full control of the response
+/// (redirects, extra headers, slow or stalled bodies); `testutil::serve` only
+/// sends canned JSON. Shared with the update and CLI tests.
+#[cfg(test)]
+pub(crate) mod http_stub {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    #[derive(Debug, Clone)]
+    pub struct Request {
+        pub method: String,
+        /// Request target as sent (`/path`, or `host:port` for CONNECT).
+        pub path: String,
+        pub headers: Vec<(String, String)>,
+        pub body: Vec<u8>,
+    }
+
+    impl Request {
+        pub fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+
+        /// Port from the `Host` header (to build same- or cross-host URLs).
+        pub fn port(&self) -> String {
+            self.header("Host")
+                .and_then(|h| h.rsplit(':').next())
+                .unwrap_or_default()
+                .to_string()
+        }
+    }
+
+    pub struct Stub {
+        pub base_url: String,
+        requests: Arc<Mutex<Vec<Request>>>,
+    }
+
+    impl Stub {
+        pub fn requests(&self) -> Vec<Request> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// Serve every connection on its own thread; `handler` writes the raw
+    /// response. Requests are recorded before the handler runs.
+    pub fn serve(handler: impl Fn(&Request, &mut TcpStream) + Send + Sync + 'static) -> Stub {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (rec, handler) = (requests.clone(), Arc::new(handler));
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let (rec, handler) = (rec.clone(), handler.clone());
+                thread::spawn(move || {
+                    if let Some(req) = read_request(&stream) {
+                        rec.lock().unwrap().push(req.clone());
+                        handler(&req, &mut stream);
+                    }
+                });
+            }
+        });
+        Stub { base_url, requests }
+    }
+
+    fn read_request(stream: &TcpStream) -> Option<Request> {
+        let mut reader = BufReader::new(stream.try_clone().ok()?);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        let mut parts = line.split_whitespace();
+        let method = parts.next()?.to_string();
+        let path = parts.next().unwrap_or_default().to_string();
+        let mut headers = Vec::new();
+        let mut len = 0usize;
+        loop {
+            let mut h = String::new();
+            if reader.read_line(&mut h).ok()? == 0 {
+                break;
+            }
+            let h = h.trim_end();
+            if h.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = h.split_once(':') {
+                let (k, v) = (k.trim().to_string(), v.trim().to_string());
+                if k.eq_ignore_ascii_case("content-length") {
+                    len = v.parse().unwrap_or(0);
+                }
+                headers.push((k, v));
+            }
+        }
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body).ok()?;
+        Some(Request {
+            method,
+            path,
+            headers,
+            body,
+        })
+    }
+
+    /// Write a complete response (`Content-Length`, `Connection: close`).
+    pub fn respond(stream: &mut TcpStream, status: u16, headers: &[(&str, &str)], body: &[u8]) {
+        let mut head = format!(
+            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (k, v) in headers {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+        head.push_str("\r\n");
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+    }
+
+    /// Send the head and then `body` in `chunks` pieces, `gap` apart.
+    pub fn trickle(stream: &mut TcpStream, body: &[u8], chunks: usize, gap: std::time::Duration) {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.flush();
+        for chunk in body.chunks(body.len().div_ceil(chunks.max(1)).max(1)) {
+            thread::sleep(gap);
+            let _ = stream.write_all(chunk);
+            let _ = stream.flush();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::http_stub::{self, respond};
     use super::*;
     use crate::testutil::serve;
+    use std::time::Instant;
 
     #[test]
     fn claim_parses_201() {
@@ -446,5 +688,241 @@ mod tests {
         let body: Value = serde_json::from_slice(&reqs[2].body).unwrap();
         assert_eq!(body["status"], "error");
         assert_eq!(body["message"], "lp failed");
+    }
+
+    /// 401 unless the request carries the token — what wms-api does.
+    fn whoami_v2(req: &http_stub::Request, s: &mut std::net::TcpStream) {
+        if req.header("Authorization") == Some("Bearer tok") {
+            respond(s, 200, &[], br#"{"node_id":"n1"}"#);
+        } else {
+            respond(s, 401, &[], br#"{"error":{"code":"unauthorized"}}"#);
+        }
+    }
+
+    #[test]
+    fn same_host_redirect_resends_token() {
+        for status in [301u16, 302, 303, 307, 308] {
+            let srv = http_stub::serve(move |req, s| match req.path.as_str() {
+                "/print/v1/whoami" => {
+                    respond(s, status, &[("Location", "/v2/print/v1/whoami")], b"")
+                }
+                _ => whoami_v2(req, s),
+            });
+            let who = CloudClient::new(&srv.base_url).whoami("tok").unwrap();
+            assert_eq!(who["node_id"], "n1", "HTTP {status}");
+            let reqs = srv.requests();
+            assert_eq!(reqs.len(), 2);
+            assert_eq!(reqs[1].path, "/v2/print/v1/whoami");
+            assert_eq!(reqs[1].header("Authorization"), Some("Bearer tok"));
+            assert_eq!(reqs[1].header("Accept"), Some("application/json"));
+        }
+    }
+
+    #[test]
+    fn absolute_same_host_redirect_is_followed() {
+        let srv = http_stub::serve(|req, s| match req.path.as_str() {
+            "/print/v1/jobs/pending" => {
+                let to = format!("http://127.0.0.1:{}/v2/jobs?x=1#frag", req.port());
+                respond(s, 302, &[("Location", &to)], b"")
+            }
+            _ if req.header("Authorization") == Some("Bearer tok") => {
+                respond(s, 200, &[], br#"{"jobs":[{"id":"j1"}]}"#)
+            }
+            _ => respond(s, 401, &[], b""),
+        });
+        let jobs = CloudClient::new(&srv.base_url).pending_jobs("tok").unwrap();
+        assert_eq!(jobs[0]["id"], "j1");
+        assert_eq!(srv.requests()[1].path, "/v2/jobs?x=1");
+    }
+
+    #[test]
+    fn cross_host_redirect_is_an_error_not_a_401() {
+        // "localhost" and port 1 are other origins: the token must not follow.
+        // (localhost reaches this same stub, so a follow would be recorded.)
+        for target in [
+            "http://localhost:{port}/v2/print/v1/whoami",
+            "http://127.0.0.1:1/x",
+        ] {
+            let srv = http_stub::serve(move |req, s| match req.path.as_str() {
+                "/print/v1/whoami" => {
+                    let to = target.replace("{port}", &req.port());
+                    respond(s, 302, &[("Location", &to)], b"")
+                }
+                _ => whoami_v2(req, s),
+            });
+            let err = CloudClient::new(&srv.base_url).whoami("tok").unwrap_err();
+            assert_eq!(err.status, 302, "{target}");
+            assert!(!err.unauthorized());
+            assert!(
+                err.message.starts_with("unexpected redirect to http://"),
+                "{err}"
+            );
+            assert_eq!(srv.requests().len(), 1, "{target} was followed");
+        }
+    }
+
+    #[test]
+    fn post_redirect_is_not_followed() {
+        let srv = http_stub::serve(|req, s| match req.path.as_str() {
+            "/print/v1/heartbeat" => {
+                respond(s, 307, &[("Location", "/v2/print/v1/heartbeat")], b"")
+            }
+            _ => whoami_v2(req, s),
+        });
+        let err = CloudClient::new(&srv.base_url)
+            .heartbeat("tok", &HeartbeatBody::default())
+            .unwrap_err();
+        assert_eq!(err.status, 307);
+        assert!(!err.unauthorized());
+        assert_eq!(err.message, "unexpected redirect to /v2/print/v1/heartbeat");
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].body, b"{}");
+    }
+
+    #[test]
+    fn redirect_loop_and_missing_location_are_errors() {
+        let srv = http_stub::serve(|req, s| match req.path.as_str() {
+            "/print/v1/whoami" => respond(s, 302, &[("Location", "/loop")], b""),
+            "/loop" => respond(s, 302, &[("Location", "/loop")], b""),
+            _ => respond(s, 302, &[], b""),
+        });
+        let client = CloudClient::new(&srv.base_url);
+        let err = client.whoami("tok").unwrap_err();
+        assert_eq!(err.status, 302);
+        assert!(err.message.starts_with("too many redirects"), "{err}");
+        assert_eq!(srv.requests().len(), 1 + MAX_REDIRECTS);
+
+        let err = client.ack_job("tok", "j1").unwrap_err();
+        assert_eq!(
+            (err.status, err.message.as_str()),
+            (302, "unexpected HTTP 302")
+        );
+    }
+
+    #[test]
+    fn redirect_rules() {
+        let ok =
+            |a: &str, b: &str| same_host_redirect(&Url::parse(a).unwrap(), &Url::parse(b).unwrap());
+        assert!(ok("https://api.example/print/", "https://API.example/v2/"));
+        assert!(ok("http://api.example/", "https://api.example/"));
+        assert!(ok("http://api.example:8080/", "http://api.example:8080/v2"));
+        assert!(!ok("https://api.example/", "http://api.example/"));
+        assert!(!ok("https://api.example/", "https://other.example/"));
+        assert!(!ok("https://api.example/", "https://api.example:8443/"));
+        assert!(!ok("http://api.example:8080/", "https://api.example/"));
+        assert!(!ok("http://api.example/", "ftp://api.example/"));
+    }
+
+    #[test]
+    fn slow_steady_body_outlives_the_per_phase_timeout() {
+        // 2.5 s of body against a 1 s timeout: urllib's timeout is per socket
+        // operation, so Python completes this; an end-to-end deadline did not.
+        let body = r#"{"jobs":[{"id":"j1"},{"id":"j2"},{"id":"j3"}]}"#;
+        let srv = http_stub::serve(move |_, s| {
+            http_stub::trickle(s, body.as_bytes(), 10, Duration::from_millis(250))
+        });
+        let started = Instant::now();
+        let jobs = CloudClient::with_timeout(&srv.base_url, Duration::from_secs(1))
+            .pending_jobs("tok")
+            .unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert!(started.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stalled_body_times_out() {
+        let srv = http_stub::serve(|_, s| {
+            use std::io::Write;
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"jobs\"");
+            let _ = s.flush();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(1),
+            response: Duration::from_secs(1),
+            body: Duration::from_millis(500),
+        };
+        let started = Instant::now();
+        let err = CloudClient::with_timeouts(&srv.base_url, timeouts)
+            .pending_jobs("tok")
+            .unwrap_err();
+        assert_eq!((err.status, err.message.as_str()), (0, "request timed out"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    const PROXY_CHILD_BASE: &str = "VESYL_TEST_PROXY_CHILD_BASE";
+
+    /// Proxy variables must follow urllib's rules. They are process-global, so
+    /// each case runs `proxy_env_child` in a child copy of this test binary.
+    #[test]
+    fn proxy_env_rules_match_urllib() {
+        let api = http_stub::serve(|_, s| respond(s, 200, &[], br#"{"node_id":"n1"}"#));
+        let proxy = http_stub::serve(|_, s| respond(s, 502, &[], b""));
+        let run = |base: &str, vars: &[(&str, &str)]| {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "cloud::tests::proxy_env_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+            for k in [
+                "http_proxy",
+                "HTTP_PROXY",
+                "https_proxy",
+                "HTTPS_PROXY",
+                "all_proxy",
+                "ALL_PROXY",
+                "no_proxy",
+                "NO_PROXY",
+                "REQUEST_METHOD",
+            ] {
+                cmd.env_remove(k);
+            }
+            let out = cmd
+                .env(PROXY_CHILD_BASE, base)
+                .envs(vars.iter().copied())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "child failed: {stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let p = proxy.base_url.as_str();
+
+        // NO_PROXY entries are trimmed (ureq kept the leading space).
+        run(
+            &api.base_url,
+            &[("http_proxy", p), ("NO_PROXY", "example.com, 127.0.0.1")],
+        );
+        assert_eq!((api.requests().len(), proxy.requests().len()), (1, 0));
+        // ALL_PROXY is ignored, as urllib ignores it.
+        run(&api.base_url, &[("ALL_PROXY", p)]);
+        assert_eq!((api.requests().len(), proxy.requests().len()), (2, 0));
+        // HTTP_PROXY does not apply to https.
+        run("https://127.0.0.1:9", &[("HTTP_PROXY", p)]);
+        assert_eq!(proxy.requests().len(), 0);
+        // Without a bypass, http_proxy does apply to http.
+        run(&api.base_url, &[("http_proxy", p)]);
+        let via = proxy.requests();
+        assert_eq!(via.len(), 1);
+        assert_eq!(via[0].method, "CONNECT");
+        assert_eq!(via[0].path, api.base_url.trim_start_matches("http://"));
+        assert_eq!(api.requests().len(), 2);
+    }
+
+    #[test]
+    #[ignore = "child process of proxy_env_rules_match_urllib"]
+    fn proxy_env_child() {
+        let Ok(base) = std::env::var(PROXY_CHILD_BASE) else {
+            return;
+        };
+        let result = CloudClient::with_timeout(&base, Duration::from_secs(5)).whoami("tok");
+        println!("whoami via {base}: {result:?}");
     }
 }
