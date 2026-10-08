@@ -1,3 +1,5 @@
+# setup.sh installs this unit with User= set to the service account and
+# /opt/vesyl-print replaced by its INSTALL_ROOT.
 [Unit]
 Description=VESYL Print — LCD system info display
 # Wait until Plymouth has quit before painting. Plymouth owns the LCD during

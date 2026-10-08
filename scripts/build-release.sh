@@ -3,18 +3,22 @@
 # Build a signed vesyl-print OTA release (tarball + manifest).
 #
 # Usage:
-#   ./scripts/build-release.sh
-#   ./scripts/build-release.sh 0.4.0
-#   UPDATE_PRIVATE_KEY_FILE=/path/to/key.pem ./scripts/build-release.sh
+#   ./scripts/build-release.sh [VERSION]            # default: the VERSION file
+#   UPDATE_PRIVATE_KEY_FILE=/path/to/key.pem ./scripts/build-release.sh 0.4.0
 #
 # By default this builds the tarball and signs its manifest in one go. CI runs
-# the two halves in separate jobs, so the signing key never shares a runner
-# with cargo build scripts, proc-macros or the zig toolchain:
-#   BUILD_ONLY=1  build and package the tarball only. Writes no manifest and
-#                 never reads a key (one left in the environment is dropped).
-#   SIGN_ONLY=1   sign the tarball already in $OUT_DIR: hash it and write its
-#                 signed manifest. Runs only sha256sum, python3 (stdlib) and
-#                 openssl: no cargo, rsync, tar or third-party tools. Needs a key.
+# the steps in separate jobs, so the signing key never shares a runner with
+# cargo build scripts, proc-macros or the zig toolchain:
+#   BUILD_ONLY=1   build and package the tarball only. Writes no manifest and
+#                  never reads a key (one left in the environment is dropped).
+#   SIGN_ONLY=1    sign the tarball already in $OUT_DIR: hash it and write its
+#                  signed manifest. Runs only jq, openssl, sha256sum and
+#                  coreutils: no cargo, rsync, tar or Python. Needs a key.
+#   VERIFY_ONLY=1  check the tarball + manifest already in $OUT_DIR before they
+#                  are published: the manifest names this version, artifact URL
+#                  and tarball sha256, and its signature verifies against
+#                  UPDATE_PUBLIC_KEY_FILE (default keys/update_public.pem).
+#                  Same tools as SIGN_ONLY; never reads a private key.
 #
 # Env:
 #   UPDATE_PRIVATE_KEY       PEM private key contents (CI secret)
@@ -25,23 +29,33 @@
 #                            (lab keys).
 #   GITHUB_REPOSITORY        owner/repo (default: vesylapp/vesyl-print)
 #   RELEASE_CHANNEL          stable|beta (default: stable)
+#   RELEASE_CHANGELOG        optional release notes, signed into the manifest
+#   MIN_AGENT_VERSION        oldest agent that may install this release over
+#                            OTA (default: 0.4.0). Python-era 0.3.x agents
+#                            refuse it: their systemd units still run python3,
+#                            so those devices are re-provisioned with setup.sh.
 #   OUT_DIR                  output directory (default: dist)
-#   SKIP_RUST_BINARY=1       Python-only tarball (no vesyl-print binary)
 #   AARCH64_SYSROOT          aarch64 glibc root for qemu-aarch64
 #                            (default: /usr/aarch64-linux-gnu)
 #
-# The Rust agent/CLI binary is cross-compiled for aarch64 (glibc >= 2.31) with
-# cargo-zigbuild and placed at the tarball root as ./vesyl-print. agent.py and
-# cli.py hand off to it when present, so existing systemd units keep working.
-# It is packaged from cargo's own target directory (CARGO_TARGET_DIR and
-# build.target-dir are honoured) after any previous build there is deleted,
-# and it must report $VERSION: it is run on an aarch64 host, or under
-# qemu-aarch64 when an aarch64 sysroot is installed (Debian/Ubuntu: qemu-user
-# + libc6-arm64-cross); elsewhere the version string must at least be in it.
+# The tarball holds the vesyl-print binary (Rust agent + CLI) at its root, the
+# Python LCD display (*.py), assets, and the files setup.sh needs to provision
+# a device from the extracted tree. It never holds rust/, tests/ or secrets.
+# The binary is cross-compiled for aarch64 (glibc >= 2.31) with cargo-zigbuild
+# from cargo's own target directory (CARGO_TARGET_DIR and build.target-dir are
+# honoured), after any previous build there is deleted, and it must report
+# $VERSION: it is run on an aarch64 host, or under qemu-aarch64 when an aarch64
+# sysroot is installed (Debian/Ubuntu: qemu-user + libc6-arm64-cross);
+# elsewhere the version string must at least be in it.
+#
+# The signature is Ed25519 over the manifest's canonical JSON: every field but
+# "signature" and nulls, keys sorted, compact, non-ASCII escaped as \uXXXX
+# (jq -S -c -a). Devices rebuild the same bytes in update.rs
+# ReleaseManifest::canonical_bytes(); the two must never diverge.
 #
 # Artifacts written to $OUT_DIR:
-#   vesyl-print-X.Y.Z-linux-aarch64.tar.gz
-#   vesyl-print-X.Y.Z.manifest.json   (not with BUILD_ONLY=1)
+#   vesyl-print-X.Y.Z-linux-aarch64.tar.gz   (not with SIGN_ONLY / VERIFY_ONLY)
+#   vesyl-print-X.Y.Z.manifest.json          (not with BUILD_ONLY / VERIFY_ONLY)
 #
 set -euo pipefail
 
@@ -58,18 +72,28 @@ if [[ -z "$VERSION" ]]; then
   VERSION="$(tr -d '[:space:]' < VERSION)"
 fi
 VERSION="${VERSION#v}"
-if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$ ]]; then
-  echo "ERROR: invalid version: $VERSION" >&2
-  exit 1
-fi
+# Same pattern as update.rs is_version and scripts/apply-update.
+VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'
+[[ "$VERSION" =~ $VERSION_RE ]] || die "invalid version: $VERSION"
 
 BUILD_ONLY="${BUILD_ONLY:-}"
 SIGN_ONLY="${SIGN_ONLY:-}"
-if [[ "$BUILD_ONLY" == "1" && "$SIGN_ONLY" == "1" ]]; then
-  die "BUILD_ONLY=1 and SIGN_ONLY=1 are mutually exclusive"
+VERIFY_ONLY="${VERIFY_ONLY:-}"
+modes=0
+for mode in "$BUILD_ONLY" "$SIGN_ONLY" "$VERIFY_ONLY"; do
+  if [[ "$mode" == "1" ]]; then
+    modes=$((modes + 1))
+  fi
+done
+if ((modes > 1)); then
+  die "BUILD_ONLY=1, SIGN_ONLY=1 and VERIFY_ONLY=1 are mutually exclusive"
 fi
 
+command -v jq >/dev/null 2>&1 || die "jq not found (Debian/Ubuntu: apt install jq)"
+
 CHANNEL="${RELEASE_CHANNEL:-stable}"
+CHANGELOG="${RELEASE_CHANGELOG:-}"
+MIN_AGENT_VERSION="${MIN_AGENT_VERSION:-0.4.0}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/dist}"
 ARCH="linux-aarch64"
 GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-vesylapp/vesyl-print}"
@@ -82,10 +106,84 @@ ARTIFACT_URL="${DOWNLOAD_BASE}/${ASSET_NAME}"
 TARBALL="${OUT_DIR}/${ASSET_NAME}"
 MANIFEST="${OUT_DIR}/${MANIFEST_NAME}"
 
+# version_core_ge A B: A's major.minor.patch >= B's (suffixes ignored).
+version_core_ge() {
+  local -a a b
+  local i
+  IFS=.- read -r -a a <<<"$1"
+  IFS=.- read -r -a b <<<"$2"
+  for i in 0 1 2; do
+    if ((10#${a[i]} != 10#${b[i]})); then
+      ((10#${a[i]} > 10#${b[i]}))
+      return
+    fi
+  done
+}
+
+if [[ "$VERIFY_ONLY" != "1" ]]; then
+  [[ "$MIN_AGENT_VERSION" =~ $VERSION_RE ]] ||
+    die "invalid MIN_AGENT_VERSION: $MIN_AGENT_VERSION"
+  # A device running this release must be able to install the next one.
+  version_core_ge "$VERSION" "$MIN_AGENT_VERSION" ||
+    die "version $VERSION is below MIN_AGENT_VERSION $MIN_AGENT_VERSION: devices" \
+      "running it could never update over OTA again (bump VERSION, or set" \
+      "MIN_AGENT_VERSION to the first Rust-only release)"
+fi
+
 mkdir -p "$OUT_DIR"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/vesyl-print-release.XXXXXX")"
 cleanup() { rm -rf "$STAGE"; }
 trap cleanup EXIT
+
+# The manifest's canonical JSON: the exact bytes that are signed and verified.
+canonical_json() {
+  jq -S -c -a -j 'del(.signature) | with_entries(select(.value != null))' "$1"
+}
+
+# manifest_verifies <manifest> <public key>: its signature is good.
+manifest_verifies() {
+  local canonical="${STAGE}/verify.canonical.json" sig="${STAGE}/verify.sig"
+  canonical_json "$1" >"$canonical" || return 1
+  jq -r '.signature // ""' "$1" | tr -d '[:space:]' | base64 -d >"$sig" 2>/dev/null || return 1
+  openssl pkeyutl -verify -pubin -inkey "$2" -rawin -in "$canonical" \
+    -sigfile "$sig" >/dev/null 2>&1
+}
+
+sha256_of() {
+  local sum
+  sum="$(sha256sum "$1")"
+  printf '%s\n' "${sum%% *}"
+}
+
+if [[ "$VERIFY_ONLY" == "1" ]]; then
+  if [[ -n "${UPDATE_PRIVATE_KEY:-}${UPDATE_PRIVATE_KEY_FILE:-}" ]]; then
+    echo "   VERIFY_ONLY=1: ignoring UPDATE_PRIVATE_KEY / UPDATE_PRIVATE_KEY_FILE"
+  fi
+  unset UPDATE_PRIVATE_KEY UPDATE_PRIVATE_KEY_FILE
+  PUBLIC_KEY="${UPDATE_PUBLIC_KEY_FILE:-$REPO_ROOT/keys/update_public.pem}"
+  [[ -f "$PUBLIC_KEY" ]] || die "public key not found: $PUBLIC_KEY"
+  [[ -f "$TARBALL" ]] || die "VERIFY_ONLY=1: missing $TARBALL"
+  [[ -f "$MANIFEST" ]] || die "VERIFY_ONLY=1: missing $MANIFEST"
+  echo "==> Verifying $MANIFEST"
+  jq -e 'type == "object"' "$MANIFEST" >/dev/null 2>&1 || die "$MANIFEST is not a JSON object"
+  field() { jq -r --arg k "$1" '.[$k] // "" | tostring' "$MANIFEST"; }
+  problems=()
+  got="$(field version)"
+  [[ "$got" == "$VERSION" ]] || problems+=("version '$got' != '$VERSION'")
+  [[ "$(field artifact_sha256)" == "$(sha256_of "$TARBALL")" ]] ||
+    problems+=("artifact_sha256 does not match $ASSET_NAME")
+  got="$(field artifact_url)"
+  [[ "$got" == "$ARTIFACT_URL" ]] || problems+=("artifact_url '$got' != '$ARTIFACT_URL'")
+  [[ -n "$(field signature)" ]] || problems+=("manifest is not signed")
+  if ((${#problems[@]})); then
+    printf -v joined '%s; ' "${problems[@]}"
+    die "refusing to publish: ${joined%; }"
+  fi
+  manifest_verifies "$MANIFEST" "$PUBLIC_KEY" ||
+    die "refusing to publish: signature does not verify against $PUBLIC_KEY"
+  echo "   $MANIFEST_NAME describes $ASSET_NAME and verifies against $PUBLIC_KEY"
+  exit 0
+fi
 
 # A manifest left from an earlier run never describes what this run builds.
 rm -f "$MANIFEST"
@@ -113,8 +211,53 @@ unset UPDATE_PRIVATE_KEY UPDATE_PRIVATE_KEY_FILE
 if [[ "$SIGN_ONLY" == "1" && -z "$KEY_FILE" ]]; then
   die "SIGN_ONLY=1 needs UPDATE_PRIVATE_KEY or UPDATE_PRIVATE_KEY_FILE"
 fi
+if [[ -n "$KEY_FILE" && -n "${UPDATE_PUBLIC_KEY_FILE:-}" && ! -f "$UPDATE_PUBLIC_KEY_FILE" ]]; then
+  die "UPDATE_PUBLIC_KEY_FILE not found: $UPDATE_PUBLIC_KEY_FILE"
+fi
 
 RUST_TARGET="aarch64-unknown-linux-gnu"
+
+# Runtime files, relative to the repo root (rsync filter rules, first match
+# wins). Everything else stays out: rust/, tests/, .github/, keys other than
+# the public key, requirements.txt, dist/, and any untracked local files.
+PACKAGE_FILTER=(
+  --exclude='__pycache__/'
+  --exclude='*.py[cod]'
+  --exclude='update_private.pem'
+  --exclude='tailscale.key'
+  --exclude='credentials.json'
+  --exclude='.env'
+  --exclude='/scripts/build-release.sh'
+  --include='/VERSION'
+  --include='/*.py'
+  --include='/*.service'
+  --include='/*.md'
+  --include='/setup.sh'
+  --include='/base.jpg'
+  --include='/assets/***'
+  --include='/overlays/***'
+  --include='/scripts/***'
+  --include='/keys/'
+  --include='/keys/update_public.pem'
+  --exclude='*'
+)
+# What a device needs from the tree: the units run vesyl-print and main.py,
+# setup.sh provisions from it, test-print sends the test labels, and the
+# auto-provision test page is base.jpg.
+REQUIRED_FILES=(
+  vesyl-print
+  VERSION
+  main.py
+  setup.sh
+  vesyl-print-agent.service
+  vesyl-print-display.service
+  scripts/apply-update
+  scripts/wifi-setup
+  keys/update_public.pem
+  base.jpg
+  assets/test-labels/vesyl-roadrunner-4x6.pdf
+  assets/test-labels/vesyl-roadrunner-4x6.zpl
+)
 
 # The packaged binary must report $VERSION.
 check_binary_version() {
@@ -141,16 +284,14 @@ check_binary_version() {
 }
 
 build_rust_binary() {
-  if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-    echo "ERROR: cargo-zigbuild not found (pip install ziglang cargo-zigbuild)" >&2
-    echo "       or set SKIP_RUST_BINARY=1 for a Python-only release" >&2
-    exit 1
-  fi
+  command -v cargo-zigbuild >/dev/null 2>&1 ||
+    die "cargo-zigbuild not found: install it with zig (pip install ziglang" \
+      "cargo-zigbuild, or cargo install --locked cargo-zigbuild plus zig on PATH)"
   # Package exactly what this build produces: ask cargo where its target dir
   # is, pin that for the build, and delete the previous artifact there.
   local target_dir built
   target_dir="$(cd "$REPO_ROOT/rust" && cargo metadata --format-version 1 --no-deps |
-    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+    jq -r '.target_directory // empty')"
   [[ -n "$target_dir" ]] || die "cargo metadata reported no target directory"
   export CARGO_TARGET_DIR="$target_dir"
   built="$CARGO_TARGET_DIR/$RUST_TARGET/release/vesyl-print"
@@ -171,51 +312,36 @@ if [[ "$SIGN_ONLY" == "1" ]]; then
   [[ -f "$TARBALL" ]] || die "SIGN_ONLY=1: missing $TARBALL (build it with BUILD_ONLY=1)"
   echo "==> Signing $TARBALL"
 else
+  [[ -z "${SKIP_RUST_BINARY:-}" ]] ||
+    die "SKIP_RUST_BINARY is no longer supported: the agent and CLI are the" \
+      "vesyl-print binary, so every release ships it"
   rm -f "$TARBALL"
   STAGE_TREE="${STAGE}/vesyl-print-${VERSION}"
   mkdir -p "$STAGE_TREE"
 
   echo "==> Packaging version $VERSION ($ARCH)"
-
-  # App runtime files (no git, tests, secrets, pyc)
-  rsync -a \
-    --exclude='.git/' \
-    --exclude='__pycache__/' \
-    --exclude='*.py[cod]' \
-    --exclude='.pytest_cache/' \
-    --exclude='tests/' \
-    --exclude='dist/' \
-    --exclude='*.egg-info/' \
-    --exclude='.env' \
-    --exclude='credentials.json' \
-    --exclude='lcd-screenshot.png' \
-    --exclude='.gitignore' \
-    --exclude='keys/update_private.pem' \
-    --exclude='**/update_private.pem' \
-    --exclude='keys/tailscale.key' \
-    --exclude='**/tailscale.key' \
-    --exclude='rust/' \
-    --exclude='/vesyl-print' \
-    "$REPO_ROOT/" "$STAGE_TREE/"
+  rsync -a "${PACKAGE_FILTER[@]}" "$REPO_ROOT/" "$STAGE_TREE/"
 
   # Rust agent/CLI binary (version baked in from the release tag).
-  if [[ "${SKIP_RUST_BINARY:-}" == "1" ]]; then
-    echo "   SKIP_RUST_BINARY=1 — Python-only release"
-  else
-    build_rust_binary
-  fi
+  build_rust_binary
 
   # Ensure VERSION matches release
   printf '%s\n' "$VERSION" >"$STAGE_TREE/VERSION"
 
+  for f in "${REQUIRED_FILES[@]}"; do
+    [[ -f "$STAGE_TREE/$f" ]] || die "release tree is missing $f"
+  done
+
   # Never leave a partial tarball behind for a later SIGN_ONLY run to sign.
-  tar -C "$STAGE" -czf "${TARBALL}.partial" "vesyl-print-${VERSION}"
+  # Owned by root in the archive: extracting it as root must not hand the tree
+  # to whichever local account has the build machine's uid.
+  tar --owner=0 --group=0 --numeric-owner \
+    -C "$STAGE" -czf "${TARBALL}.partial" "vesyl-print-${VERSION}"
   mv -f "${TARBALL}.partial" "$TARBALL"
   echo "   tarball: $TARBALL"
 fi
 
-SHA256="$(sha256sum "$TARBALL")"
-SHA256="${SHA256%% *}"
+SHA256="$(sha256_of "$TARBALL")"
 echo "   sha256:  $SHA256"
 
 if [[ "$BUILD_ONLY" == "1" ]]; then
@@ -223,71 +349,57 @@ if [[ "$BUILD_ONLY" == "1" ]]; then
   exit 0
 fi
 
-# Manifest body first (everything except signature), then sign that exact canonical form.
+# Manifest body first (everything except the signature), then sign its
+# canonical form.
 BODY_JSON="${STAGE}/manifest.body.json"
-python3 - "$VERSION" "$CHANNEL" "$ARTIFACT_URL" "$SHA256" <<'PY' >"$BODY_JSON"
-import json, sys
-from datetime import datetime, timezone
-version, channel, url, sha = sys.argv[1:5]
-body = {
-    "version": version,
-    "channel": channel,
-    "artifact_url": url,
-    "artifact_sha256": sha,
-    "min_agent_version": "0.3.0",
-    "released_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-}
-print(json.dumps(body, indent=2))
-PY
+jq -n -a \
+  --arg version "$VERSION" \
+  --arg channel "$CHANNEL" \
+  --arg artifact_url "$ARTIFACT_URL" \
+  --arg artifact_sha256 "$SHA256" \
+  --arg min_agent_version "$MIN_AGENT_VERSION" \
+  --arg released_at "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" \
+  --arg changelog "$CHANGELOG" \
+  '{version: $version, channel: $channel, artifact_url: $artifact_url,
+    artifact_sha256: $artifact_sha256, min_agent_version: $min_agent_version,
+    released_at: $released_at}
+   + (if $changelog == "" then {} else {changelog: $changelog} end)' \
+  >"$BODY_JSON"
 
 CANONICAL="${STAGE}/manifest.canonical.json"
-python3 - "$BODY_JSON" "$CANONICAL" <<'PY'
-import json, sys
-from pathlib import Path
-body = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-# No trailing newline — must match update.ReleaseManifest.canonical_bytes()
-Path(sys.argv[2]).write_bytes(
-    json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
-)
-PY
+canonical_json "$BODY_JSON" >"$CANONICAL"
 
 SIGNATURE=""
 if [[ -n "$KEY_FILE" ]]; then
   echo "==> Signing manifest with Ed25519"
   SIG_BIN="${STAGE}/manifest.sig"
   openssl pkeyutl -sign -inkey "$KEY_FILE" -rawin -in "$CANONICAL" -out "$SIG_BIN"
-  verifies_with() {
-    openssl pkeyutl -verify -pubin -inkey "$1" -rawin -in "$CANONICAL" \
-      -sigfile "$SIG_BIN" >/dev/null 2>&1
-  }
+  SIGNATURE="$(base64 -w0 <"$SIG_BIN" 2>/dev/null || base64 <"$SIG_BIN" | tr -d '\n')"
+else
+  echo "WARNING: no UPDATE_PRIVATE_KEY / UPDATE_PRIVATE_KEY_FILE — manifest unsigned" >&2
+fi
+
+jq -a --arg signature "$SIGNATURE" \
+  'if $signature == "" then . else . + {signature: $signature} end' \
+  "$BODY_JSON" >"${MANIFEST}.partial"
+
+# Check the manifest as written, the way the publish job and devices see it.
+if [[ -n "$SIGNATURE" ]]; then
   if [[ -n "${UPDATE_PUBLIC_KEY_FILE:-}" ]]; then
-    [[ -f "$UPDATE_PUBLIC_KEY_FILE" ]] ||
-      die "UPDATE_PUBLIC_KEY_FILE not found: $UPDATE_PUBLIC_KEY_FILE"
-    verifies_with "$UPDATE_PUBLIC_KEY_FILE" ||
+    manifest_verifies "${MANIFEST}.partial" "$UPDATE_PUBLIC_KEY_FILE" || {
+      rm -f "${MANIFEST}.partial"
       die "signature does not verify against $UPDATE_PUBLIC_KEY_FILE (wrong signing key?)"
+    }
     echo "   signature verifies against $UPDATE_PUBLIC_KEY_FILE"
   elif [[ -f "$REPO_ROOT/keys/update_public.pem" ]]; then
-    if verifies_with "$REPO_ROOT/keys/update_public.pem"; then
+    if manifest_verifies "${MANIFEST}.partial" "$REPO_ROOT/keys/update_public.pem"; then
       echo "   signature verifies against keys/update_public.pem"
     else
       echo "WARNING: signature does not verify against keys/update_public.pem;" \
         "devices with that key will reject this manifest (expected for a lab key)" >&2
     fi
   fi
-  SIGNATURE="$(base64 -w0 <"$SIG_BIN" 2>/dev/null || base64 <"$SIG_BIN" | tr -d '\n')"
-else
-  echo "WARNING: no UPDATE_PRIVATE_KEY / UPDATE_PRIVATE_KEY_FILE — manifest unsigned" >&2
 fi
-
-python3 - "$BODY_JSON" "$SIGNATURE" <<'PY' >"${MANIFEST}.partial"
-import json, sys
-from pathlib import Path
-body = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-sig = sys.argv[2]
-if sig:
-    body["signature"] = sig
-print(json.dumps(body, indent=2) + "\n")
-PY
 mv -f "${MANIFEST}.partial" "$MANIFEST"
 
 echo "==> Wrote $MANIFEST"

@@ -1,31 +1,32 @@
-# vesyl-print (Rust port)
+# vesyl-print (Rust)
 
-In-progress port of the Python agent. The Python app is still what ships;
-this tree builds alongside it until the agent service can switch over.
+The agent and CLI that ship on devices: one binary, `vesyl-print`. The
+`vesyl-print-agent.service` unit runs `vesyl-print agent`; operators and the
+LCD display use the same binary as the CLI. The LCD display stack is still
+Python (`main.py` and its modules at the repository root) and talks to the
+binary only through state files and CLI calls.
 
 ```bash
 cd rust
-cargo test
-cargo clippy --all-targets
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
 ```
 
-## Status
+## Modules
 
-| Python | Rust | State |
-|---|---|---|
-| `config.py` | `config.rs` | ported |
-| `auth.py` | `auth.rs` | ported (reads existing `credentials.json`) |
-| `statusio.py` | `statusio.rs` | ported (same `status.json` shape for the LCD) |
-| `cloud.py` | `cloud.rs` | ported (`ureq`, OS trust store) |
-| `cable.py` | `cable.rs` | ported (`tungstenite`, sync thread) |
-| `jobs.py` | `jobs.rs` | ported |
-| `zpl.py` | `zpl.rs` | ported (`image` crate) |
-| `printers.py` | `printers.rs` | ported |
-| `update.py` | `update.rs` | ported (`ed25519-dalek`, `tar`) |
-| `agent.py` | `agent.rs` | ported |
-| `sysinfo.py` | `sysinfo.rs` | `hostname` only |
-| `cli.py` | `cli.rs` → `vesyl-print` binary | ported (all subcommands) |
-| display: `main.py`, `touch.py`, `framebuffer.py`, `stream_lcd.py`, … | — | later |
+| Module | Role |
+|---|---|
+| `agent.rs` | `vesyl-print agent`: heartbeat loop, job pull, cable session, OTA hook; writes `printers.json` after each inventory refresh |
+| `cli.rs` | subcommands: `claim`, `enroll`, `status`, `queues`, `unpair`, `agent`, `version`, `update check\|apply\|rollback`, `print-test`, `test-print` |
+| `cloud.rs` | wms-api client: claim / enroll / whoami / heartbeat / ws_ticket (`ureq`, OS trust store) |
+| `cable.rs` | ActionCable `PrintNodeChannel` client (`tungstenite`, sync thread) |
+| `jobs.rs` | durable queue + print pipeline (`lp`, CUPS wait) |
+| `printers.rs` | CUPS discovery, Zebra LAN scan, auto-provisioning, inventory |
+| `zpl.rs` | PDF/PNG/JPEG → ZPL `^GFA` for raw thermal queues (`image` crate, `pdftoppm`) |
+| `update.rs` | app OTA: manifest verify (`ed25519-dalek`), download, extract, activate, health gate, rollback |
+| `config.rs`, `auth.rs`, `statusio.rs` | paths and config, `credentials.json` (0600), `status.json` for the LCD |
+| `sysinfo.rs`, `net.rs`, `util.rs`, `logging.rs` | helpers |
 
 Run the agent locally (unpaired, temp dirs):
 
@@ -34,39 +35,66 @@ VESYL_PRINT_CONFIG_DIR=/tmp/vp/cfg VESYL_PRINT_STATE_DIR=/tmp/vp/state \
 VESYL_PRINT_INSTALL_ROOT=/tmp/vp/install cargo run -- agent
 ```
 
-Every `cli.py` subcommand exists with the same flags and output
-(`claim`, `enroll`, `status`, `queues`, `unpair`, `agent`, `version`,
-`update check|apply|rollback`, `print-test`). `vesyl-print queues` output is
-byte-identical to the Python CLI against the same CUPS server.
-
 `VESYL_PRINT_LOG=debug` raises log verbosity.
 
-Python tests that used `mock.patch` map to injectable hooks: `jobs::Pipeline`
-takes `lp`, `ack`, `report_state`, `fetch_url`, `wait_cups_job` and
-`supports_raw` as closures, and the cloud/cable tests run against local
-HTTP/WebSocket servers.
+## Interfaces the Python LCD relies on
 
-## Intentional differences from Python
+- State files under the state dir (`/var/lib/vesyl-print`): `status.json`,
+  `update_status.json`, and `printers.json` (`{"updated_at", "printers": [...]}`,
+  mode 0644, rewritten after every inventory refresh, about every 15 s).
+- `vesyl-print claim CODE [--name NAME] --json` and
+  `vesyl-print test-print --queue Q --format pdf|zpl [--json]`: one JSON object
+  on stdout, exit 0 on success and 1 on failure. The test labels come from
+  `assets/test-labels/` next to the running executable
+  (`VESYL_PRINT_ASSETS_DIR` overrides it in tests).
+- The agent provisions printers (`printers::ensure_printers`) once at startup,
+  in a background thread.
 
-- `VERSION` is baked in at compile time (`include_str!`), not read at runtime.
-- No "websocket library missing" mode: push is always available.
-- `Pipeline::default()` waits on CUPS synchronously like `process_job`'s
-  default; the agent passes `config.wait_cups` (default `async`).
+## Tests
+
+Unit tests sit next to the code and replace mocks with injectable hooks:
+`jobs::Pipeline` takes `lp`, `ack`, `report_state`, `fetch_url`,
+`wait_cups_job` and `supports_raw` as closures, and the cloud/cable tests run
+against local HTTP/WebSocket servers.
+
+`crates/vesyl-print/tests/` drives the release tooling in temp dirs:
+`build_release.rs` runs `scripts/build-release.sh` (all modes, with a fake
+cargo/qemu and throwaway Ed25519 keys) and checks that its manifests verify
+with `update::verify_manifest`, including a non-ASCII changelog;
+`apply_update.rs` runs a copy of the root helper against a fake install root.
+They need bash, jq, rsync, openssl and GNU coreutils; when one is missing they
+skip locally and fail in CI.
+
+## Release builds
+
+`scripts/build-release.sh` cross-compiles for `aarch64-unknown-linux-gnu.2.31`
+with cargo-zigbuild (Debian bullseye and newer) and sets `VESYL_PRINT_VERSION`
+from the release tag. See [OTA_UPDATES.md](../OTA_UPDATES.md) §4.2.
+
+## Behaviour notes
+
+Contracts a change here must keep (several differ from the retired Python
+agent on purpose):
+
+- `VERSION` is baked in at compile time (`VESYL_PRINT_VERSION`, else the
+  repository `VERSION` file), not read at runtime.
+- `Pipeline::default()` waits on CUPS synchronously; the agent passes
+  `config.wait_cups` (default `async`).
 - Unparsable `options.copies` falls back to 1 instead of failing the job.
-- ZPL resize uses Lanczos3 from the `image` crate. Its output can differ from
-  Pillow's LANCZOS by a few edge pixels. Grayscale conversion matches Pillow's
-  coefficients exactly.
-- OTA slots count as healthy with either the Python entrypoints
-  (`agent.py`/`main.py`) or the Rust binary (`vesyl-print` / `bin/vesyl-print`),
-  so rollback works across the migration in both directions.
+- ZPL resize uses Lanczos3 from the `image` crate; grayscale conversion uses
+  Pillow's coefficients.
+- A release slot is runnable only with the `vesyl-print` binary; Python-era
+  slots never count.
 - The OTA public key is compiled in from `keys/update_public.pem`; a key file
-  set in config still overrides it.
-- `update_status.json` is written atomically (Python wrote it in place).
-- Agent sleeps wake within 100 ms of SIGTERM (Python finished its sleep).
+  set in config overrides it.
+- `ReleaseManifest::canonical_bytes()` must stay byte-identical to the
+  canonical JSON `scripts/build-release.sh` signs (`jq -S -c -a`: sorted keys,
+  compact, `\uXXXX` for non-ASCII, nulls and `signature` dropped).
+- `update_status.json`, `status.json` and `printers.json` are written
+  atomically.
+- Agent sleeps wake within 100 ms of SIGTERM.
 - `printers::test_image()` looks for `base.jpg` next to the executable, then
-  `/opt/vesyl-print/current/base.jpg`, so release tarballs must keep shipping it.
-- `status --check` and `queues --json` print JSON keys sorted (Python kept
-  insertion order). Values are identical.
+  `/opt/vesyl-print/current/base.jpg`, so release tarballs keep shipping it.
+- `status --check` and `queues --json` print JSON keys sorted.
 - `update apply --manifest-url` and `update rollback` use the installed
-  `apply-update` sudo helper when present; Python's CLI flipped `current`
-  in-process and restarted via `systemctl`.
+  `apply-update` sudo helper when present.

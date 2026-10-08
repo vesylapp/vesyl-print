@@ -8,8 +8,13 @@
 keys/update_public.pem
 ```
 
+The `vesyl-print` binary compiles it in, and release tarballs carry it.
+`setup.sh` also installs it as `/etc/vesyl-print/keys/update_public.pem`, for
+configs whose `update_public_key_path` points there.
+
 **Private key** (never commit): store as GitHub Actions secret **`UPDATE_PRIVATE_KEY`**
-(full PEM, including `BEGIN`/`END` lines). Used by `.github/workflows/release.yml`.
+(full PEM, including `BEGIN`/`END` lines). Only the `sign` job of
+`.github/workflows/release.yml` gets it.
 
 ## Tailscale auth key (factory)
 
@@ -17,7 +22,8 @@ keys/update_public.pem
 keys/tailscale.key
 ```
 
-- **Never commit** (gitignored). Used only by `setup.sh` on first provision.
+- **Never commit.** Used only by `setup.sh` on first provision: copy it into
+  `keys/` of the extracted release before running `setup.sh`.
 - Contents: a **one-time** Tailscale auth key (single line).
 - `setup.sh` installs Tailscale (if needed) and runs:
 
@@ -30,11 +36,13 @@ tailscale up \
 - On **successful** join, `setup.sh` **deletes** the key file (one-time use).
   On failure the file is left so you can retry.
 - After a full factory setup succeeds, `setup.sh` also **removes the entire
-  source checkout** used to provision (app runs from `/opt/vesyl-print/current`).
-  Lab: `SKIP_SOURCE_CLEANUP=1 sudo ./setup.sh`.
-- Not copied into `/opt/vesyl-print/releases/*` (OTA slots).
-- Skip Tailscale: `SKIP_TAILSCALE=1 sudo ./setup.sh`
-- Override path: `TAILSCALE_AUTH_KEY_FILE=/path/to.key`
+  source tree** used to provision (the extracted release; the app runs from
+  `/opt/vesyl-print/current`). Lab: `sudo SKIP_SOURCE_CLEANUP=1 ./setup.sh`.
+- Not copied into `/opt/vesyl-print/releases/*` (OTA slots) or release tarballs.
+- Skip Tailscale: `sudo SKIP_TAILSCALE=1 ./setup.sh`
+- Override path: `sudo TAILSCALE_AUTH_KEY_FILE=/path/to.key ./setup.sh`
+
+Pass these options after `sudo`: it drops variables set before it.
 
 ## Generate a new key pair
 
@@ -48,6 +56,7 @@ openssl pkey -in update_private.pem -pubout -out keys/update_public.pem
 
 ```bash
 UPDATE_PRIVATE_KEY_FILE=./update_private.pem ./scripts/build-release.sh 0.4.0
+VERIFY_ONLY=1 ./scripts/build-release.sh 0.4.0   # the publish job's check
 # artifacts in dist/
 gh release create v0.4.0 dist/* --generate-notes
 ```
@@ -61,9 +70,10 @@ git push origin v0.4.0
 
 ## Canonical signature
 
-`scripts/build-release.sh` signs compact JSON of the manifest **without** the
-`signature` field (`sort_keys=True`, separators `,` / `:`). Devices verify the
-same form in `update.ReleaseManifest.canonical_bytes()`.
-
-Ship `update_public.pem` on appliances (this directory or
-`/etc/vesyl-print/keys/update_public.pem` via `setup.sh`).
+`scripts/build-release.sh` signs the manifest's canonical JSON: every field
+except `signature` and nulls, keys sorted, compact separators (`,` / `:`),
+non-ASCII escaped as `\uXXXX`. It builds it with `jq -S -c -a`, which gives the
+same bytes as Python's `json.dumps(sort_keys=True, separators=(",", ":"))`.
+Devices rebuild the same form in `update.rs` `ReleaseManifest::canonical_bytes()`
+and verify with Ed25519; the Rust tests in
+`rust/crates/vesyl-print/tests/build_release.rs` check that the two agree.

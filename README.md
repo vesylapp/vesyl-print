@@ -6,15 +6,18 @@ Raspberry Pi **print node** for VESYL: LCD status display, CUPS printer discover
 
 | Component | Role |
 |-----------|------|
-| **LCD** (`main.py` / `vesyl-print-display.service`) | Multi-page status (ops / network / system); touch cycle; unpaired network view; OTA |
-| **Agent** (`agent.py` / `vesyl-print-agent.service`) | Heartbeats + `whoami`; writes status for the LCD |
-| **CLI** (`vesyl-print`) | `claim`, `enroll`, `status`, `queues`, `unpair` |
+| **Agent** (`vesyl-print agent` / `vesyl-print-agent.service`) | Rust binary. Heartbeats + `whoami`, job pull and ActionCable push, CUPS printing, printer discovery, app OTA. Writes the state files the LCD reads |
+| **CLI** (`vesyl-print`, the same binary) | `claim`, `enroll`, `status`, `queues`, `unpair`, `print-test`, `test-print`, `update`, `version` |
+| **LCD** (`main.py` / `vesyl-print-display.service`) | Python, for now. Multi-page status (ops / network / system), touch cycle, MJPEG stream + claim page, Wi-Fi setup. Pairs and test-prints through the CLI |
 
-**Local print (Phase B)** + **cloud job pull (Phase C)** + **ActionCable push (Phase D)** are implemented.
+The agent and CLI are Rust ([`rust/`](rust/README.md)); only the LCD display
+stack is still Python. There is no Python agent or fallback: devices set up by
+the Python agent are re-provisioned with `setup.sh` (see below).
+
+**Local print** + **cloud job pull** + **ActionCable push** are implemented.
 
 - Pull: `pull_jobs_enabled` (default `true`) — always-on safety net  
-- Push: `cable_enabled` (default `true`) — `PrintNodeChannel` on `/print/cable`  
-- Push requires `websocket-client` (`python3-websocket` or `pip install -r requirements.txt`)
+- Push: `cable_enabled` (default `true`) — `PrintNodeChannel` on `/print/cable`
 
 ## Hardware
 
@@ -40,22 +43,46 @@ then reboots.
 
 ### App stack
 
-On the Pi (from this repo), after the board is up:
+On the Pi, run `setup.sh` from an **extracted release tarball** (it carries the
+`vesyl-print` binary):
 
 ```bash
-sudo ./setup.sh
+V=0.4.0
+curl -fLO https://github.com/vesylapp/vesyl-print/releases/download/v$V/vesyl-print-$V-linux-aarch64.tar.gz
+tar -xzf vesyl-print-$V-linux-aarch64.tar.gz
+cp ~/tailscale.key vesyl-print-$V/keys/tailscale.key   # optional, one-time auth key
+sudo ./vesyl-print-$V/setup.sh
 ```
 
-This installs dependencies, display overlay, config dirs, CLI, OTA helper, and
-both systemd units. The app is copied into the dual-slot layout:
+This installs the packages (CUPS, poppler-utils, NetworkManager; python3,
+Pillow, numpy, segno and DejaVu fonts for the LCD), the display overlay, config
+dirs, the root helpers + sudoers, the release, the CLI wrapper and both systemd
+units, then deletes the extracted tree. Options go after `sudo`, which drops
+the caller's environment: `sudo SKIP_TAILSCALE=1 ./setup.sh` (see the header of
+`setup.sh`).
+
+A git checkout has no binary, so `setup.sh` stops before changing anything.
+Build a release from a checkout with `BUILD_ONLY=1 ./scripts/build-release.sh`
+(needs cargo-zigbuild) and run the `setup.sh` inside the extracted tarball.
 
 ```text
-/opt/vesyl-print/current → releases/<VERSION>/
+/opt/vesyl-print/current → releases/<VERSION>/   vesyl-print binary, LCD (*.py), assets
+/usr/local/bin/vesyl-print                       wrapper: exec current/vesyl-print
 ```
 
-Services and `vesyl-print` CLI run from `current` so OTA can flip the symlink
-without rewriting unit files. Site config stays in `/etc/vesyl-print`; runtime
-state in `/var/lib/vesyl-print`.
+Services and the CLI run from `current`, so OTA can flip the symlink without
+rewriting unit files. Site config stays in `/etc/vesyl-print`; runtime state in
+`/var/lib/vesyl-print`.
+
+### Re-provisioning a Python-era device
+
+Devices set up before the Rust agent (units running `python3 agent.py`) are not
+migrated by OTA. Re-run `setup.sh` from an extracted release (over Tailscale or
+SSH). It rewrites the units, CLI wrapper and root helpers, removes old release
+slots without a `vesyl-print` binary, and keeps `/etc/vesyl-print` (config,
+credentials) and `/var/lib/vesyl-print` (queue, state). Releases carry
+`min_agent_version` 0.4.0, so a Python 0.3.x agent refuses them instead of
+installing a slot its units cannot run.
 
 ## Config
 
@@ -113,13 +140,38 @@ Credentials (mode **0600**):
 /etc/vesyl-print/credentials.json
 ```
 
-Status file for the LCD:
-
-```
-/var/lib/vesyl-print/status.json
-```
-
 Never commit credentials or device tokens.
+
+### State files the LCD reads
+
+The display never talks to the cloud or CUPS itself. It reads what the agent
+writes under `/var/lib/vesyl-print/`:
+
+| File | Written by | LCD use |
+|------|------------|---------|
+| `status.json` | agent; CLI `claim` / `unpair` | pairing + cloud state, warehouse, last error |
+| `printers.json` | agent, after each inventory refresh (about every 15 s), mode 0644 | printer rows and status dots |
+| `update_status.json` | agent (OTA) | update banner / footer |
+| `queue/`, `processed/` | agent | local queue depth |
+
+`printers.json`:
+
+```json
+{
+  "updated_at": "2026-10-08T16:05:00+00:00",
+  "printers": [
+    {
+      "cups_name": "Zebra_ZD421",
+      "uri": "socket://10.0.0.172:9100",
+      "display_name": "Zebra ZD421",
+      "status": "idle",
+      "status_reasons": [],
+      "status_message": null,
+      "supports_raw": true
+    }
+  ]
+}
+```
 
 ## Staging claim flow
 
@@ -164,20 +216,34 @@ If the device token is revoked, the agent clears local credentials and the LCD s
 ## CLI
 
 ```bash
-vesyl-print claim <CODE> [--name NAME]
+vesyl-print claim <CODE> [--name NAME] [--json]
 vesyl-print enroll <TOKEN> [--name NAME]
 vesyl-print status [--check]
 vesyl-print queues [--json]
 vesyl-print unpair
-vesyl-print agent          # same as agent.py service
+vesyl-print agent          # what vesyl-print-agent.service runs
 vesyl-print print-test --file ./label.pdf --queue Brother_HL-L3280CDW_series
+vesyl-print test-print --queue Zebra_ZD421 --format zpl [--json]
+vesyl-print version
+vesyl-print update check|apply|rollback
 ```
+
+The LCD and its stream page use the `--json` forms:
+
+- `claim CODE --json` prints one object: `{"ok": true, "node_id", "name",
+  "organization_name", "warehouse_name"}`, or `{"ok": false, "error", "status",
+  "code"}` with exit 1 (`status` is the HTTP status, 0 for transport errors).
+- `test-print --queue Q --format pdf|zpl --json` sends the built-in 4x6 test
+  label (`assets/test-labels/vesyl-roadrunner-4x6.pdf|.zpl` of the running
+  release) through a private, temporary queue, not the agent's, and returns
+  once `lp` has accepted it: `{"ok": true, "state": "delivered", "job_id",
+  "queue", "format"}`, or `{"ok": false, "error", "code"}` with exit 1.
 
 ### Local print test (no cloud)
 
 ```bash
 # uses first CUPS network queue if --queue omitted
-vesyl-print print-test --file /home/vesyl/vesyl-print/base.jpg
+vesyl-print print-test --file /opt/vesyl-print/current/base.jpg
 vesyl-print print-test -f label.pdf -q My_CUPS_Queue --copies 1
 ```
 
@@ -196,15 +262,17 @@ submitted with `lp -o raw`. Thermal printers usually need a **raw** CUPS queue
 not honor raw. Inventory reports `supports_raw` per queue for WMS.
 
 **PDF / PNG / JPEG → Zebra:** if the queue is raw (USB ZD220, `socket://…:9100`),
-the agent rasterizes the file (`pdftoppm` / Pillow) to 1-bit and wraps it in a
-ZPL `^GFA` graphic (ASCII hex), then `lp -o raw`. Options: `zpl_max_width_dots`
-(default 448), `zpl_dpi` (203), `zpl_threshold`, `zpl_invert`, `no_zpl_convert`.
-Native ZPL (`raw_*` / files starting with `^XA`) is sent unchanged.
+the agent rasterizes the file (`pdftoppm`, from poppler-utils) to 1-bit and
+wraps it in a ZPL `^GFA` graphic (ASCII hex), then `lp -o raw`. Options:
+`zpl_max_width_dots` (default 448), `zpl_dpi` (203), `zpl_threshold`,
+`zpl_invert`, `no_zpl_convert`. Native ZPL (`raw_*` / files starting with
+`^XA`) is sent unchanged.
 
-**Zebra discovery:** after IPP/`lpinfo`, the agent scans local `/24` LAN
-segments for TCP **9100**, skips IPs already known from IPP/CUPS, GETs
-`http://IP/` to confirm a Zebra print server (e.g. “ZTC ZD421-203dpi ZPL”), and
-adds an AppSocket queue:
+**Printer discovery:** when the agent starts it provisions printers once, in
+the background: IPP/`lpinfo`, then a scan of local `/24` LAN segments for TCP
+**9100** that skips IPs already known from IPP/CUPS, GETs `http://IP/` to
+confirm a Zebra print server (e.g. “ZTC ZD421-203dpi ZPL”), and adds an
+AppSocket queue:
 
 ```bash
 lpadmin -p Zebra_ZD421-203dpi_ZPL -v socket://10.0.0.172:9100 -m raw -E
@@ -233,14 +301,17 @@ sudo systemctl status vesyl-print-agent
 journalctl -u vesyl-print-agent -f
 ```
 
-Agent logs never include `device_token`.
+Agent logs never include `device_token`. `VESYL_PRINT_LOG=debug` raises the
+agent's log level.
 
 ## OTA updates (app)
 
 Long-term plan (app + OS layers, control plane, roadmap): **[OTA_UPDATES.md](./OTA_UPDATES.md)**.
 
 Appliances update over **outbound HTTPS only** — no `git pull` on customer devices.
-Artifacts ship on **GitHub Releases** (CDN).
+Artifacts ship on **GitHub Releases** (CDN). A release tarball holds the
+`vesyl-print` binary (aarch64, glibc ≥ 2.31), the Python LCD and its assets,
+and the provisioning files; never `rust/`, `tests/` or secrets.
 
 ### Publish a release
 
@@ -249,10 +320,13 @@ Artifacts ship on **GitHub Releases** (CDN).
 # 2) Bump VERSION, commit, tag, push:
 git tag v0.4.0
 git push origin v0.4.0
-# CI builds + signs + uploads tarball + manifest to the GitHub Release
+# CI: build (BUILD_ONLY=1) → sign (SIGN_ONLY=1) → publish (VERIFY_ONLY=1 + gh release)
 ```
 
-Local build (optional): `UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 0.4.0`
+Local build: `UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 0.4.0` builds
+and signs in one go (needs cargo-zigbuild, jq, rsync, openssl). `BUILD_ONLY=1`,
+`SIGN_ONLY=1` and `VERIFY_ONLY=1` run one step each; see
+[OTA_UPDATES.md §4.2](./OTA_UPDATES.md#42-artifact-format).
 
 ### How it works
 
@@ -285,7 +359,7 @@ vesyl-print version
 vesyl-print update check
 vesyl-print update apply --manifest-url https://github.com/vesylapp/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json
 vesyl-print update apply --file ./release.tar.gz --manifest ./release.manifest.json
-vesyl-print update rollback [--version 0.3.0] --restart
+vesyl-print update rollback [--version 0.4.0] --restart
 ```
 
 ### Config (`/etc/vesyl-print/config.json`)
@@ -304,8 +378,9 @@ vesyl-print update rollback [--version 0.3.0] --restart
 Install layout: `/opt/vesyl-print/current` → `releases/<version>` (lab: `$state_dir/app`).  
 Credentials and `/var/lib/vesyl-print` are never part of the tarball.
 
-`setup.sh` installs apply-update, sudoers, and `keys/update_public.pem` when present.
-Requires `python3-cryptography` for signature verify. See `keys/README.md`.
+`setup.sh` installs apply-update, sudoers, and `keys/update_public.pem`. The
+binary verifies signatures itself (the public key is also compiled in). See
+`keys/README.md`.
 
 ### Customer firewall
 
@@ -329,12 +404,12 @@ http://10.0.0.28:8765/
 | `/stream.mjpg` | Raw MJPEG |
 | `/snapshot.jpg` | Single frame |
 | `/api/stats` | JSON snapshot of the same stats (polls ~2s cache) |
-| `/api/claim` | `POST {{"code":"AB7K2Q9M","name":"optional"}}` — pair node (trusted LAN) |
+| `/api/claim` | `POST {"code":"AB7K2Q9M","name":"optional"}` — pair node (trusted LAN) |
 
 When the node is **unpaired** or **revoked**, the page shows a VESYL-branded claim
 form: **8 large character boxes** with a dash between the two groups of four.
 Typing auto-advances; paste fills all boxes and **ignores dashes/spaces**.
-Optional node name field. Same pairing path as `vesyl-print claim`.
+Optional node name field. It pairs through `vesyl-print claim --json`.
 
 Options on `main.py` / the unit’s `ExecStart`:
 
@@ -355,10 +430,17 @@ Only use on a trusted network (binds all interfaces by default).
 ## Development / tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+cd rust
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked                        # agent, CLI, and the release scripts
+cd .. && python3 -m unittest discover -s tests   # LCD display (Python)
 ```
 
-Unit tests mock HTTP; no network or real tokens required.
+Unit tests mock HTTP; no network or real tokens required. The Rust integration
+tests (`rust/crates/vesyl-print/tests/`) run `scripts/build-release.sh` and
+`scripts/apply-update` in temp dirs with a fake cargo and throwaway keys; they
+need bash, jq, rsync, openssl and GNU coreutils.
 
 ## LCD views
 
@@ -394,7 +476,7 @@ If no device is found, the LCD stays on the default page (Ops when paired).
 
 ### Pairing / footer states
 
-Footer shows **agent version** just left of the status dot (e.g. `v0.3.0 ● cloud`).
+Footer shows **agent version** just left of the status dot (e.g. `v0.4.0 ● cloud`).
 
 | State | Footer / message |
 |-------|------------------|
@@ -411,24 +493,22 @@ OTA labels come from `/var/lib/vesyl-print/update_status.json` (written by the a
 
 ## Repo layout
 
-```
-config.py         # paths, api_base_url, env
-auth.py           # credentials 0600
-cloud.py          # claim / enroll / whoami / heartbeat / ws_ticket
-agent.py          # heartbeat + pull + cable session
-cable.py          # ActionCable PrintNodeChannel client
-jobs.py           # durable queue + print pipeline
-statusio.py       # status.json for LCD
-display_status.py # OTA/version/page labels for LCD
-touch.py          # ADS7846 tap → page cycle
-cli.py            # vesyl-print entry
-main.py           # LCD (ops/network/system pages)
-printers.py       # CUPS discovery + inventory_payload()
-requirements.txt  # websocket-client for cable
+```text
+rust/                         vesyl-print binary: agent + CLI (rust/README.md)
+main.py, stream_lcd.py, …     LCD display (Python, for now): pages, MJPEG stream,
+                              touch, framebuffer, Wi-Fi setup + captive portal
+setup.sh                      provisioning; run it from an extracted release
+vesyl-print-*.service         systemd units (setup.sh installs them)
+scripts/build-release.sh      release tarball + signed manifest (CI and local)
+scripts/apply-update          root OTA helper: activate / restart / rollback
+scripts/wifi-setup            root Wi-Fi helper (runs wifi_setup.py)
+scripts/bootstrap-fresh-pi.sh first boot: appliance id, hostname, LCD driver
+assets/                       logo, boot splash, 4x6 test labels
+keys/                         OTA public key (keys/README.md)
+tests/                        LCD tests (Python) + ActionCable fixtures (Rust)
 ```
 
 ## Non-goals (this phase)
 
-- ZPL/EPL raw thermal (`raw_*` content types rejected for now)
 - GPIO claim keypad
 - Label generation on the Pi

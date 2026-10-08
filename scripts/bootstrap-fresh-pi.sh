@@ -58,10 +58,9 @@ if [[ -f "$APPLIANCE_ID_FILE" ]]; then
 else
   if command -v uuidgen >/dev/null 2>&1; then
     APPLIANCE_ID="$(uuidgen)"
-  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
-    APPLIANCE_ID="$(cat /proc/sys/kernel/random/uuid)"
   else
-    APPLIANCE_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    # The kernel's random UUID source; always present on Linux.
+    APPLIANCE_ID="$(cat /proc/sys/kernel/random/uuid)"
   fi
   # Normalize to lowercase UUID with hyphens
   APPLIANCE_ID="$(echo "$APPLIANCE_ID" | tr '[:upper:]' '[:lower:]')"

@@ -9,10 +9,13 @@
 #            cross-compiles and packages; uploads the unsigned tarball.
 #   sign     contents: read, the only job that gets UPDATE_PRIVATE_KEY. A fresh
 #            runner with no pip installs or toolchain actions: SIGN_ONLY=1 runs
-#            just sha256sum, python3 (stdlib) and openssl. It hashes the tarball
-#            and builds the manifest itself, so the only thing it takes from the
-#            build job is the tarball's bytes.
-#   publish  contents: write, no signing key. Only `gh release`.
+#            just jq, openssl, sha256sum and coreutils (no Python). It hashes
+#            the tarball and builds the manifest itself, so the only thing it
+#            takes from the build job is the tarball's bytes.
+#   publish  contents: write, no signing key. VERIFY_ONLY=1 re-checks that the
+#            manifest describes the tarball and verifies against
+#            keys/update_public.pem (same canonical JSON as the signer and as
+#            devices), then `gh release`.
 #
 # Required repo secret:
 #   UPDATE_PRIVATE_KEY  — PEM for Ed25519 private key (pair of keys/update_public.pem)
@@ -48,11 +51,12 @@ jobs:
           echo "${VERSION}" > VERSION
 
       # qemu-user + the aarch64 glibc let build-release.sh run the packaged
-      # binary's --version and check it reports the tag's version.
+      # binary's --version and check it reports the tag's version. jq and rsync
+      # are also used by the script tests in `cargo test`.
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq rsync qemu-user libc6-arm64-cross
+          sudo apt-get install -y -qq jq rsync qemu-user libc6-arm64-cross
 
       - name: Install Rust (aarch64 target)
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
@@ -65,9 +69,10 @@ jobs:
         with:
           workspaces: rust
 
-      # Own venv: the runner's system Python is externally managed (PEP 668),
-      # and $RUNNER_TEMP keeps it out of the rsync'd release tree. Exact
-      # versions, binary wheels only, hashes for x86_64 and aarch64 runners.
+      # Build tooling only (nothing from it ships): zig + cargo-zigbuild come
+      # as PyPI wheels, in their own venv because the runner's system Python
+      # is externally managed (PEP 668). Exact versions, binary wheels only,
+      # hashes for x86_64 and aarch64 runners.
       - name: Install cargo-zigbuild
         run: |
           python3 -m venv "$RUNNER_TEMP/zigbuild"
@@ -83,7 +88,7 @@ jobs:
             -r "$RUNNER_TEMP/zigbuild-requirements.txt"
           echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
 
-      - name: Test Rust agent
+      - name: Test Rust agent, CLI and release scripts
         working-directory: rust
         run: cargo test --locked
 
@@ -162,12 +167,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      # Only for keys/update_public.pem, to re-check the signature.
-      - name: Checkout public key
+      # Only keys/update_public.pem and the release script, to re-check the
+      # signature.
+      - name: Checkout public key and release script
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-          sparse-checkout: keys
+          sparse-checkout: |
+            keys
+            scripts
 
       - name: Download unsigned tarball
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -181,6 +189,15 @@ jobs:
           name: release-manifest
           path: dist
 
+      # Publish only a manifest that describes exactly this tarball and
+      # carries a signature devices will accept.
+      - name: Verify signed manifest
+        env:
+          OUT_DIR: ${{ github.workspace }}/dist
+        run: |
+          VERIFY_ONLY=1 UPDATE_PUBLIC_KEY_FILE=keys/update_public.pem \
+            ./scripts/build-release.sh "${GITHUB_REF_NAME}"
+
       - name: Create GitHub Release and upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -192,33 +209,6 @@ jobs:
           MANIFEST="dist/vesyl-print-${VERSION}.manifest.json"
           test -f "$TARBALL"
           test -f "$MANIFEST"
-          # Publish only a manifest that describes exactly this tarball and
-          # carries a signature devices will accept.
-          python3 - "$TARBALL" "$MANIFEST" "$VERSION" "$RUNNER_TEMP" <<'PY'
-          import base64, hashlib, json, sys
-          tarball, manifest, version, tmp = sys.argv[1:5]
-          with open(manifest, encoding="utf-8") as f:
-              m = json.load(f)
-          with open(tarball, "rb") as f:
-              sha = hashlib.sha256(f.read()).hexdigest()
-          problems = []
-          if m.get("version") != version:
-              problems.append(f"version {m.get('version')!r} != {version!r}")
-          if m.get("artifact_sha256") != sha:
-              problems.append("artifact_sha256 does not match the tarball")
-          if not m.get("signature"):
-              problems.append("manifest is not signed")
-          if problems:
-              sys.exit("refusing to publish: " + "; ".join(problems))
-          # Same canonical form as update.ReleaseManifest.canonical_bytes().
-          body = {k: v for k, v in m.items() if k != "signature" and v is not None}
-          with open(f"{tmp}/manifest.canonical.json", "wb") as f:
-              f.write(json.dumps(body, sort_keys=True, separators=(",", ":")).encode())
-          with open(f"{tmp}/manifest.sig", "wb") as f:
-              f.write(base64.b64decode(m["signature"]))
-          PY
-          openssl pkeyutl -verify -pubin -inkey keys/update_public.pem -rawin \
-            -in "$RUNNER_TEMP/manifest.canonical.json" -sigfile "$RUNNER_TEMP/manifest.sig"
           # --generate-notes uses commits since previous tag
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$TARBALL" "$MANIFEST" --clobber

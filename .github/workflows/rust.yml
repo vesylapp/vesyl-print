@@ -1,12 +1,40 @@
-# Rust agent/CLI: format, lint and test on every change under rust/.
+# Rust agent/CLI: format, lint and test on every change under rust/, and on
+# changes to what the tests read: the release scripts they drive
+# (scripts/build-release.sh, scripts/apply-update), the files a release tarball
+# must carry, the ActionCable fixtures and the release public key. The script
+# tests use bash, jq, rsync and openssl from the runner image.
 name: Rust
 
 on:
   push:
     branches: [main]
-    paths: ["rust/**", "VERSION", "keys/update_public.pem", "tests/fixtures/**", ".github/workflows/rust.yml"]
+    paths:
+      - "rust/**"
+      - "scripts/**"
+      - "setup.sh"
+      - "*.service"
+      - "*.py"
+      - "assets/**"
+      - "base.jpg"
+      - "overlays/**"
+      - "VERSION"
+      - "keys/update_public.pem"
+      - "tests/fixtures/**"
+      - ".github/workflows/rust.yml"
   pull_request:
-    paths: ["rust/**", "VERSION", "keys/update_public.pem", "tests/fixtures/**", ".github/workflows/rust.yml"]
+    paths:
+      - "rust/**"
+      - "scripts/**"
+      - "setup.sh"
+      - "*.service"
+      - "*.py"
+      - "assets/**"
+      - "base.jpg"
+      - "overlays/**"
+      - "VERSION"
+      - "keys/update_public.pem"
+      - "tests/fixtures/**"
+      - ".github/workflows/rust.yml"
 
 jobs:
   test:
