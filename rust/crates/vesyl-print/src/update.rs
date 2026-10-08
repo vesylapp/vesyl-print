@@ -17,8 +17,8 @@
 //! SHA-256 + Ed25519 signature over the canonical manifest (signature field
 //! excluded) — byte-compatible with `scripts/build-release.sh`.
 //!
-//! Slots may hold either the Python app (`agent.py` / `main.py`) or the Rust
-//! binary, so rollback works in both directions during the migration.
+//! A slot is runnable when it contains the `vesyl-print` binary (the agent and
+//! CLI; the LCD display is still Python and ships in the same slot).
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -67,7 +67,7 @@ pub const STATUS_ROLLED_BACK: &str = "rolled_back";
 const JOB_PAUSE_STATUSES: &[&str] = &[STATUS_DOWNLOADING, STATUS_INSTALLING, STATUS_PENDING_HEALTH];
 
 /// Files that mark a release slot as runnable (Python app or Rust binary).
-const SLOT_ENTRYPOINTS: &[&str] = &["agent.py", "main.py", "vesyl-print", "bin/vesyl-print"];
+const SLOT_ENTRYPOINTS: &[&str] = &["vesyl-print", "bin/vesyl-print"];
 
 /// Installed root-owned helper (NOPASSWD sudoers on appliances).
 const APPLY_HELPER: &str = "/usr/local/lib/vesyl-print/apply-update";
@@ -554,7 +554,7 @@ pub fn http_download_to_file(
     expected_sha256: &str,
 ) -> Result<(), UpdateError> {
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(io_err("download_failed"))?;
+        crate::util::create_dir_all_owned(parent).map_err(io_err("download_failed"))?;
     }
     let tmp = PathBuf::from(format!("{}.part", dest.display()));
     let result = (|| {
@@ -649,7 +649,7 @@ pub fn extract_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), UpdateErro
         ));
     }
     let parent = dest_dir.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent).map_err(io_err("bad_archive"))?;
+    crate::util::create_dir_all_owned(parent).map_err(io_err("bad_archive"))?;
     let staging = PathBuf::from(format!("{}.staging", dest_dir.display()));
     if staging.exists() {
         let _ = fs::remove_dir_all(&staging);
@@ -698,6 +698,9 @@ pub fn extract_tarball(tarball: &Path, dest_dir: &Path) -> Result<(), UpdateErro
     } else {
         fs::rename(&staging, dest_dir).map_err(io_err("bad_archive"))?;
     }
+    // An operator running `update apply` as root must not leave a root-owned
+    // slot the non-root agent can never replace or remove.
+    crate::util::hand_tree_to_parent_owner(dest_dir).map_err(io_err("bad_archive"))?;
     Ok(())
 }
 
@@ -930,7 +933,7 @@ pub fn apply_release(
 
     let root = &env.install_root;
     let update_dir = root.join("update");
-    fs::create_dir_all(&update_dir).map_err(io_err("download_failed"))?;
+    crate::util::create_dir_all_owned(&update_dir).map_err(io_err("download_failed"))?;
     let tarball = update_dir.join(format!("vesyl-print-{}.tar.gz", manifest.version));
 
     log::info!(target: LOG, "downloading {}", manifest.artifact_url);
@@ -951,7 +954,7 @@ pub fn apply_release(
     {
         let _ = fs::remove_dir_all(&release_dir);
         return Err(UpdateError::new(
-            "archive missing agent entrypoint (vesyl-print or agent.py/main.py)",
+            "archive missing the vesyl-print binary",
             "bad_archive",
         ));
     }
@@ -1000,7 +1003,7 @@ pub fn mark_pending_health(
 pub fn local_slot_healthy(env: &UpdateEnv, expected_version: Option<&str>) -> Result<(), String> {
     let cur = current_release_dir(&env.install_root).ok_or("current symlink missing or broken")?;
     if !SLOT_ENTRYPOINTS.iter().any(|e| cur.join(e).is_file()) {
-        return Err("current slot missing agent entrypoint".into());
+        return Err("current slot missing the vesyl-print binary".into());
     }
     if let Some(expected) = expected_version.filter(|e| !e.is_empty()) {
         let name = dir_name(&cur);
@@ -1575,8 +1578,10 @@ mod tests {
     fn build_release(root: &Path, version: &str) -> PathBuf {
         let src = root.join("src");
         fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("agent.py"), "# fake agent\n").unwrap();
-        fs::write(src.join("main.py"), "# fake main\n").unwrap();
+        fs::write(src.join("vesyl-print"), b"\x7fELF fake agent").unwrap();
+        crate::util::set_mode(&src.join("vesyl-print"), 0o755).unwrap();
+        // The LCD display is still Python and ships in the same slot.
+        fs::write(src.join("main.py"), "# fake display\n").unwrap();
         fs::write(src.join("VERSION"), format!("{version}\n")).unwrap();
         let tarball = root.join(format!("vesyl-print-{version}.tar.gz"));
         let gz = flate2::write::GzEncoder::new(
@@ -1739,7 +1744,7 @@ mod tests {
         let root = td.path().join("opt");
         let r1 = root.join("releases/0.4.0");
         extract_tarball(&build_release(td.path(), "0.4.0"), &r1).unwrap();
-        assert!(r1.join("agent.py").is_file());
+        assert!(r1.join("vesyl-print").is_file());
         write_version_file(&r1, "0.4.0").unwrap();
         flip_current(&root, "0.4.0").unwrap();
         assert_eq!(current_name(&root), "0.4.0");
@@ -1906,7 +1911,7 @@ mod tests {
         .unwrap();
         apply_release(&m, &env(&root), None, false).unwrap();
         assert_eq!(current_name(&root), "0.5.0");
-        assert!(root.join("releases/0.5.0/agent.py").is_file());
+        assert!(root.join("releases/0.5.0/vesyl-print").is_file());
         assert!(!root.join("update/vesyl-print-0.5.0.tar.gz").exists());
     }
 
@@ -2046,8 +2051,7 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let root = two_slots(td.path());
         let cur = fs::canonicalize(root.join("current")).unwrap();
-        fs::remove_file(cur.join("agent.py")).unwrap();
-        fs::remove_file(cur.join("main.py")).unwrap();
+        fs::remove_file(cur.join("vesyl-print")).unwrap();
         let out = process_pending_health(
             pending(utc_now_plus(120)),
             &cfg(td.path()),
@@ -2061,14 +2065,42 @@ mod tests {
     }
 
     #[test]
-    fn rust_binary_slot_is_healthy() {
+    fn slot_needs_the_rust_binary() {
         let td = tempfile::tempdir().unwrap();
         let root = two_slots(td.path());
-        let cur = fs::canonicalize(root.join("current")).unwrap();
-        fs::remove_file(cur.join("agent.py")).unwrap();
-        fs::remove_file(cur.join("main.py")).unwrap();
-        fs::write(cur.join("vesyl-print"), b"\x7fELF").unwrap();
         assert!(local_slot_healthy(&env(&root), Some("0.4.0")).is_ok());
+        // A Python-era slot (agent.py / main.py only) is no longer runnable.
+        let cur = fs::canonicalize(root.join("current")).unwrap();
+        fs::remove_file(cur.join("vesyl-print")).unwrap();
+        fs::write(cur.join("agent.py"), "# old python agent\n").unwrap();
+        let err = local_slot_healthy(&env(&root), Some("0.4.0")).unwrap_err();
+        assert!(err.contains("vesyl-print binary"), "{err}");
+    }
+
+    #[test]
+    fn archive_without_the_binary_is_rejected() {
+        let td = tempfile::tempdir().unwrap();
+        let src = td.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("agent.py"), "# python only\n").unwrap();
+        let tarball = td.path().join("py.tar.gz");
+        let gz = flate2::write::GzEncoder::new(
+            File::create(&tarball).unwrap(),
+            flate2::Compression::default(),
+        );
+        let mut tar = tar::Builder::new(gz);
+        tar.append_dir_all("vesyl-print-0.9.0", &src).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+        let m = ReleaseManifest::from_dict(&obj(json!({
+            "version": "0.9.0",
+            "artifact_url": url::Url::from_file_path(&tarball).unwrap().to_string(),
+            "artifact_sha256": sha256_file(&tarball).unwrap(),
+        })))
+        .unwrap();
+        let root = td.path().join("install");
+        let err = apply_release(&m, &env(&root), None, false).unwrap_err();
+        assert_eq!(err.code, "bad_archive");
+        assert!(!root.join("releases/0.9.0").exists());
     }
 
     #[test]

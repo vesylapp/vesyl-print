@@ -206,6 +206,11 @@ impl Config {
         self.state_dir.join("status.json")
     }
 
+    /// The agent's latest printer inventory, for the LCD display.
+    pub fn printers_path(&self) -> PathBuf {
+        self.state_dir.join("printers.json")
+    }
+
     pub fn update_status_path(&self) -> PathBuf {
         self.state_dir.join("update_status.json")
     }

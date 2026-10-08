@@ -361,10 +361,14 @@ impl Agent {
     fn start_inventory_refresher(&self, stop: &Arc<AtomicBool>) -> u64 {
         let generation = self.shared.inventory.begin();
         let (shared, source, stop) = (self.shared.clone(), self.inventory.clone(), stop.clone());
+        let printers_path = self.cfg.printers_path();
         let body = Box::new(move || {
             let cache = &shared.inventory;
             while !stop.load(Ordering::SeqCst) && cache.is_current(generation) {
                 let inventory = contained("printer inventory", || source());
+                if let Some(Some(printers)) = &inventory {
+                    write_printers_snapshot(&printers_path, printers);
+                }
                 cache.publish(generation, inventory);
                 sleep_until(Instant::now() + INVENTORY_REFRESH_EVERY, &stop);
             }
@@ -1155,6 +1159,17 @@ fn apply_node_config(cfg: &Config, msg: &JsonObject) {
         updated.warehouse_label(),
         updated.name.as_deref().unwrap_or("")
     );
+}
+
+/// Publish the latest printer inventory for the LCD display, which reads it
+/// instead of querying CUPS itself.
+fn write_printers_snapshot(path: &std::path::Path, printers: &[Value]) {
+    let body = json!({ "updated_at": crate::util::utc_now_iso(), "printers": printers });
+    let mut raw = serde_json::to_string_pretty(&body).unwrap_or_default();
+    raw.push('\n');
+    if let Err(e) = crate::util::write_durable(path, raw.as_bytes(), 0o644, false) {
+        log::warn!(target: LOG, "write {}: {e}", path.display());
+    }
 }
 
 /// Sleep until `deadline`, waking early if `stop` is set.
@@ -2184,6 +2199,37 @@ mod tests {
 
     /// The OS refusing the refresher thread must not panic: heartbeats fall
     /// back to querying the inventory inline.
+    #[test]
+    fn inventory_snapshot_is_published_for_the_display() {
+        let td = tempfile::tempdir().unwrap();
+        let mut agent = test_agent(td.path(), "http://127.0.0.1:9");
+        agent.inventory = Arc::new(|| {
+            Some(vec![
+                json!({"cups_name": "Zebra", "status": "idle", "supports_raw": true}),
+            ])
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let generation = agent.start_inventory_refresher(&stop);
+        let path = agent.cfg.printers_path();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, Ordering::SeqCst);
+        agent.shared.inventory.end(generation);
+        let snap: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(snap["printers"][0]["cups_name"], "Zebra");
+        assert!(snap["updated_at"].as_str().is_some_and(|t| !t.is_empty()));
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&path).unwrap().permissions(),
+        );
+        assert_eq!(
+            mode & 0o777,
+            0o644,
+            "the display user must be able to read it"
+        );
+    }
+
     #[test]
     fn inventory_refresher_spawn_failure_falls_back_inline() {
         let td = tempfile::tempdir().unwrap();

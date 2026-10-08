@@ -140,6 +140,7 @@ const PERMANENT_CODES: &[&str] = &[
     // Image / PDF → ZPL conversion.
     "image_bad",
     "pdf_render",
+    "pdf_too_many_pages",
     "zpl_error",
     // `lp`: the CUPS queue does not exist.
     "unknown_queue",
@@ -2205,6 +2206,7 @@ mod tests {
             ),
             ("p2", JobError::new("bad", "image_bad"), true),
             ("p3", JobError::new("bad", "pdf_render"), true),
+            ("p4", JobError::new("51 pages", "pdf_too_many_pages"), true),
             (
                 "t1",
                 lp_failure("lp: Unable to connect to server: Connection refused"),

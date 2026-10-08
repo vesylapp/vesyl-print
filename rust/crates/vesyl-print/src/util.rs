@@ -247,6 +247,43 @@ fn open_dir_at(parent: &File, name: &OsStr) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+/// `fs::create_dir_all`, except that directories root creates get the owner
+/// of the closest directory that already existed (see [`write_durable`]).
+pub fn create_dir_all_owned(dir: &Path) -> io::Result<()> {
+    create_dirs(dir)
+}
+
+/// After root (an operator running the CLI) unpacked a tree into a directory
+/// the service user owns — a release slot under `releases/` — hand every
+/// entry to that directory's owner, so the non-root agent can later replace
+/// or remove it. No-op unless running as root. Entries are inspected with
+/// lstat and changed with lchown, so a symlink in the tree is changed itself
+/// and never followed.
+pub fn hand_tree_to_parent_owner(tree: &Path) -> io::Result<()> {
+    if euid() != 0 {
+        return Ok(());
+    }
+    let parent = match tree.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let (uid, gid) = owner(&fs::metadata(parent)?);
+    if uid == 0 {
+        return Ok(());
+    }
+    let mut stack = vec![tree.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let meta = fs::symlink_metadata(&path)?;
+        std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;
+        if meta.file_type().is_dir() {
+            for entry in fs::read_dir(&path)? {
+                stack.push(entry?.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
@@ -398,6 +435,46 @@ mod tests {
 
     /// Needs root: `sudo cargo test`, or unprivileged with
     /// `unshare --map-root-user --map-auto cargo test -- --ignored root_write`.
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_hands_an_unpacked_tree_to_the_parent_owner() {
+        if euid() != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let releases = td.path().join("releases");
+        fs::create_dir(&releases).unwrap();
+        std::os::unix::fs::chown(&releases, Some(1000), Some(1000)).unwrap();
+        let slot = releases.join("0.9.0");
+        fs::create_dir_all(slot.join("assets")).unwrap();
+        fs::write(slot.join("vesyl-print"), b"bin").unwrap();
+        fs::write(slot.join("assets/logo.png"), b"png").unwrap();
+        // A symlink in the tree is changed itself, never its target.
+        let outside = td.path().join("outside");
+        fs::write(&outside, b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, slot.join("link")).unwrap();
+        hand_tree_to_parent_owner(&slot).unwrap();
+        for p in [
+            &slot,
+            &slot.join("assets"),
+            &slot.join("vesyl-print"),
+            &slot.join("assets/logo.png"),
+        ] {
+            assert_eq!(fs::metadata(p).unwrap().uid(), 1000, "{}", p.display());
+        }
+        assert_eq!(fs::symlink_metadata(slot.join("link")).unwrap().uid(), 1000);
+        assert_eq!(
+            fs::metadata(&outside).unwrap().uid(),
+            0,
+            "symlink target untouched"
+        );
+        // Directories created for a new slot get the owner too.
+        let update = td.path().join("install").join("update");
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        create_dir_all_owned(&update).unwrap();
+        assert_eq!(fs::metadata(&update).unwrap().uid(), 1000);
+    }
+
     #[test]
     #[ignore = "needs root (or a user namespace) to chown"]
     fn root_write_hands_files_to_the_directory_owner() {

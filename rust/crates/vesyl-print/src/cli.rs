@@ -341,6 +341,15 @@ fn cmd_status(deps: &Deps, out: &mut dyn Write, check: bool) -> CmdResult {
     writeln!(out, "api_base_url:  {}", cfg.api_base_url)?;
     writeln!(out, "config:        {}", cfg.config_path().display())?;
     writeln!(out, "credentials:   {}", cfg.credentials_path().display())?;
+    // load_credentials treats an unreadable file as "not paired"; say why.
+    if let Err(e) = fs::File::open(cfg.credentials_path()) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            writeln!(
+                out,
+                "  WARNING: credentials file exists but this user cannot read it ({e})"
+            )?;
+        }
+    }
     writeln!(out, "status file:   {}", cfg.status_path().display())?;
     writeln!(out, "agent_version: {}", agent_version())?;
     writeln!(out)?;
