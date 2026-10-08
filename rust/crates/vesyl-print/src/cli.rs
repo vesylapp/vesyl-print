@@ -1355,18 +1355,14 @@ mod tests {
 
     /// A paired agent at `version`, started from its slot (`current`).
     fn slot_agent(d: &Deps, version: &str, inventory: InventoryFn) -> Agent {
-        Agent {
-            cfg: d.cfg.clone(),
-            client: CloudClient::new(&d.cfg.api_base_url),
-            store: JobStore::from_config(&d.cfg),
-            inventory,
-            update_env: UpdateEnv {
-                running_version: version.into(),
-                running_from_slot: true,
-                ..d.update_env.clone()
-            },
-            pipeline: Pipeline::default(),
-        }
+        let mut agent = Agent::new(d.cfg.clone());
+        agent.inventory = inventory;
+        agent.update_env = UpdateEnv {
+            running_version: version.into(),
+            running_from_slot: true,
+            ..d.update_env.clone()
+        };
+        agent
     }
 
     /// `update apply <how> --restart` while the 0.8.0 agent it replaces is

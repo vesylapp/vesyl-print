@@ -190,9 +190,24 @@ pub fn proxy_for(url: &str) -> Option<ureq::Proxy> {
     match ureq::Proxy::new(&proxy) {
         Ok(p) => Some(p),
         Err(e) => {
-            log::warn!(target: "vesyl-print.net", "ignoring invalid proxy {proxy:?}: {e}");
+            log::warn!(target: "vesyl-print.net", "ignoring invalid proxy {}: {e}", redact_proxy(&proxy));
             None
         }
+    }
+}
+
+/// A proxy URL safe to log: userinfo (`user:pass@`) replaced by `***@`.
+pub fn redact_proxy(proxy: &str) -> String {
+    let (scheme, rest) = proxy.split_once("://").map_or(("", proxy), |(s, r)| (s, r));
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let redacted = match rest[..authority_end].rfind('@') {
+        Some(at) => format!("***@{}", &rest[at + 1..]),
+        None => rest.to_string(),
+    };
+    if scheme.is_empty() {
+        redacted
+    } else {
+        format!("{scheme}://{redacted}")
     }
 }
 
@@ -320,6 +335,17 @@ mod tests {
             .unwrap();
         assert_eq!(decoded, b"us@er:p:ss");
         assert_eq!(parse_proxy("socks5://p:1080"), None);
+    }
+
+    #[test]
+    fn redacts_proxy_credentials() {
+        assert_eq!(
+            redact_proxy("http://user:secret@proxy:3128"),
+            "http://***@proxy:3128"
+        );
+        assert_eq!(redact_proxy("user:secret@proxy:3128/x"), "***@proxy:3128/x");
+        assert_eq!(redact_proxy("http://proxy:3128"), "http://proxy:3128");
+        assert!(!redact_proxy("http://u:p@ss@proxy:1").contains("p@ss"));
     }
 
     #[test]
