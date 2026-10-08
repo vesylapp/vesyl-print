@@ -1680,7 +1680,7 @@ fn judge_pending_health(
     st.last_error = Some(reason.clone());
 
     let past_deadline = deadline_passed(st.health_deadline_at.as_deref(), &now);
-    // Local slot broken (wrong version / missing entrypoints) → fail fast.
+    // Local slot broken (wrong version / no vesyl-print binary) → fail fast.
     let hard_fail = local.is_err();
     if !past_deadline && !hard_fail {
         log::warn!(
@@ -4372,8 +4372,9 @@ mod tests {
 
     #[test]
     fn slow_download_is_not_cut_off_at_a_fixed_deadline() {
-        // 2.5 s of body with 1 s connect/response timeouts: urllib's timeout is
-        // per socket operation, so the Python agent finishes this download.
+        // 2.5 s of body, a piece every 250 ms, with 1 s connect, response and
+        // idle timeouts: `idle` bounds each read, not the whole download, so
+        // a slow but steady download finishes.
         let body: Vec<u8> = (0..40u8).collect();
         let served = body.clone();
         let srv = http_stub::serve(move |_, s| {
@@ -4420,7 +4421,8 @@ mod tests {
     }
 
     /// N15: a download whose connection goes silent fails after the idle
-    /// timeout (Python's per-read 300 s), not the 30-minute body budget.
+    /// timeout (`Timeouts::ARTIFACT.idle`, 300 s per read), not the 30-minute
+    /// body budget.
     #[test]
     fn dead_connection_fails_after_the_idle_timeout() {
         let srv = http_stub::serve(|_, s| {
@@ -4442,7 +4444,7 @@ mod tests {
         assert!(err.to_string().contains("timeout"), "{err}");
         assert!(took >= Duration::from_millis(900), "{took:?}");
         assert!(took < Duration::from_secs(5), "{took:?}");
-        // Python's per-operation values: manifest 120 s, artifact 300 s.
+        // Per read, at most 120 s for a manifest and 300 s for an artifact.
         assert_eq!(Timeouts::MANIFEST.idle, Duration::from_secs(120));
         assert_eq!(Timeouts::ARTIFACT.idle, Duration::from_secs(300));
     }
