@@ -1,0 +1,23 @@
+.github/workflows/lcd.yml
+  s_2883cba6969ed7::t_38b7a712e63cd3 1-52,54-56
+  s_2883cba6969ed7::t_92361b57874647 53
+.github/workflows/rust.yml
+  s_2883cba6969ed7::t_1e8ee308fbafa8 2-9
+  s_2883cba6969ed7::t_25437b3d6a809a 43-45,53-55,57,59,62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "203e664a14ad2a897e6126f06f97a93e82393ebf",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
