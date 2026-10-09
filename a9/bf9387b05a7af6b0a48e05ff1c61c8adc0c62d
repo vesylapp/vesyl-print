@@ -1,0 +1,19 @@
+rust/crates/vesyl-print/src/agent.rs
+  s_2883cba6969ed7::t_ae02a0bc1895ff 1848-1890
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a9bf9387b05a7af6b0a48e05ff1c61c8adc0c62d",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
