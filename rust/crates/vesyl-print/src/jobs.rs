@@ -170,6 +170,8 @@ const PERMANENT_CODES: &[&str] = &[
     // for, too large to rasterize within the conversion's memory limits.
     "pdf_page_too_large",
     "label_too_large",
+    // The agent died in the job MAX_ATTEMPTS times.
+    CRASH_LOOP,
 ];
 
 /// Code of a job the agent died in [`MAX_ATTEMPTS`] times while converting
@@ -189,7 +191,7 @@ impl JobError {
     /// keeps killing the agent). Transient failures (network, CUPS down,
     /// local I/O) return false.
     pub fn is_permanent(&self) -> bool {
-        PERMANENT_CODES.contains(&self.code.as_str()) || self.code == CRASH_LOOP
+        PERMANENT_CODES.contains(&self.code.as_str())
     }
 }
 
@@ -1131,7 +1133,8 @@ impl JobStore {
         valid_job_id(job_id) && self.queue_path(job_id).is_file()
     }
 
-    /// Write job JSON with fsync (file + dir). Idempotent if file already exists.
+    /// Write job JSON with fsync (file + dir). Idempotent if file already
+    /// exists, which is still only `Ok` once its directory entry is durable.
     pub fn write_queue(&self, job: &PrintJob) -> std::io::Result<PathBuf> {
         if !valid_job_id(&job.id) {
             return Err(invalid_id_error());
@@ -1139,6 +1142,10 @@ impl JobStore {
         self.ensure()?;
         let path = self.queue_path(&job.id);
         if path.is_file() {
+            // Already queued (a redelivery, or a retry after a write whose
+            // directory fsync failed): make the entry durable before the
+            // ack, which Pipeline::process sends once this returns.
+            crate::util::sync_dir(&self.queue_dir)?;
             return Ok(path);
         }
         // A new record has no history here, whatever its payload carries.
@@ -2400,6 +2407,47 @@ mod tests {
         );
     }
 
+    /// A queue file that is there already (a redelivery, or a retry after a
+    /// write whose directory fsync failed) is acked only once its directory
+    /// entry is durable. queue/ without read permission makes every fsync of
+    /// it fail, as a failing disk would.
+    #[test]
+    fn a_queue_entry_that_is_not_durable_is_never_acked() {
+        if is_root() {
+            // Root opens queue/ whatever its mode: its fsync cannot fail here.
+            eprintln!("skipping: running as root");
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        st.ensure().unwrap();
+        let acks = Arc::new(AtomicUsize::new(0));
+        let a = acks.clone();
+        let p = Pipeline {
+            ack: Arc::new(move |_| {
+                a.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            ..test_pipeline()
+        };
+        let j = png_job("redelivered");
+        fs::set_permissions(&st.queue_dir, fs::Permissions::from_mode(0o300)).unwrap();
+        // The first delivery leaves its file, but not durably: no ack.
+        let err = p.process(&j, &st).unwrap_err();
+        assert_eq!(err.code, "job_error", "{}", err.message);
+        assert!(st.has_queue_file("redelivered"));
+        // Nor the redelivery, which finds the file in place (it used to be
+        // acked as it was).
+        let err = p.process(&j, &st).unwrap_err();
+        assert_eq!(err.code, "job_error", "{}", err.message);
+        assert_eq!(acks.load(Ordering::SeqCst), 0, "acked a non-durable entry");
+
+        fs::set_permissions(&st.queue_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(p.process(&j, &st).unwrap(), JobOutcome::Delivered);
+        assert_eq!(acks.load(Ordering::SeqCst), 1);
+        assert!(st.is_processed("redelivered"));
+    }
+
     #[test]
     fn queue_preserves_original_payload() {
         let td = tempfile::tempdir().unwrap();
@@ -2803,6 +2851,9 @@ mod tests {
             ("p2", JobError::new("bad", "image_bad"), true),
             ("p3", JobError::new("bad", "pdf_render"), true),
             ("p4", JobError::new("51 pages", "pdf_too_many_pages"), true),
+            ("p5", JobError::new("A0 page", "pdf_page_too_large"), true),
+            ("p6", JobError::new("90 M dots", "label_too_large"), true),
+            ("p7", JobError::new("3 deaths", CRASH_LOOP), true),
             (
                 "t1",
                 lp_failure("lp: Unable to connect to server: Connection refused"),
