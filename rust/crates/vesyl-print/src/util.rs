@@ -312,7 +312,8 @@ fn owner_for_rewrite(euid: u32, existing: Option<Owner>, dir: Option<Owner>) -> 
     }
 }
 
-fn euid() -> u32 {
+/// This process's effective uid.
+pub fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }
@@ -764,6 +765,41 @@ fn hand_entry_over(
     chown_at(&sub, OsStr::new(""), to, libc::AT_EMPTY_PATH)
 }
 
+/// The open file or directory `file` as a path: its link in
+/// `/proc/self/fd`, which leads to it, not to wherever its name is now.
+pub fn fd_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Take write permission from group and others on the open directory
+/// `dir` and on all it holds, at any depth, whatever mode it was made
+/// with (the umask's, say). Through descriptors: no name is followed, and
+/// a symlink is left as it is.
+pub fn clear_group_other_write(dir: &File) -> io::Result<()> {
+    clear_group_other_write_on(dir)?;
+    for entry in fs::read_dir(fd_path(dir))? {
+        let name = entry?.file_name();
+        let entry = open_at(dir, &name, libc::O_PATH | libc::O_NOFOLLOW)?;
+        let kind = entry.metadata()?.file_type();
+        if kind.is_dir() {
+            clear_group_other_write(&entry)?;
+        } else if kind.is_file() {
+            clear_group_other_write_on(&entry)?;
+        }
+    }
+    Ok(())
+}
+
+/// [`clear_group_other_write`] for `file` alone, open (O_PATH will do):
+/// chmod(2) through [`fd_path`].
+fn clear_group_other_write_on(file: &File) -> io::Result<()> {
+    let mode = file.metadata()?.mode() & 0o7777;
+    if mode & 0o022 == 0 {
+        return Ok(());
+    }
+    fs::set_permissions(fd_path(file), fs::Permissions::from_mode(mode & !0o022))
+}
+
 pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
@@ -1064,6 +1100,40 @@ mod tests {
         let dir = open_dir_owned(&td.path().join("install").join("update")).unwrap();
         create_file_at(&dir, OsStr::new("a"), 0o644).unwrap();
         assert!(real.join("update/a").is_file());
+    }
+
+    /// [`clear_group_other_write`] takes write from group and others on a
+    /// tree, at any depth, and keeps every other bit. A symlink in it, to a
+    /// file or a directory elsewhere, is not followed: what it points at
+    /// keeps its mode.
+    #[test]
+    fn group_and_others_lose_write_in_a_tree_and_nowhere_else() {
+        let td = tempfile::tempdir().unwrap();
+        let tree = td.path().join("tree");
+        let elsewhere = td.path().join("elsewhere");
+        fs::create_dir_all(tree.join("lib/web")).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        for file in [tree.join("lib/web/a.py"), elsewhere.join("f")] {
+            fs::write(file, b"x").unwrap();
+        }
+        std::os::unix::fs::symlink(elsewhere.join("f"), tree.join("file-link")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tree.join("dir-link")).unwrap();
+        let modes = [
+            (tree.clone(), 0o777, 0o755),
+            (tree.join("lib"), 0o1777, 0o1755),
+            (tree.join("lib/web"), 0o775, 0o755),
+            (tree.join("lib/web/a.py"), 0o666, 0o644),
+            (elsewhere.clone(), 0o777, 0o777),
+            (elsewhere.join("f"), 0o666, 0o666),
+        ];
+        for (path, before, _) in &modes {
+            set_mode(path, *before).unwrap();
+        }
+        clear_group_other_write(&open_dir(&tree).unwrap()).unwrap();
+        for (path, _, after) in &modes {
+            let mode = fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+            assert_eq!(mode, *after, "{}: {mode:o}", path.display());
+        }
     }
 
     #[test]

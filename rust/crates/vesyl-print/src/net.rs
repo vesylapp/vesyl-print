@@ -351,7 +351,8 @@ pub fn redact_proxy(proxy: &str) -> String {
 /// the userinfo, query or fragment, where credentials and signatures travel
 /// (a presigned download's `X-Amz-Signature`, a portal's session token).
 /// Text that does not parse as a URL is cut the same way: at `?` or `#`,
-/// and without a `user:pass@` in its authority.
+/// and without a `user:pass@` in its authority, which a network-path
+/// reference (`//host/path`, a redirect target) has too.
 pub fn redact_url(url: &str) -> String {
     if let Ok(mut parsed) = Url::parse(url) {
         // Only a URL with a host has userinfo; for others these fail.
@@ -362,17 +363,19 @@ pub fn redact_url(url: &str) -> String {
         return parsed.into();
     }
     let url = &url[..url.find(['?', '#']).unwrap_or(url.len())];
-    let (scheme, rest) = url.split_once("://").map_or(("", url), |(s, r)| (s, r));
+    let (lead, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => match url.strip_prefix("//") {
+            Some(rest) => ("//".to_string(), rest),
+            None => (String::new(), url),
+        },
+    };
     let authority_end = rest.find('/').unwrap_or(rest.len());
     let rest = match rest[..authority_end].rfind('@') {
         Some(at) => &rest[at + 1..],
         None => rest,
     };
-    if scheme.is_empty() {
-        rest.to_string()
-    } else {
-        format!("{scheme}://{rest}")
-    }
+    format!("{lead}{rest}")
 }
 
 /// The proxy urllib talks to for one request.
@@ -1116,6 +1119,10 @@ mod tests {
             ("https://u:pw@bad host/x?sig=1", "https://bad host/x"),
             ("http://u:pw@[::1/x#f", "http://[::1/x"),
             ("/v2/hb?token=abc", "/v2/hb"),
+            // A network-path reference, as a redirect target may be.
+            ("//u:pw@bad host/x?sig=1", "//bad host/x"),
+            ("//?sig=1", "//"),
+            ("///x?sig=1", "///x"),
         ] {
             assert_eq!(redact_url(url), want, "{url}");
         }

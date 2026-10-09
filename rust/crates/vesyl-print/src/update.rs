@@ -45,7 +45,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{agent_version, Config, ENV_INSTALL_ROOT};
 use crate::net::{self, Redirects, Timeouts};
-use crate::util::{opt_str, py_int, py_str, truthy, write_durable};
+use crate::util::{euid, fd_path, opt_str, py_int, py_str, truthy, write_durable};
 use crate::JsonObject;
 
 const LOG: &str = "vesyl-print.update";
@@ -677,6 +677,22 @@ fn shown_url(url: &str) -> String {
     net::redact_url(url).chars().take(SHOWN_URL_CHARS).collect()
 }
 
+/// `e`, from a request ureq could not make, as an error says it: in ureq's
+/// words, except for a redirect target it could not follow (a space or a
+/// byte a URL may not hold, `..` above the root). ureq quotes that target
+/// whole (`location header is malformed: <target>`), and the server picks
+/// it, so it is named as [`shown_url`] shows it.
+fn network_error(e: &ureq::Error) -> String {
+    const MALFORMED: &str = "location header is malformed: ";
+    if let ureq::Error::Protocol(protocol) = e {
+        let text = protocol.to_string();
+        if let Some(target) = text.strip_prefix(MALFORMED) {
+            return format!("network error: protocol: {MALFORMED}{}", shown_url(target));
+        }
+    }
+    format!("network error: {e}")
+}
+
 /// Open a URL for streaming. `file://` is supported for lab installs/tests.
 ///
 /// HTTP goes through [`net::agent`]: urllib's timeouts (every read waits at
@@ -685,7 +701,7 @@ fn shown_url(url: &str) -> String {
 /// again on every redirect hop, and no transparent decompression, so the
 /// SHA-256 always covers the bytes the server sent. A URL that does not
 /// parse is refused here, named as [`shown_url`] shows it: ureq's own error
-/// would quote it whole.
+/// would quote it whole, as it quotes a redirect target ([`network_error`]).
 fn open_url(
     url: &str,
     timeouts: Timeouts,
@@ -708,7 +724,7 @@ fn open_url(
         // What urllib sends: a CDN must not compress the tarball on the fly.
         .header("Accept-Encoding", "identity")
         .call()
-        .map_err(|e| UpdateError::new(format!("network error: {e}"), "download_failed"))?;
+        .map_err(|e| UpdateError::new(network_error(&e), "download_failed"))?;
     let status = resp.status().as_u16();
     // urllib raises for anything it could not turn into a 2xx (incl. a 3xx
     // without a usable Location).
@@ -1171,12 +1187,14 @@ impl Staged {
     /// `unpacked`, in the open `releases`, is root's own and 0700, and
     /// through the tree's descriptor ([`unpack_through`]): a name the
     /// service user swaps in `releases/` (it owns it) takes no write
-    /// elsewhere, and nothing in the tree is that user's to change before
-    /// the release is in place, after which it is handed over
-    /// ([`Staged::put_in_place`]): no mode the archive gives lets others
-    /// write. The release then moves to `staging`, relative to the
-    /// directories opened. Returns the archive's single top-level
-    /// directory, if it has one.
+    /// elsewhere. Nothing in the tree is that user's to change before the
+    /// release is in place, after which it is handed over
+    /// ([`Staged::put_in_place`]): before the tree leaves `unpacked`, group
+    /// and others lose write on all of it, whatever mode the archive or the
+    /// umask gave ([`crate::util::clear_group_other_write`]; tar gives a
+    /// directory only a member's path implies the umask's). The release
+    /// then moves to `staging`, relative to the directories opened. Returns
+    /// the archive's single top-level directory, if it has one.
     fn unpack_as_root(
         archive: &mut tar::Archive<impl Read>,
         releases: &File,
@@ -1185,9 +1203,10 @@ impl Staged {
     ) -> Result<Option<OsString>, UpdateError> {
         const TREE: &str = "tree";
         let failed = io_err(INSTALL_FAILED);
-        archive.set_mask(0o022);
         let name = |p: &Path| p.file_name().unwrap_or_default().to_owned();
         crate::util::create_dir_at(releases, &name(unpacked), 0o700).map_err(&failed)?;
+        #[cfg(test)]
+        run_hook(&AFTER_UNPACK_DIR_MADE);
         let private = crate::util::open_dir_at(releases, &name(unpacked)).map_err(&failed)?;
         // The directory just made, unless another user put one of theirs,
         // or one open to them, in its place since.
@@ -1200,9 +1219,10 @@ impl Staged {
                 INSTALL_FAILED,
             ));
         }
-        crate::util::create_dir_at(&private, OsStr::new(TREE), 0o777).map_err(&failed)?;
+        crate::util::create_dir_at(&private, OsStr::new(TREE), 0o755).map_err(&failed)?;
         let tree = crate::util::open_dir_at(&private, OsStr::new(TREE)).map_err(&failed)?;
         unpack_through(archive, &tree)?;
+        crate::util::clear_group_other_write(&tree).map_err(&failed)?;
         let top = single_top_dir(&fd_path(&tree))?;
         let (from, from_name) = match &top {
             Some(top) => (&tree, top.as_os_str()),
@@ -1316,18 +1336,10 @@ fn single_top_dir(dir: &Path) -> Result<Option<OsString>, UpdateError> {
     })
 }
 
-/// This process's effective uid.
-fn euid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
-}
-
-/// The open directory `dir` as a path: its link in `/proc/self/fd`, which
-/// leads to the directory itself, not to wherever its name is now.
-fn fd_path(dir: &File) -> PathBuf {
-    use std::os::fd::AsRawFd;
-    PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
-}
+/// What a test runs at a step of root's unpack, on its own thread
+/// ([`run_hook`]).
+#[cfg(test)]
+type TestHook = RefCell<Option<Box<dyn Fn()>>>;
 
 #[cfg(test)]
 thread_local! {
@@ -1335,8 +1347,22 @@ thread_local! {
     /// after each member it unpacks: the service user may rename anything
     /// in `releases/` while root unpacks there (see
     /// `tests::unpacking_as_root_takes_no_write_elsewhere`).
-    static AFTER_EACH_MEMBER: std::cell::RefCell<Option<Box<dyn Fn()>>> =
-        const { std::cell::RefCell::new(None) };
+    static AFTER_EACH_MEMBER: TestHook = const { RefCell::new(None) };
+    /// While a test sets this, [`Staged::unpack_as_root`] on its thread
+    /// calls it right after it makes `.<slot>.unpack`, before it opens it:
+    /// the service user may put a directory of its own at that name
+    /// meanwhile (see `tests::unpacking_as_root_refuses_a_dir_put_in_its_place`).
+    static AFTER_UNPACK_DIR_MADE: TestHook = const { RefCell::new(None) };
+}
+
+/// Call `hook`, if a test on this thread set it.
+#[cfg(test)]
+fn run_hook(hook: &'static std::thread::LocalKey<TestHook>) {
+    hook.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
 }
 
 /// Unpack `archive` into the open directory `dir`, member by member as
@@ -1368,11 +1394,7 @@ fn unpack_through(archive: &mut tar::Archive<impl Read>, dir: &File) -> Result<(
             entry.unpack_in(&at).map_err(extract_failed)?;
         }
         #[cfg(test)]
-        AFTER_EACH_MEMBER.with(|hook| {
-            if let Some(hook) = hook.borrow().as_ref() {
-                hook();
-            }
-        });
+        run_hook(&AFTER_EACH_MEMBER);
     }
     directories.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
     for mut directory in directories {
@@ -6935,6 +6957,84 @@ mod tests {
         assert_eq!(current_name(&root), "0.4.0");
     }
 
+    /// A redirect target ureq cannot follow (a space, a byte a URL may not
+    /// hold, `..` above the root) is quoted whole in ureq's error, and the
+    /// server picks it: errors and log lines name it as [`shown_url`] shows
+    /// it, without its query or userinfo, for the manifest and the artifact
+    /// alike. (ureq's words, the signature included, reached `last_error`.)
+    #[test]
+    fn a_redirect_target_is_shown_without_userinfo_or_query() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let c = unsigned_ok(td.path());
+        let srv = http_stub::serve(|req, s| {
+            let target = match req.path.as_str() {
+                "/space" => "/b c.tar.gz?X-Amz-Signature=s3cr3t".to_string(),
+                "/above" => "../../x.tar.gz?X-Amz-Signature=s3cr3t".to_string(),
+                "/byte" => "/b\u{e9}c.tar.gz?X-Amz-Signature=s3cr3t".to_string(),
+                "/authority" => format!(
+                    "//u:pw@127.0.0.1:{}/b c.tar.gz?X-Amz-Signature=s3cr3t",
+                    req.port()
+                ),
+                // A manifest whose artifact URL redirects there.
+                path => match path.strip_suffix(".json") {
+                    Some(artifact) => {
+                        let manifest = json!({
+                            "version": "0.5.0",
+                            "artifact_url": format!("http://127.0.0.1:{}{artifact}", req.port()),
+                            "artifact_sha256": "a".repeat(64),
+                        });
+                        return respond(s, 200, &[], manifest.to_string().as_bytes());
+                    }
+                    None => return respond(s, 404, &[], b""),
+                },
+            };
+            respond(s, 302, &[("Location", &target)], b"")
+        });
+        let base = srv.base_url.clone();
+        let port = base.rsplit(':').next().unwrap().to_string();
+        let leaks =
+            |text: &str| text.contains("s3cr3t") || text.contains("pw@") || text.contains('?');
+        let dest = td.path().join("a.tar.gz");
+        for (route, shown) in [
+            ("/space", "/b c.tar.gz".to_string()),
+            ("/above", "../../x.tar.gz".to_string()),
+            ("/byte", "/b\u{e9}c.tar.gz".to_string()),
+            ("/authority", format!("//127.0.0.1:{port}/b c.tar.gz")),
+        ] {
+            let error = format!("network error: protocol: location header is malformed: {shown}");
+            let err =
+                http_download_to_file(&format!("{base}{route}"), &dest, &"a".repeat(64), &NO_STOP)
+                    .unwrap_err();
+            assert_eq!(
+                (err.code, err.message.as_str()),
+                ("download_failed", error.as_str()),
+                "{route}"
+            );
+            // The manifest redirected (the update URL), then the artifact.
+            for update_url in [format!("{base}{route}"), format!("{base}{route}.json")] {
+                let hb = obj(json!({"desired_agent_version": "0.5.0", "update_url": update_url}));
+                let (st, lines) = logs_during(|| {
+                    maybe_update_from_heartbeat(&hb, &c, &env(&root), None, None, false, &NO_STOP)
+                });
+                assert_eq!(
+                    st.last_error.as_deref(),
+                    Some(error.as_str()),
+                    "{update_url}"
+                );
+                assert!(
+                    lines.iter().any(|(_, line)| line.contains(&error)),
+                    "{update_url}: {lines:?}"
+                );
+                for (_, line) in &lines {
+                    assert!(!leaks(line), "{line}");
+                }
+            }
+        }
+        assert!(!dest.exists());
+        assert_eq!(current_name(&root), "0.4.0");
+    }
+
     // --- root in the service user's tree ---------------------------------------------
 
     use std::cell::Cell;
@@ -6980,6 +7080,37 @@ mod tests {
         assert_eq!(names(victim.path()), Vec::<String>::new());
     }
 
+    /// Once installed, the artifact is removed from the `update/` it was
+    /// downloaded in, relative to it: an `update/` swapped for a symlink
+    /// meanwhile takes the removal nowhere else, and a file of that name in
+    /// the link's target stays. (Removed by path, that file went, and the
+    /// artifact stayed.)
+    #[test]
+    fn the_artifact_is_removed_from_the_update_dir_it_opened() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        let victim = tempfile::tempdir().unwrap();
+        let theirs = victim.path().join("vesyl-print-0.5.0.tar.gz");
+        fs::write(&theirs, b"not the artifact").unwrap();
+        let tarball = build_release(&td.path().join("0.5.0"), "0.5.0");
+        let served = fs::read(&tarball).unwrap();
+        let (update, target) = (root.join("update"), victim.path().to_path_buf());
+        let srv = http_stub::serve(move |_, s| {
+            swap_for_link(&update, &target);
+            respond(s, 200, &[], &served)
+        });
+        let m = ReleaseManifest::from_dict(&obj(json!({
+            "version": "0.5.0",
+            "artifact_url": format!("{}/vesyl-print-0.5.0.tar.gz", srv.base_url),
+            "artifact_sha256": sha256_file(&tarball).unwrap(),
+        })))
+        .unwrap();
+        apply_release(&m, &env(&root), None, false, &NO_STOP).unwrap();
+        assert_eq!(current_name(&root), "0.5.0");
+        assert_eq!(names(&root.join("update.moved")), Vec::<String>::new());
+        assert_eq!(fs::read(&theirs).unwrap(), b"not the artifact");
+    }
+
     /// [`download_while_update_is_swapped`] as root, in the service user's
     /// `update/`, its symlink to a root-owned directory: nothing lands
     /// there, and the artifact is the service user's. Needs root (or a user
@@ -7004,15 +7135,20 @@ mod tests {
         assert_eq!(fs::metadata(victim.path()).unwrap().uid(), 0);
     }
 
-    /// Run `f` with `hook` called after each member root's unpack unpacks.
-    fn after_each_member<T>(hook: impl Fn() + 'static, f: impl FnOnce() -> T) -> T {
-        AFTER_EACH_MEMBER.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    /// Run `f` with `hook` called at the step of root's unpack `at` names
+    /// ([`AFTER_EACH_MEMBER`], [`AFTER_UNPACK_DIR_MADE`]).
+    fn with_hook<T>(
+        at: &'static std::thread::LocalKey<TestHook>,
+        hook: impl Fn() + 'static,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        at.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
         let out = f();
-        AFTER_EACH_MEMBER.with(|h| *h.borrow_mut() = None);
+        at.with(|h| *h.borrow_mut() = None);
         out
     }
 
-    /// A hook for [`after_each_member`]: on its first call it notes the
+    /// A hook for [`AFTER_EACH_MEMBER`]: on its first call it notes the
     /// owner and mode of `unpack` (the directory root unpacks in), then
     /// swaps it for a symlink to `victim`, as the service user could.
     fn swap_unpack_dir_once(
@@ -7073,7 +7209,7 @@ mod tests {
             let releases = install.path();
             let seen = Rc::new(Cell::new(None));
             let hook = swap_unpack_dir_once(&releases.join(".0.5.0.unpack"), victim.path(), &seen);
-            let staged = after_each_member(hook, || {
+            let staged = with_hook(&AFTER_EACH_MEMBER, hook, || {
                 Staged::unpack_as(
                     &File::open(&tarball).unwrap(),
                     &releases.join("0.5.0"),
@@ -7095,7 +7231,8 @@ mod tests {
 
     /// An archive without a single top-level directory is the release as a
     /// whole, unpacked as root or not: the staging dir holds its members,
-    /// with the mode `create_dir_all` gives (not root's 0700).
+    /// with the mode `create_dir_all` gives (not root's 0700), as root less
+    /// write for group and others.
     #[test]
     fn a_flat_archive_is_staged_whole() {
         let td = tempfile::tempdir().unwrap();
@@ -7115,7 +7252,7 @@ mod tests {
             modes.push(fs::metadata(&staged.dir).unwrap().mode() & 0o7777);
             assert_eq!(names(&releases), ["0.5.0.staging"], "{as_root}");
         }
-        assert_eq!(modes[0], modes[1]);
+        assert_eq!(modes[1], modes[0] & !0o022);
     }
 
     /// As root, no mode the archive gives lets others write in the release
@@ -7158,6 +7295,109 @@ mod tests {
             }
             assert!(slot_is_runnable(&staged.dir), "{as_root}");
         }
+    }
+
+    /// Set in the child process of
+    /// [`unpacking_as_root_lets_no_one_else_write_whatever_the_umask`].
+    const UMASK_CHILD: &str = "VESYL_TEST_UMASK_CHILD";
+
+    /// [`unpacking_as_root_lets_no_one_else_write`] whatever the umask of
+    /// the shell that ran `sudo vesyl-print update apply`: what tar makes
+    /// with no mode from the archive (the directory a flat release is in, a
+    /// directory only a member's path implies, a member whose mode does not
+    /// parse) lets no one else write either. In a child process, as the
+    /// umask is the whole process's.
+    #[test]
+    fn unpacking_as_root_lets_no_one_else_write_whatever_the_umask() {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "update::tests::umask_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(UMASK_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "child process of unpacking_as_root_lets_no_one_else_write_whatever_the_umask"]
+    fn umask_child() {
+        if std::env::var_os(UMASK_CHILD).is_none() {
+            return;
+        }
+        // SAFETY: umask has no preconditions; this process runs this test
+        // alone.
+        unsafe { libc::umask(0) };
+        let td = tempfile::tempdir().unwrap();
+        fs::create_dir(td.path().join("probe")).unwrap();
+        let probe = fs::metadata(td.path().join("probe")).unwrap().mode() & 0o777;
+        assert_eq!(probe, 0o777, "umask 0 in effect");
+
+        // No directory entries: the members' paths imply every directory.
+        let files = [
+            ("vesyl-print", true),
+            ("lib/a.py", false),
+            ("lib/web/b.py", false),
+        ];
+        let garbled = td.path().join("garbled.tar.gz");
+        evil_tarball(&garbled, |tar| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(4);
+            h.set_mode(0o755);
+            tar.append_data(&mut h, "vesyl-print-0.5.0/vesyl-print", &b"\x7fELF"[..])
+                .unwrap();
+            let mut h = tar::Header::new_gnu();
+            h.set_size(4);
+            h.as_old_mut().mode = *b"garbled\0";
+            tar.append_data(&mut h, "vesyl-print-0.5.0/main.py", &b"\x7fELF"[..])
+                .unwrap();
+        });
+        for tarball in [
+            tarball_with(&subdir(td.path(), "src"), "0.5.0", &files),
+            flat_tarball(&subdir(td.path(), "flat"), &files),
+            garbled,
+        ] {
+            let install = tempfile::tempdir().unwrap();
+            let staged = Staged::unpack_as(
+                &File::open(&tarball).unwrap(),
+                &install.path().join("0.5.0"),
+                true,
+            )
+            .unwrap();
+            assert!(slot_is_runnable(&staged.dir), "{}", tarball.display());
+            assert_eq!(
+                others_may_write(&staged.dir),
+                Vec::<PathBuf>::new(),
+                "{}",
+                tarball.display()
+            );
+        }
+    }
+
+    /// What in `dir` (itself included) group or others may write, at any
+    /// depth; symlinks aside, whose mode means nothing.
+    fn others_may_write(dir: &Path) -> Vec<PathBuf> {
+        let mut open = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if !meta.file_type().is_symlink() && meta.mode() & 0o022 != 0 {
+                open.push(path.clone());
+            }
+            if meta.is_dir() {
+                stack.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            }
+        }
+        open
     }
 
     /// Root refuses a hard link in an archive: tar finds its target by
@@ -7204,6 +7444,86 @@ mod tests {
         assert!(staged.dir.join("agent").is_file());
     }
 
+    /// Root's unpack of a `0.5.0` release into `releases`, while the
+    /// service user (it owns `releases/`) renames the `.0.5.0.unpack` root
+    /// just made away, to `.0.5.0.unpack.moved`, and `plant`s a directory
+    /// of its own at that name, before root opens it. The unpack must be
+    /// refused before any member is unpacked, in that directory or any
+    /// other: in one not root's alone, that user could rearrange the tree
+    /// under root's unpack.
+    fn refuses_a_dir_put_in_place_of_its_own(releases: &Path, plant: impl Fn(&Path) + 'static) {
+        let td = tempfile::tempdir().unwrap();
+        let tarball = build_release(td.path(), "0.5.0");
+        let unpack = releases.join(".0.5.0.unpack");
+        let planted = unpack.clone();
+        let swap = move || {
+            let mut away = planted.as_os_str().to_owned();
+            away.push(".moved");
+            fs::rename(&planted, away).unwrap();
+            plant(&planted);
+        };
+        let unpacked_any = Rc::new(Cell::new(false));
+        let noted = unpacked_any.clone();
+        let result = with_hook(&AFTER_UNPACK_DIR_MADE, swap, || {
+            with_hook(
+                &AFTER_EACH_MEMBER,
+                move || noted.set(true),
+                || {
+                    Staged::unpack_as(
+                        &File::open(&tarball).unwrap(),
+                        &releases.join("0.5.0"),
+                        true,
+                    )
+                },
+            )
+        });
+        let err = result.unwrap_err();
+        assert_eq!(
+            (err.code, err.message),
+            (
+                INSTALL_FAILED,
+                format!("{} is not the directory just made", unpack.display())
+            )
+        );
+        assert!(!unpacked_any.get());
+        // Root's own, empty; no staging dir. (The planted one is cleared.)
+        assert_eq!(names(releases), [".0.5.0.unpack.moved"]);
+        assert_eq!(
+            names(&releases.join(".0.5.0.unpack.moved")),
+            Vec::<String>::new()
+        );
+    }
+
+    /// [`refuses_a_dir_put_in_place_of_its_own`], the directory put there
+    /// open to others.
+    #[test]
+    fn unpacking_as_root_refuses_a_dir_put_in_its_place() {
+        let td = tempfile::tempdir().unwrap();
+        refuses_a_dir_put_in_place_of_its_own(&subdir(td.path(), "releases"), |at| {
+            fs::create_dir(at).unwrap();
+            crate::util::set_mode(at, 0o755).unwrap();
+        });
+    }
+
+    /// [`refuses_a_dir_put_in_place_of_its_own`] as root, the directory put
+    /// there the service user's, and closed to others as root's own is.
+    /// Needs root (or a user namespace).
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_refuses_the_service_users_dir_in_place_of_its_own() {
+        if euid() != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let releases = subdir(td.path(), "releases");
+        std::os::unix::fs::chown(&releases, Some(1000), Some(1000)).unwrap();
+        refuses_a_dir_put_in_place_of_its_own(&releases, |at| {
+            fs::create_dir(at).unwrap();
+            crate::util::set_mode(at, 0o700).unwrap();
+            std::os::unix::fs::chown(at, Some(1000), Some(1000)).unwrap();
+        });
+    }
+
     /// As root, in the service user's `releases/`: the release is root's
     /// until it is in place, then the owner of `releases/` gets it all. The
     /// directory root unpacks in is root's and 0700, and swapping it for a
@@ -7237,7 +7557,7 @@ mod tests {
             let unpack = releases.join(format!(".{version}.unpack"));
             seen.set(None);
             let hook = swap_unpack_dir_once(&unpack, victim.path(), &seen);
-            after_each_member(hook, || {
+            with_hook(&AFTER_EACH_MEMBER, hook, || {
                 apply_local_release(&m, &env(&root), &tarball, None, false)
             })
             .unwrap();
