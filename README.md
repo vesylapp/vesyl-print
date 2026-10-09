@@ -318,10 +318,10 @@ leave root-owned files in the state dir and follow links that account can
 plant there. To run it in the foreground, stop the service and use
 `sudo -u <service user> vesyl-print agent` (e.g. `sudo -u vesyl`). On
 SIGTERM or Ctrl-C it finishes an in-process step in flight, an HTTP request
-included, then exits; a second signal quits at once. Child processes are not
-spared: systemd's stop signals every process in the unit's cgroup, and Ctrl-C
-the whole foreground process group, so a running `lp`, `lpstat`, `pdftoppm`
-or `gs` is killed with the agent (see the drain notes under
+included, then exits; a second signal quits at once. The unit's
+`KillMode=mixed` sends systemd's stop to the agent alone, so a running `lp`,
+`lpstat`, `pdftoppm` or `gs` finishes too; Ctrl-C reaches the whole
+foreground process group and kills them (see the drain notes under
 [Local print test](#local-print-test-no-cloud)). Under systemd a stop waits for that
 at most the default `TimeoutStopSec` (90 s) before the agent is killed. Jobs
 not yet given to `lp` stay queued for the next start
@@ -473,26 +473,29 @@ gate of an install cut off after its slot flip.
   reports it delivered when CUPS no longer knows it.
 - A job the agent died in three times while converting or submitting it (out
   of memory, say) is retired to `queue/failed/` as `crash_loop` and reported
-  `error`.
+  `error`. A death after a stop began (systemd's SIGKILL once its 90 s stop
+  timeout runs out, say during a slow content fetch, or a second signal) is
+  the stop's, and does not count: the agent lists the runs that began to
+  stop in `queue/.stopped-runs`.
 - Once the agent is stopping (SIGTERM), the drain takes no further job and no
   job goes to `lp`. An in-process step already running (a content fetch, an
   image conversion) finishes first. A `wait_cups: sync` wait ends at its next
   check: it naps 100 ms at a time between `lpstat` polls. A job cut short
   that way stays queued for the next start.
-- Child processes do not finish first. The unit sets no `KillMode`, so
-  `systemctl stop` or restart sends SIGTERM to the whole cgroup at once (and
-  Ctrl-C reaches the whole foreground process group); the CUPS tools and
-  renderers run in the agent's group with signals unblocked. A PDF
-  conversion killed that way currently fails the job permanently as
-  `pdf_render` (retired to `queue/failed/`, reported `error`). An `lp` killed
-  mid-submit fails as `lp_error`, reported `error` but kept queued and sent
-  again on the next start; if cupsd had already accepted it, it can print
-  twice. This is a known gap (it needs `KillMode=mixed` in the unit, which
-  reaches devices only through `setup.sh`, or the children in their own
-  process group).
+- The unit sets `KillMode=mixed`, so `systemctl stop` or restart sends
+  SIGTERM to the agent alone: a running `lp`, `pdftoppm` or `gs` finishes
+  too (what is left at the stop timeout is SIGKILLed with the agent). A
+  device keeps the unit `setup.sh` installed, which an OTA update does not
+  change; under an older unit, as under Ctrl-C (which reaches the whole
+  foreground process group), the children get the signal and die. A
+  conversion or `lp` that fails once the agent is stopping leaves the job
+  queued for the next start, as any other job cut short by the stop; an `lp`
+  killed mid-submit can then print twice if cupsd had already accepted it.
+- A job canceled (`job_canceled`) while the agent runs it is not given to
+  `lp` once the cancel has landed, and its queue file is not written again.
 
 The queue file is the cloud payload plus the agent's notes under `_agent`
-(`attempts`, `cups_job_id`, `submitted_at`). Agents from older releases ignore
+(`attempts`, `run`, `cups_job_id`, `submitted_at`). Agents from older releases ignore
 that key: after a rollback to one, a job whose record says CUPS has it may
 print again.
 

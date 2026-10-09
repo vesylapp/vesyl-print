@@ -140,23 +140,32 @@ agent on purpose):
   takes no further job, no job goes to `lp`, and a synchronous CUPS wait ends
   at its next check (it naps 100 ms at a time between `lpstat` polls). An
   in-process step already running (a content fetch, an image conversion, a
-  wait-tick heartbeat) finishes first. Child processes do not: the unit sets
-  no `KillMode`, so a systemd stop signals the whole cgroup (Ctrl-C the whole
-  process group), and `printers::unblocked_signals` leaves the children
-  killable. A killed `pdftoppm`/`gs` maps to `pdf_render`, which is
-  permanent, so a PDF job converting at stop time is retired to
-  `queue/failed/`; a killed `lp` is a retryable `lp_error` and may print
-  twice if cupsd already had the job. Known gap: fixing it needs
-  `KillMode=mixed` (via `setup.sh`) or a process group per child, or treating
-  a child failure while stopping as `Interrupted`.
+  wait-tick heartbeat) finishes first, and so do child processes: the unit
+  sets `KillMode=mixed`, so a systemd stop signals the agent alone. Ctrl-C
+  (the whole process group), or a device still on a unit from before
+  (`setup.sh` installs the unit; OTA does not), kills the children, which
+  `printers::unblocked_signals` leaves killable. A conversion or `lp` error
+  that comes back once `stop` is set is `Interrupted`, not the job's failure:
+  the job stays queued (a killed `lp` may then print twice if cupsd already
+  had the job).
+- A job canceled while it runs (`job_canceled` on the cable thread) is not
+  given to `lp` once the cancel landed: `JobStore::write_local` rewrites a
+  record only while it exists and its job is not processed, under a lock
+  `JobStore::cancel` shares, so it never brings back a record the cancel
+  deleted. Such a run ends `canceled`, reported as nothing more.
 - Every CUPS tool (lp, lpstat, lpinfo, lpoptions, ipptool, lpadmin) runs
   with LC_ALL and LC_MESSAGES set to C.UTF-8 (`printers::CUPS_ENV`): their
   output is parsed in English.
 - Queue records keep the cloud payload as received; the agent's notes go
-  under `_agent` (attempts, cups_job_id, submitted_at). A record that says
-  CUPS has the job is never sent to `lp` again; three deaths in one job
-  retire it as `crash_loop`. Agents of older releases ignore `_agent`, so
-  after a rollback to one such a record may print again.
+  under `_agent` (attempts, run, cups_job_id, submitted_at). A record that
+  says CUPS has the job is never sent to `lp` again; three deaths in one job
+  retire it as `crash_loop`. Each attempt records its run (`run`, a random
+  id per process); the signal thread lists a run that begins to stop in
+  `queue/.stopped-runs`, and an attempt of a listed run does not count (it
+  ended in the stop's SIGKILL, not in the job). An attempt whose record
+  write failed, say its directory fsync, is taken back. Agents of older
+  releases ignore `_agent`, so after a rollback to one such a record may
+  print again.
 - Release tarballs keep shipping `base.jpg`: it is the sample image for
   `vesyl-print print-test --file /opt/vesyl-print/current/base.jpg` (top-level
   README).
@@ -185,8 +194,9 @@ agent on purpose):
   explicit one that cannot.
 - `vesyl-print agent` refuses to run as root: run it as the service user
   (`sudo -u <service user> vesyl-print agent`). On SIGTERM or SIGINT it
-  finishes an in-process step in flight, an HTTP request included (child
-  processes are killed with it, see above), so a stop takes up
+  finishes an in-process step in flight, an HTTP request included (and,
+  under systemd's `KillMode=mixed`, a child process; see above), so a stop
+  takes up
   to systemd's `TimeoutStopSec` (default 90 s); a second signal exits at
   once. A stop during an OTA download removes the partial file; one after
   activation skips the restart, and the next start runs the health gate.

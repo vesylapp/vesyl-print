@@ -144,16 +144,9 @@ pub fn handle_job_canceled(job_id: &str, store: &JobStore) -> std::io::Result<()
         log::warn!(target: LOG, "ignoring job_canceled with invalid job id {}", jobs::shown_id(job_id));
         return Ok(());
     }
-    if store.is_processed(job_id) {
-        store.delete_queue(job_id);
-        return Ok(());
-    }
-    if store.has_queue_file(job_id) {
-        log::info!(target: LOG, "job {job_id} canceled — dropping queue file");
-        store.delete_queue(job_id);
-    }
-    // Marker prevents a late redelivery/print of a canceled job.
-    store.mark_processed(job_id)
+    // Drops the queue file and writes the marker that prevents a late
+    // redelivery/print, never while the job's own run rewrites its record.
+    store.cancel(job_id)
 }
 
 /// A stand-in job for reporting a cloud payload that failed validation, when
@@ -969,6 +962,17 @@ impl Agent {
         );
         // Job pipelines follow this run's stop from here on.
         *lock(&self.shared.stop) = stop.clone();
+        // Once a stop begins, whatever ends this run is the stop, not the
+        // job in flight: its attempt must not count as a death in it.
+        let store = self.store.clone();
+        let _stop_note = on_stop(
+            &stop,
+            Box::new(move || {
+                if let Err(e) = store.note_stop_began() {
+                    log::warn!(target: LOG, "could not record that the agent is stopping: {e}");
+                }
+            }),
+        );
 
         self.recover_interrupted_update();
         // CUPS inventory runs off this loop from here on.
@@ -1474,9 +1478,47 @@ pub fn stop_on_signals(stop: Arc<AtomicBool>) -> io::Result<()> {
     Ok(())
 }
 
+/// Something to do the moment a stop signal sets a given stop flag.
+type StopHook = Box<dyn Fn() + Send>;
+
+/// The [`StopHook`]s, by the address of the flag they wait on.
+static STOP_HOOKS: Mutex<Vec<(usize, StopHook)>> = Mutex::new(Vec::new());
+
+fn flag_key(stop: &Arc<AtomicBool>) -> usize {
+    Arc::as_ptr(stop) as usize
+}
+
+/// Run `hook` on the signal thread when a stop signal sets `stop`, until
+/// the returned guard is dropped. [`Agent::run`] records with it that its
+/// run began to stop, at once, while the job in flight may not look at the
+/// flag again before systemd's SIGKILL.
+fn on_stop(stop: &Arc<AtomicBool>, hook: StopHook) -> StopHookGuard {
+    let key = flag_key(stop);
+    lock(&STOP_HOOKS).push((key, hook));
+    StopHookGuard(key)
+}
+
+/// Removes the hooks [`on_stop`] added for its flag.
+struct StopHookGuard(usize);
+
+impl Drop for StopHookGuard {
+    fn drop(&mut self) {
+        lock(&STOP_HOOKS).retain(|(key, _)| *key != self.0);
+    }
+}
+
+/// A stop signal arrived: set `stop`, then run its hooks.
+fn stop_began(stop: &Arc<AtomicBool>) {
+    stop.store(true, Ordering::SeqCst);
+    let key = flag_key(stop);
+    for (_, hook) in lock(&STOP_HOOKS).iter().filter(|(k, _)| *k == key) {
+        hook();
+    }
+}
+
 /// The signal thread: the first stop signal sets `stop`, a second one ends
 /// the process.
-fn take_stop_signals(set: &libc::sigset_t, stop: &AtomicBool) {
+fn take_stop_signals(set: &libc::sigset_t, stop: &Arc<AtomicBool>) {
     let mut stopping = false;
     loop {
         let mut sig: libc::c_int = 0;
@@ -1491,7 +1533,7 @@ fn take_stop_signals(set: &libc::sigset_t, stop: &AtomicBool) {
         }
         stopping = true;
         log::info!(target: LOG, "{name} received — stopping once the current step is done (a second signal quits at once)");
-        stop.store(true, Ordering::SeqCst);
+        stop_began(stop);
     }
 }
 
@@ -2219,6 +2261,50 @@ mod tests {
         handle_job_canceled("c1", &store).unwrap();
         assert!(!store.has_queue_file("c1"));
         assert!(store.is_processed("c1"));
+    }
+
+    /// A stop signal records, at once, that this run began to stop (the job
+    /// in flight then does not count a SIGKILL as a death in it), through
+    /// the hook registered for its flag alone, and only while registered.
+    #[test]
+    fn a_stop_signal_records_that_the_run_is_stopping() {
+        let td = tempfile::tempdir().unwrap();
+        let store = JobStore::new(td.path().join("q"), td.path().join("p"));
+        let (stop, other) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let s = store.clone();
+        let guard = on_stop(&stop, Box::new(move || s.note_stop_began().unwrap()));
+
+        stop_began(&other);
+        assert!(other.load(Ordering::SeqCst));
+        assert!(!store.stop_marker_path().exists(), "another flag's stop");
+
+        stop_began(&stop);
+        assert!(stop.load(Ordering::SeqCst));
+        let runs = fs::read_to_string(store.stop_marker_path()).unwrap();
+        assert_eq!(runs.lines().count(), 1, "{runs}");
+
+        drop(guard);
+        fs::remove_file(store.stop_marker_path()).unwrap();
+        stop_began(&stop);
+        assert!(!store.stop_marker_path().exists(), "hook removed");
+    }
+
+    /// The unit sends the stop's SIGTERM to the agent alone (see
+    /// vesyl-print-agent.service): lp and the renderers finish their step.
+    #[test]
+    fn the_unit_stops_the_agent_alone() {
+        let unit = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../vesyl-print-agent.service"),
+        )
+        .unwrap();
+        let kill_modes: Vec<_> = unit
+            .lines()
+            .filter(|l| l.trim_start().starts_with("KillMode="))
+            .collect();
+        assert_eq!(kill_modes, ["KillMode=mixed"]);
     }
 
     /// A job_canceled id must never reach outside queue/ or processed/
