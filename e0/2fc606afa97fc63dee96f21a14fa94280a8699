@@ -1,0 +1,21 @@
+README.md
+  s_2883cba6969ed7::t_3693a1155f4cfd 110-111,320-325,478-492
+rust/README.md
+  s_2883cba6969ed7::t_3693a1155f4cfd 141-151,188-189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e02fc606afa97fc63dee96f21a14fa94280a8699",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
