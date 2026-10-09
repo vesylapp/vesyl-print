@@ -133,10 +133,13 @@ check_release_binary() {
      curl -fLO https://github.com/vesylapp/vesyl-print/releases/download/vX.Y.Z/vesyl-print-X.Y.Z-linux-aarch64.tar.gz
      tar -xzf vesyl-print-X.Y.Z-linux-aarch64.tar.gz
      sudo ./vesyl-print-X.Y.Z/setup.sh
-   or build a release from this checkout (needs cargo-zigbuild) and run the
-   setup.sh inside it:
-     BUILD_ONLY=1 ./scripts/build-release.sh
-     tar -xzf dist/vesyl-print-${APP_VERSION}-linux-aarch64.tar.gz
+   or build a release from this checkout (needs cargo-zigbuild, binutils, jq
+   and rsync) and run the setup.sh inside it; README.md ("Re-provisioning a
+   Python-era device") says how to number X.Y.Z for a build that is not a
+   release:
+     BUILD_ONLY=1 ./scripts/build-release.sh X.Y.Z
+     tar -xzf dist/vesyl-print-X.Y.Z-linux-aarch64.tar.gz
+     sudo ./vesyl-print-X.Y.Z/setup.sh
 EOF
         exit 1
     fi

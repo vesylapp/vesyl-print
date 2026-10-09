@@ -5,8 +5,9 @@
 //! optional package never blocks the required ones, and re-provisioning from
 //! an extracted release without a Tailscale key skips Tailscale and removes
 //! only that tree. setup.sh and `apply-update` take exactly the release
-//! versions update.rs `is_version` takes, and the agent unit outlives a
-//! renderer killed for memory.
+//! versions update.rs `is_version` takes, the agent unit outlives a
+//! renderer killed for memory, and a tree without the binary says how to
+//! get one.
 //!
 //! The unprivileged tests run setup.sh's preflight, which checks the release
 //! tree before it asks for sudo, with a `sudo` stub that records the hand-off.
@@ -214,6 +215,45 @@ fn preflight_hands_a_release_tree_to_sudo() {
             path_str(&p.tree.join("setup.sh"))
         )
     );
+}
+
+/// A tree without the binary (a git checkout) stops before sudo, saying how
+/// to get one: a release, or a build of the checkout given its version, as
+/// the checkout's own VERSION can be below the floor build-release.sh
+/// refuses. The README section it points at, for how to number such a
+/// build, is there.
+#[test]
+fn preflight_without_the_binary_says_how_to_build_one() {
+    let Some(p) = Preflight::new() else { return };
+    fs::remove_file(p.tree.join("vesyl-print")).unwrap();
+    let r = p.run();
+    assert_eq!(r.code, Some(1), "{}", r.log());
+    let binary = path_str(&p.tree.join("vesyl-print")).to_string();
+    for line in [
+        format!("!! {binary} not found.\n"),
+        "     BUILD_ONLY=1 ./scripts/build-release.sh X.Y.Z\n".into(),
+        "     tar -xzf dist/vesyl-print-X.Y.Z-linux-aarch64.tar.gz\n".into(),
+    ] {
+        assert!(r.stderr.contains(&line), "{line:?}\n{}", r.log());
+    }
+    // Once for the release, once for the build.
+    let setup = "\n     sudo ./vesyl-print-X.Y.Z/setup.sh\n";
+    assert_eq!(r.stderr.matches(setup).count(), 2, "{}", r.log());
+    let words = r.stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    let readme_section = "Re-provisioning a Python-era device";
+    assert!(
+        words.contains(&format!(
+            "README.md (\"{readme_section}\") says how to number X.Y.Z"
+        )),
+        "{}",
+        r.log()
+    );
+    // Not the checkout's own VERSION.
+    let own = format!("vesyl-print-{VERSION}-linux-aarch64.tar.gz");
+    assert!(!r.stderr.contains(&own), "{}", r.log());
+    assert_eq!(p.sudo_calls(), "", "{}", r.log());
+    let readme = read(&repo_root().join("README.md"));
+    assert!(readme.contains(&format!("\n### {readme_section}\n")));
 }
 
 #[test]
