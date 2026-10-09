@@ -149,13 +149,25 @@ jobs:
         run: ./scripts/build-release.sh 0.0.0-ci
 
       # The library's unit tests on aarch64, under qemu-user with the
-      # aarch64 glibc. Two tests re-run the test binary itself, which needs
-      # binfmt_misc on the runner; they gain nothing on aarch64 and are
-      # skipped.
+      # aarch64 glibc. Skipped, as they gain nothing on aarch64:
+      # - tests that re-run the test binary itself: the child would need
+      #   binfmt_misc on the runner and the sysroot's dynamic loader, which
+      #   qemu's -L gives only to the process it starts;
+      # - tests of root's descriptor walk, which opens "/" by path: qemu's -L
+      #   maps "/" to the sysroot, so the walk looks for the test's temp dirs
+      #   there.
+      # build_release.rs checks that every such test is listed here.
       - name: Unit tests (aarch64, qemu)
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
         run: |
           cargo-zigbuild test --lib --locked --target aarch64-unknown-linux-gnu.2.31 -- \
             --skip cloud::tests::proxy_env_rules_match_urllib \
-            --skip net::tests::requests_start_no_threads
+            --skip net::tests::requests_start_no_threads \
+            --skip cli::tests::tilde_paths_are_the_home_directory \
+            --skip util::tests::unset_home_uses_the_passwd_entry \
+            --skip update::tests::unpacking_as_root_lets_no_one_else_write_whatever_the_umask \
+            --skip util::tests::a_dir_swapped_after_the_open_cannot_redirect_the_write \
+            --skip util::tests::root_dir_walk_never_follows_a_swapped_in_symlink \
+            --skip util::tests::root_refuses_a_symlink_planted_in_the_service_tree \
+            --skip util::tests::root_walk_follows_only_links_nobody_else_could_plant

@@ -95,6 +95,7 @@ covered below.
 ```text
 /opt/vesyl-print/current → releases/<VERSION>/   vesyl-print binary, LCD (*.py), assets
 /usr/local/bin/vesyl-print                       wrapper: exec current/vesyl-print
+                                                 (as the service account under sudo)
 ```
 
 Services and the CLI run from `current`, so OTA can flip the symlink without
@@ -106,14 +107,17 @@ as in `sudo ln -s /data/vesyl-print /var/lib/vesyl-print`. Root must own the
 link and the directory that holds it, and nobody else may write to that
 directory unless it is sticky (`/var/lib`, `/etc` and `/opt` qualify by
 default). Any further symlink on the way to the target must meet the same
-rule, and the target must exist. Run as root (`sudo vesyl-print claim`,
-`enroll`, `unpair`, `print-test` or `update …`), the CLI's writes into these
-trees (and an update's unpack and hand-over) follow no other symlink. It refuses a symlink that root does not
-own, and one in a directory that someone other than root owns or can write
-to, such as `/var/lib/vesyl-print/queue` inside the service user's state dir.
-Such a run fails with "Not a directory" and logs which symlink it refused;
-link the top-level directory instead. The agent runs as the service user
-(never as root, see [CLI](#cli)) and follows symlinks as usual.
+rule, and the target must exist. `setup.sh` hands the tree an install-root
+link points at to the service user and keeps the link itself root's. The
+agent, and the CLI run through `sudo vesyl-print …` (see [CLI](#cli)), run
+as the service user and follow symlinks as usual. Only the binary run as
+root by path (`sudo /opt/vesyl-print/current/vesyl-print …`) is stricter:
+its writes into these trees (and an update's unpack and hand-over) follow
+no other symlink. It refuses a symlink that root does not own, and one in a
+directory that someone other than root owns or can write to, such as
+`/var/lib/vesyl-print/queue` inside the service user's state dir. Such a run
+fails with "Not a directory" and logs which symlink it refused; link the
+top-level directory instead.
 
 ### Re-provisioning a Python-era device
 
@@ -311,10 +315,27 @@ vesyl-print version
 vesyl-print update check|apply|rollback
 ```
 
+Run as root (`sudo vesyl-print …`), the installed wrapper runs the binary
+as the service account (`runuser -u <service user>`), as the units do. That
+account owns every release slot (OTA writes them as it), so root running the
+binary would run code the account can change. Every command works that way:
+`claim`, `enroll`, `unpair` and `status` read and write the account's own
+config and state; `update apply` and `update rollback` (with `--restart` too)
+activate a slot and restart the services through the `apply-update` sudo
+helper, as the agent does; `print-test` and `test-print` print through CUPS
+as the account, which `setup.sh` adds to `lp` and `lpadmin`. A file given to
+`--file` or `--manifest` must be one that account can read (copy it out of
+`/root` first), and a relative path needs a current directory it can enter.
+The wrapper has no switch to run the binary as root. To do that anyway
+(recovery), run the slot's binary by path,
+`sudo /opt/vesyl-print/current/vesyl-print …`, knowing it is code the
+service account can change.
+
 `vesyl-print agent` runs as the service account (the units' `User=`, the
 owner of `/var/lib/vesyl-print`) and refuses to run as root, which would
 leave root-owned files in the state dir and follow links that account can
 plant there. To run it in the foreground, stop the service and use
+`sudo vesyl-print agent` (the wrapper runs it as that account) or
 `sudo -u <service user> vesyl-print agent` (e.g. `sudo -u vesyl`). On
 SIGTERM or Ctrl-C it finishes an in-process step in flight, an HTTP request
 included, then exits; a second signal quits at once. The unit's
@@ -764,7 +785,8 @@ aarch64, builds the release tarball as the tag's build job does, glibc 2.31
 floor and `--version` under qemu included, and runs the unit tests for
 aarch64 under qemu) and `.github/workflows/lcd.yml` (the Python LCD tests,
 with Pillow, numpy and the DejaVu fonts from apt as on devices; segno too
-where the runner packages it). The LCD tests never touch the machine's
+where the runner packages it; it also runs when `scripts/wifi-setup`, which
+they run, changes). The LCD tests never touch the machine's
 network setup: the Wi-Fi tests keep the captive-portal snippet, setup state
 and portal pid in a temp dir, record iptables calls, and fail if anything
 else would run.

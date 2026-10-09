@@ -1,6 +1,8 @@
 # Python LCD display: run its unit tests on every change to what they import
 # or read: the *.py modules, tests/, assets/, VERSION (config.py reads it),
-# requirements.txt and this workflow. The LCD calls the Rust CLI
+# scripts/wifi-setup (the root Wi-Fi helper test_wifi_helper.py runs),
+# requirements.txt and this workflow. build_release.rs checks that these
+# paths cover every repo file tests/*.py reads. The LCD calls the Rust CLI
 # (`claim --json`, `test-print --json`) and reads the agent's printers.json;
 # tests/fakecli.py stands in for the binary, so nothing is built here.
 #
@@ -18,6 +20,7 @@ on:
       - "tests/**"
       - "assets/**"
       - "VERSION"
+      - "scripts/wifi-setup"
       - "requirements.txt"
       - ".github/workflows/lcd.yml"
   pull_request:
@@ -26,6 +29,7 @@ on:
       - "tests/**"
       - "assets/**"
       - "VERSION"
+      - "scripts/wifi-setup"
       - "requirements.txt"
       - ".github/workflows/lcd.yml"
 

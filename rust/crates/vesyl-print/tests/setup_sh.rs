@@ -4,7 +4,9 @@
 //! services run as SUDO_USER or else the tree's owner (never root), a missing
 //! optional package never blocks the required ones, and re-provisioning from
 //! an extracted release without a Tailscale key skips Tailscale and removes
-//! only that tree. setup.sh and `apply-update` take exactly the release
+//! only that tree. The CLI wrapper runs the binary, which the service
+//! account owns, as that account when root runs it, and an install root that
+//! is a symlink stays root's link while the tree it points at is handed over. setup.sh and `apply-update` take exactly the release
 //! versions update.rs `is_version` takes, the agent unit outlives a
 //! renderer killed for memory, and a tree without the binary says how to
 //! get one.
@@ -98,8 +100,8 @@ fn make_wifi_helper_pre_install_root(tree: &Path) {
 }
 
 /// An extracted release at `dir`: this repository's setup.sh, units, root
-/// helpers and public key, a stand-in binary that reports [`VERSION`], and a
-/// stand-in LCD.
+/// helpers and public key, a stand-in binary that reports [`VERSION`] (and,
+/// given `whoami`, the uid and HOME it runs with), and a stand-in LCD.
 fn release_tree(dir: &Path) {
     let repo = repo_root();
     for rel in ["setup.sh", "scripts/apply-update", "scripts/wifi-setup"] {
@@ -115,7 +117,11 @@ fn release_tree(dir: &Path) {
     write(&dir.join("VERSION"), format!("{VERSION}\n"));
     write_exe(
         &dir.join("vesyl-print"),
-        &format!("#!/bin/sh\necho \"vesyl-print {VERSION}\"\n"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = whoami ]; then echo \"$(id -u) $HOME\"; exit 0; fi\n\
+             echo \"vesyl-print {VERSION}\"\n"
+        ),
     );
     write(&dir.join("main.py"), "# LCD\n");
     write(&dir.join("wifi_setup.py"), FAKE_WIFI_SETUP_PY);
@@ -607,6 +613,13 @@ impl Sandbox {
         write(
             &root.join("etc/nsswitch.conf"),
             "passwd: files\ngroup: files\n",
+        );
+        // runuser, which the CLI wrapper runs as root, opens a PAM session.
+        write(
+            &root.join("etc/pam.d/runuser"),
+            "auth sufficient pam_rootok.so\n\
+             account required pam_permit.so\n\
+             session required pam_permit.so\n",
         );
         write(
             &root.join("boot/firmware/config.txt"),
@@ -1195,6 +1208,136 @@ fn root_install_root_with_trailing_slashes_takes_ota_activations() {
         fs::read_link(sb.at(path_str(&current))).unwrap(),
         Path::new("releases/0.9.2")
     );
+}
+
+/// The service account owns the active slot's binary (OTA writes the slots
+/// as that account), so root running it would run that account's code. Run
+/// as root, the CLI wrapper runs it as the service account, with that
+/// account's HOME; run by anyone else, it runs it as they are. The real CLI
+/// works that way: `status` and `unpair` as the owner of the trees they read
+/// and write, and `update rollback` through the `apply-update` sudo helper,
+/// as the agent activates a slot.
+#[test]
+#[ignore = "needs root (or a user namespace mapping uid 1000) to chroot and chown"]
+fn root_cli_wrapper_runs_the_binary_as_the_service_account() {
+    let Some(mut sb) = Sandbox::new() else { return };
+    let src = format!("/root/vesyl-print-{VERSION}");
+    release_tree(&sb.at(&src));
+    let r = sb.setup(&src, &[]);
+    assert!(r.ok(), "{}", r.log());
+    let cli = "/usr/local/bin/vesyl-print";
+    assert_eq!(
+        (
+            owner(&sb.usr_local.join("bin/vesyl-print")),
+            mode(&sb.usr_local.join("bin/vesyl-print"))
+        ),
+        (0, 0o755)
+    );
+
+    let r = sb.exec(&[], &[cli, "whoami"]);
+    assert_eq!(
+        r.stdout,
+        format!("{SERVICE_UID} /home/vesyl\n"),
+        "{}",
+        r.log()
+    );
+    let r = sb.exec(&[], &["runuser", "-u", SERVICE_USER, "--", cli, "whoami"]);
+    assert_eq!(
+        r.stdout,
+        format!("{SERVICE_UID} /home/vesyl\n"),
+        "{}",
+        r.log()
+    );
+
+    // The real CLI in the active slot, as OTA would have put it there.
+    let slot = sb.at("/opt/vesyl-print/releases").join(VERSION);
+    let bin = slot.join("vesyl-print");
+    fs::remove_file(&bin).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_vesyl-print"), &bin).unwrap();
+    std::os::unix::fs::lchown(&bin, Some(SERVICE_UID), Some(SERVICE_UID)).unwrap();
+    let older = sb.at("/opt/vesyl-print/releases/0.4.1");
+    write_exe(
+        &older.join("vesyl-print"),
+        "#!/bin/sh\necho \"vesyl-print 0.4.1\"\n",
+    );
+    chown_tree(&older, SERVICE_UID);
+    let creds = sb.at("/etc/vesyl-print/credentials.json");
+    write(&creds, r#"{"node_id": "n1", "device_token": "t"}"#);
+    fs::set_permissions(&creds, fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::lchown(&creds, Some(SERVICE_UID), Some(SERVICE_UID)).unwrap();
+    // As the sudoers drop-in lets the service account run the helper: log
+    // who asked (where that account can write), and succeed.
+    write_exe(
+        &sb.at("/stubs/sudo"),
+        "#!/bin/sh\necho \"$(id -u) $*\" >> /tmp/sudo.calls\nexit 0\n",
+    );
+
+    let r = sb.exec(&[], &[cli, "status"]);
+    assert!(r.ok(), "{}", r.log());
+    assert!(r.stdout.contains("node_id:       n1\n"), "{}", r.log());
+    assert!(!r.stdout.contains("cannot read"), "{}", r.log());
+
+    let r = sb.exec(&[], &[cli, "update", "rollback"]);
+    assert!(r.ok(), "{}", r.log());
+    assert!(r.stdout.contains("rolled back to 0.4.1\n"), "{}", r.log());
+    assert_eq!(
+        read(&sb.at("/tmp/sudo.calls")),
+        format!(
+            "{SERVICE_UID} -n /usr/local/lib/vesyl-print/apply-update activate \
+             /opt/vesyl-print/releases/0.4.1 /opt/vesyl-print/current\n"
+        )
+    );
+    let status = sb.at("/var/lib/vesyl-print/update_status.json");
+    assert!(
+        read(&status).contains("manual rollback"),
+        "{}",
+        read(&status)
+    );
+    assert_eq!(owner(&status), SERVICE_UID);
+
+    let r = sb.exec(&[], &[cli, "unpair"]);
+    assert!(r.ok(), "{}", r.log());
+    assert!(!creds.exists(), "{}", r.log());
+}
+
+/// An install root that is a symlink to another disk, as README's App stack
+/// allows: setup.sh hands the tree it points at to the service account
+/// (VERSION, which it writes as root, included) and leaves the link root's,
+/// as root's CLI runs require, even one an older setup.sh handed over.
+#[test]
+#[ignore = "needs root (or a user namespace mapping uid 1000) to chroot and chown"]
+fn root_symlinked_install_root_stays_roots_link() {
+    let Some(mut sb) = Sandbox::new() else { return };
+    fs::create_dir_all(sb.at("/data/vesyl-print")).unwrap();
+    let link = sb.at("/opt/vesyl-print");
+    symlink("/data/vesyl-print", &link).unwrap();
+    std::os::unix::fs::lchown(&link, Some(SERVICE_UID), Some(SERVICE_UID)).unwrap();
+    let src = format!("/root/vesyl-print-{VERSION}");
+    release_tree(&sb.at(&src));
+
+    let r = sb.setup(&src, &[]);
+    assert!(r.ok(), "{}", r.log());
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(owner(&link), 0);
+    let data = sb.at("/data/vesyl-print");
+    let slot = data.join("releases").join(VERSION);
+    for path in [
+        data.clone(),
+        data.join("releases"),
+        data.join("update"),
+        slot.clone(),
+        slot.join("VERSION"),
+        slot.join("main.py"),
+        slot.join("vesyl-print"),
+    ] {
+        assert_eq!(owner(&path), SERVICE_UID, "{}", path.display());
+    }
+    assert_eq!(
+        fs::read_link(data.join("current")).unwrap(),
+        Path::new("releases").join(VERSION)
+    );
+    let r = sb.exec(&[], &["/usr/local/bin/vesyl-print", "--version"]);
+    assert_eq!(r.stdout, format!("vesyl-print {VERSION}\n"), "{}", r.log());
 }
 
 /// What setup.sh installs in one apt-get call; python3-segno goes alone.

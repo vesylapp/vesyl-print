@@ -19,7 +19,8 @@
 #   4. creates /etc/vesyl-print + /var/lib/vesyl-print,
 #   5. installs the root helpers (OTA apply-update, Wi-Fi setup) + sudoers drop-in,
 #   6. installs the release into /opt/vesyl-print/releases/<ver> + current symlink,
-#   7. installs the vesyl-print CLI wrapper (runs current/vesyl-print),
+#   7. installs the vesyl-print CLI wrapper (runs current/vesyl-print, as the
+#      service account when root runs it),
 #   8. installs and enables the LCD + cloud agent systemd services,
 #   9. installs Tailscale and joins the tailnet (auth key from keys/tailscale.key),
 #  10. removes the extracted release it ran from (app runs from /opt); never
@@ -143,6 +144,10 @@ check_release_binary() {
 EOF
         exit 1
     fi
+    # As root this runs a file the tree's owner can change (the installed
+    # binary the CLI wrapper never runs as root, see step 7). setup.sh is
+    # read from that same tree as it runs, so this gives the owner nothing
+    # more.
     local got
     got="$("$APP_BIN" --version 2>&1)" ||
         die "cannot run $APP_BIN ($got): is it built for $(uname -m)?"
@@ -405,6 +410,9 @@ else
         rm -f "$RELEASE_DIR"
     fi
     mkdir -p "$RELEASE_DIR"
+    # Through an install root that is a symlink: newer rsync (3.5 here)
+    # refuses one on its way to the destination (ELOOP).
+    RELEASE_DIR_REAL="$(cd "$RELEASE_DIR" && pwd -P)"
 
     # Never copied into a slot: VCS/CI/dev trees, Rust sources, tests, secrets.
     if command -v rsync >/dev/null 2>&1; then
@@ -424,7 +432,7 @@ else
             --exclude='lcd-screenshot.png' \
             --exclude='update_private.pem' \
             --exclude='tailscale.key' \
-            "$REPO_DIR/" "$RELEASE_DIR/"
+            "$REPO_DIR/" "$RELEASE_DIR_REAL/"
     else
         # Fallback without rsync (same exclusions)
         find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
@@ -444,7 +452,16 @@ else
     fi
 
     printf '%s\n' "$APP_VERSION" >"$RELEASE_DIR/VERSION"
-    chown -R "$RUN_USER:$RUN_GROUP" "$INSTALL_ROOT"
+    # The trailing slash makes chown -R go through an install root that is
+    # a symlink (to a data disk, say) and hand over the tree it points at:
+    # without it, chown -R changes the link itself and nothing under it.
+    chown -R "$RUN_USER:$RUN_GROUP" "$INSTALL_ROOT/"
+    # Such a link stays root's (an older setup.sh handed it over): root
+    # follows a link into the service account's trees only when root owns
+    # it (README, App stack).
+    if [[ -L "$INSTALL_ROOT" ]]; then
+        chown -h root:root "$INSTALL_ROOT"
+    fi
 
     # Atomic current → this version, through the helper OTA uses (it refuses
     # a slot without the executable binary).
@@ -473,17 +490,26 @@ else
 fi
 
 # --- 7. CLI wrapper (always follows current) -------------------------------
+# The service account owns every release slot (OTA writes them as that
+# account), so the binary is its code: run as root (sudo vesyl-print ...),
+# the wrapper runs it as that account, as the units do. Every privileged
+# step the CLI takes (activate, restart) goes through the apply-update
+# helper that account may run with sudo -n.
 echo "==> Installing CLI: $CLI_PATH"
 tmp="$(mktemp)"
 cat > "$tmp" <<WRAP
 #!/usr/bin/env bash
 # vesyl-print CLI: runs the active release's binary. Managed by setup.sh.
+# As root, it runs it as the service account, which owns it.
 BIN="$CURRENT_LINK/vesyl-print"
 if [[ ! -x "\$BIN" ]]; then
     echo "vesyl-print: \$BIN not found; re-run setup.sh from a release" >&2
     exit 127
 fi
 export VESYL_PRINT_INSTALL_ROOT="\${VESYL_PRINT_INSTALL_ROOT:-$INSTALL_ROOT}"
+if [[ \$EUID -eq 0 ]]; then
+    exec runuser -u "$RUN_USER" -- "\$BIN" "\$@"
+fi
 exec "\$BIN" "\$@"
 WRAP
 install -o root -g root -m 0755 "$tmp" "$CLI_PATH"
