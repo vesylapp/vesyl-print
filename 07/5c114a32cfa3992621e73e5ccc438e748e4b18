@@ -1,0 +1,22 @@
+tests/test_lcd_ota.py
+  s_2883cba6969ed7::t_cdb64b6c37d64d 75-98
+display_status.py
+  s_2883cba6969ed7::t_39ac28007ccf8f 751-754,759
+  s_2883cba6969ed7::t_3da246e762c9cf 760
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "075c114a32cfa3992621e73e5ccc438e748e4b18",
+  "prompts": {},
+  "sessions": {
+    "s_2883cba6969ed7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "45e49af4-eab1-43ba-a849-12ddbf10c3ef",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ben Wyrosdick <ben.wyrosdick@gmail.com>"
+    }
+  }
+}
