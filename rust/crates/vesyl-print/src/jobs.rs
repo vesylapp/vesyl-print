@@ -4680,19 +4680,19 @@ mod tests {
             "png_uri",
             "https://x.test/l.png".into(),
         );
-        let _ = p.process(&j, &st);
+        // The refused attempt write is the cancel, not a job error.
+        assert_eq!(p.process(&j, &st).unwrap(), JobOutcome::Canceled);
+        assert_eq!(*events.lock().unwrap(), ["cj:printing"]);
         assert!(!st.has_queue_file("cj"), "queue record brought back");
         assert!(st.is_processed("cj"));
         assert!(test_pipeline().drain(&st).is_empty());
-        assert!(
-            !events.lock().unwrap().iter().any(|e| e == "cj:printed"),
-            "{:?}",
-            events.lock().unwrap()
-        );
+        assert_eq!(*events.lock().unwrap(), ["cj:printing"]);
 
         // Canceled while its content downloads: the content arrives, but
         // the job never reaches lp, and its record stays gone.
         let s = st.clone();
+        let lp_calls = Arc::new(AtomicUsize::new(0));
+        let calls = lp_calls.clone();
         let p = Pipeline {
             ack: Arc::new(|_| Ok(())),
             fetch_url: Arc::new(move |_| {
@@ -4700,6 +4700,10 @@ mod tests {
                 Ok(base64::engine::general_purpose::STANDARD
                     .decode(PNG_1X1_B64)
                     .unwrap())
+            }),
+            lp: Arc::new(move |_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
             }),
             ..p
         };
@@ -4709,9 +4713,37 @@ mod tests {
             "png_uri",
             "https://x.test/l.png".into(),
         );
-        let _ = p.process(&j, &st);
+        assert_eq!(p.process(&j, &st).unwrap(), JobOutcome::Canceled);
+        assert_eq!(lp_calls.load(Ordering::SeqCst), 0, "a canceled job printed");
         assert!(!st.has_queue_file("cj2"));
         assert!(st.is_processed("cj2"));
+        assert_eq!(*events.lock().unwrap(), ["cj:printing", "cj2:printing"]);
+    }
+
+    /// A cancel that lands after `process` found the job unprocessed but
+    /// before `write_queue`: the record is back, yet the processed marker
+    /// still refuses the attempt write, so nothing keeps the record around
+    /// for the next start to report the canceled job printed.
+    #[test]
+    fn the_attempt_write_is_refused_for_a_processed_job_whose_record_is_back() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let j = png_job("late");
+        st.write_queue(&j).unwrap();
+        st.mark_processed("late").unwrap();
+        assert!(st.has_queue_file("late"));
+        let err = st
+            .write_local(
+                &j,
+                &LocalState {
+                    attempts: 1,
+                    submitted: None,
+                    run: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(st.local_state("late").attempts, 0, "attempt written");
     }
 
     /// The attempt record renamed into place, but its directory fsync failed
