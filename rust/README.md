@@ -102,7 +102,11 @@ than 2.31 (`readelf -V`), and in CI one that does not run under
 qemu-aarch64. Wherever the Rust tests run in CI, the `aarch64` job of
 `.github/workflows/rust.yml` runs that build too (`BUILD_ONLY=1`, a
 throwaway version), with clippy for aarch64 and the unit tests under qemu,
-so code that only breaks on the Pi fails before a tag. Both workflows
+so code that only breaks on the Pi fails before a tag. qemu-user cannot run
+a unit test that re-runs the test binary, or one that walks the filesystem
+from "/" as root's descriptor walk does (qemu's `-L` maps "/" to the
+sysroot): that step skips those by name, and a `build_release.rs` test fails
+when a new one is missing from the list. Both workflows
 install cargo-zigbuild and zig from `.github/zigbuild-requirements.txt`
 (pinned versions and hashes). See [OTA_UPDATES.md](../OTA_UPDATES.md) §4.2.
 
@@ -190,7 +194,8 @@ agent on purpose):
   to systemd's `TimeoutStopSec` (default 90 s); a second signal exits at
   once. A stop during an OTA download removes the partial file; one after
   activation skips the restart, and the next start runs the health gate.
-- Run as root (an operator's CLI), `util::write_durable`,
+- Run as root (the binary by path; the installed wrapper runs
+  `sudo vesyl-print …` as the service user), `util::write_durable`,
   `create_dir_all_owned`, `open_dir_owned` and `hand_tree_to_parent_owner`
   follow no symlink on the path except a root-owned link in a root-owned
   directory that is not group/other-writable or is sticky; anything else

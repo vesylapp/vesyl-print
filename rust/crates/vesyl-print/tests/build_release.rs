@@ -1674,3 +1674,176 @@ fn workflows_pin_their_tools_and_keep_the_token_read_only() {
         "{requirements}"
     );
 }
+
+/// The `--skip` arguments of the step in `workflow` named `step`.
+fn skipped_in_step(workflow: &str, step: &str) -> BTreeSet<String> {
+    let text = fs::read_to_string(repo_root().join(".github/workflows").join(workflow)).unwrap();
+    let start = text
+        .find(&format!("- name: {step}\n"))
+        .unwrap_or_else(|| panic!("{workflow}: no step {step:?}"));
+    let rest = &text[start + 1..];
+    let end = rest.find("\n      - ").unwrap_or(rest.len());
+    let skip = regex::Regex::new(r"--skip\s+(\S+)").unwrap();
+    skip.captures_iter(&rest[..end])
+        .map(|c| c[1].to_string())
+        .collect()
+}
+
+/// Every unit test in `src/` that is not ignored, by its path in the test
+/// binary (`module::tests::name`), with its body.
+fn unit_tests() -> Vec<(String, String)> {
+    let src = repo_root().join("rust/crates/vesyl-print/src");
+    let fn_re = regex::Regex::new(r"^(\s*)fn (\w+)\(").unwrap();
+    let mod_re = regex::Regex::new(r"^(?:pub(?:\([\w ]+\))? )?mod (\w+) \{").unwrap();
+    let mut tests = Vec::new();
+    for entry in fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut module = None;
+        let mut attrs: Vec<&str> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(c) = mod_re.captures(line) {
+                module = Some(c[1].to_string());
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("#[") {
+                attrs.push(trimmed);
+                continue;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let is_test = attrs.contains(&"#[test]");
+            let ignored = attrs.iter().any(|a| a.starts_with("#[ignore"));
+            attrs.clear();
+            let Some(c) = fn_re.captures(line) else {
+                continue;
+            };
+            if !is_test || ignored {
+                continue;
+            }
+            // rustfmt closes the body at the indentation of its `fn`.
+            let close = format!("{}}}", &c[1]);
+            let body: Vec<&str> = lines[i..]
+                .iter()
+                .take_while(|l| **l != close)
+                .copied()
+                .collect();
+            let module = module
+                .clone()
+                .unwrap_or_else(|| panic!("{stem}:{}: test outside a module", i + 1));
+            tests.push((format!("{stem}::{module}::{}", &c[2]), body.join("\n")));
+        }
+    }
+    tests
+}
+
+/// The aarch64 job runs the unit tests under qemu-user (rust.yml). Two
+/// kinds of test cannot run there and must be skipped by name: one that
+/// re-runs the test binary (the child gets neither binfmt_misc nor qemu's
+/// -L sysroot), and one that runs root's descriptor walk for a trusted owner
+/// (`ROOT`, or the test's own uid): the walk opens "/" by path, which -L
+/// maps to the sysroot.
+/// Every such test is skipped there, and nothing else is.
+#[test]
+fn aarch64_job_skips_exactly_the_tests_qemu_user_cannot_run() {
+    let reexec =
+        regex::Regex::new(r#"Command::new\((?:std::env::current_exe\(\)|"/proc/self/exe")"#)
+            .unwrap();
+    // `ROOT` itself, the walk, or a write or hand-over given an owner to
+    // walk for (`None` is the unprivileged path, which opens no "/").
+    let root_walk = regex::Regex::new(
+        r"(?s)\bROOT\b|\bwalk_dir\(|\b(?:write_durable_with|hand_tree_with)\([^;]*?\bSome\(",
+    )
+    .unwrap();
+    let mut need = BTreeSet::new();
+    for (name, body) in unit_tests() {
+        if reexec.is_match(&body) || root_walk.is_match(&body) {
+            need.insert(name);
+        }
+    }
+    // The scan finds the tests it was written for.
+    for known in [
+        "cloud::tests::proxy_env_rules_match_urllib",
+        "util::tests::unset_home_uses_the_passwd_entry",
+        "util::tests::root_dir_walk_never_follows_a_swapped_in_symlink",
+        "util::tests::root_walk_follows_only_links_nobody_else_could_plant",
+    ] {
+        assert!(need.contains(known), "{known} not found: {need:?}");
+    }
+    let skipped = skipped_in_step("rust.yml", "Unit tests (aarch64, qemu)");
+    assert_eq!(
+        skipped, need,
+        "rust.yml's aarch64 unit-test step must --skip exactly these"
+    );
+}
+
+/// Whether the workflow path filter `glob` (as GitHub reads the few forms
+/// these workflows use) matches the repo path `path`.
+fn path_filter_matches(glob: &str, path: &str) -> bool {
+    if let Some(dir) = glob.strip_suffix("/**") {
+        path.starts_with(&format!("{dir}/"))
+    } else if let Some(ext) = glob.strip_prefix("*.") {
+        !path.contains('/') && path.ends_with(&format!(".{ext}"))
+    } else {
+        assert!(!glob.contains('*'), "unhandled path filter {glob}");
+        glob == path
+    }
+}
+
+/// lcd.yml runs the Python tests on changes to every repo file they read
+/// (`ROOT / "…"` or `REPO / "…"` in tests/*.py), in both of its path lists:
+/// test_wifi_helper.py runs scripts/wifi-setup, which matches none of the
+/// LCD's own globs.
+#[test]
+fn lcd_workflow_runs_on_every_file_the_python_tests_read() {
+    let lcd = fs::read_to_string(repo_root().join(".github/workflows/lcd.yml")).unwrap();
+    let section = |event: &str| -> Vec<String> {
+        let start = lcd
+            .find(&format!("\n  {event}:\n"))
+            .unwrap_or_else(|| panic!("lcd.yml: no {event}"));
+        let paths = start + lcd[start..].find("    paths:\n").unwrap();
+        lcd[paths..]
+            .lines()
+            .skip(1)
+            .map_while(|l| l.trim().strip_prefix("- "))
+            .map(|g| g.trim_matches('"').to_string())
+            .collect()
+    };
+    let globs = [section("push"), section("pull_request")];
+    assert_eq!(globs[0], globs[1], "lcd.yml: push and pull_request differ");
+
+    let read = regex::Regex::new(r#"\b(?:ROOT|REPO)((?:\s*/\s*"[^"]+")+)"#).unwrap();
+    let part = regex::Regex::new(r#""([^"]+)""#).unwrap();
+    let mut files = BTreeSet::new();
+    for entry in fs::read_dir(repo_root().join("tests")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "py") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        for c in read.captures_iter(&text) {
+            let rel: Vec<&str> = part
+                .captures_iter(&c[1])
+                .map(|p| p.get(1).unwrap().as_str())
+                .collect();
+            let rel = rel.join("/");
+            if repo_root().join(&rel).exists() {
+                files.insert(rel);
+            }
+        }
+    }
+    assert!(files.contains("scripts/wifi-setup"), "{files:?}");
+    for file in &files {
+        assert!(
+            globs[0].iter().any(|g| path_filter_matches(g, file)),
+            "lcd.yml's paths miss {file}, which tests/*.py read: {:?}",
+            globs[0]
+        );
+    }
+}

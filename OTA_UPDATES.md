@@ -298,7 +298,8 @@ after a successful heartbeat and from the CLI.
    (its single top-level directory, else all of it) moves to
    `<version>.staging`. An archive whose top-level directory is
    `vesyl-print-<another version>` is refused (version_mismatch). As root
-   (`sudo vesyl-print update apply`), the archive is unpacked through
+   (the binary run by path; `sudo vesyl-print` runs it as the service
+   user), the archive is unpacked through
    descriptors into a root-owned 0700 `.<version>.unpack` (a directory at
    that name that is not root's own and closed to others is refused), with
    no hard links. Before the release leaves it, group and others lose write
@@ -410,6 +411,7 @@ that version never happened (it never ran).
 | `/usr/local/lib/vesyl-print/apply-update` | Root helper: `activate`, `restart`, `rollback` |
 | `/usr/local/lib/vesyl-print/wifi-setup` | Root helper for the LCD's Wi-Fi setup (NetworkManager hotspot / scan / connect) |
 | `/etc/sudoers.d/vesyl-print` | `$RUN_USER ALL=(root) NOPASSWD:` those two helpers only |
+| `/usr/local/bin/vesyl-print` | CLI wrapper: runs `current/vesyl-print`, as `$RUN_USER` when root runs it |
 
 Rules:
 
@@ -422,6 +424,11 @@ Rules:
   `..` or empty component (it refuses those), since `apply-update` compares
   it as a string with the paths the agent builds from the units' value.
 - No shell wrappers or `NOPASSWD: ALL`.
+- The service user owns every release slot, so root never runs a slot's
+  binary through the CLI wrapper: `sudo vesyl-print …` runs it as
+  `$RUN_USER` (`runuser -u`), and its privileged steps (activate, restart)
+  go through `apply-update` like the agent's. Running the binary as root by
+  path still runs code the service user can change.
 - **Known issue: `wifi-setup` is a root-escalation path for the service
   user.** The helper file is root-owned, but it runs as root through
   NOPASSWD sudo and imports `wifi_setup.py` (and `sysinfo.py`) from
@@ -597,13 +604,15 @@ slot starts on the next service restart, and no health gate checks it.
 **Rollback** in §4.3 and prints "holding X: …"; its `--version` also accepts
 a leading `v`.
 
-Run as root (`sudo vesyl-print update …`), the CLI hands what it writes to
-the service user that owns the tree it writes in. That means the download
+Run as root (the binary by path: `sudo vesyl-print update …` runs it as
+the service user, see §4.4), the CLI hands what it writes to the service
+user that owns the tree it writes in. That means the download
 and the unpacked slot (with its `VERSION`) under the install root, and
 `update_status.json` in the state dir. On its way there it follows a symlink
 only when root owns the link and the directory that holds it, and nobody
 else can write to that directory (README, App stack). `/opt/vesyl-print`
-itself may be such a link in `/opt`.
+itself may be such a link in `/opt`: `setup.sh` hands over the tree it
+points at and keeps the link root's.
 
 ### 4.8 Version source of truth
 
