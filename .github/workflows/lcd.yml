@@ -1,0 +1,64 @@
+# Python LCD display: run its unit tests on every change to what they import
+# or read: the *.py modules, tests/, assets/, VERSION (config.py reads it),
+# scripts/wifi-setup (the root Wi-Fi helper test_wifi_helper.py runs),
+# requirements.txt and this workflow. build_release.rs checks that these
+# paths cover every repo file tests/*.py reads. The LCD calls the Rust CLI
+# (`claim --json`, `test-print --json`) and reads the agent's printers.json;
+# tests/fakecli.py stands in for the binary, so nothing is built here.
+#
+# The packages come from apt for the system python3, as on devices (setup.sh):
+# Pillow, numpy and the DejaVu fonts, plus segno where the runner's release
+# packages it (it is optional on devices too, and no test needs it). Actions
+# are pinned to the same commit SHAs as release.yml; bump them together.
+name: LCD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "*.py"
+      - "tests/**"
+      - "assets/**"
+      - "VERSION"
+      - "scripts/wifi-setup"
+      - "requirements.txt"
+      - ".github/workflows/lcd.yml"
+  pull_request:
+    paths:
+      - "*.py"
+      - "tests/**"
+      - "assets/**"
+      - "VERSION"
+      - "scripts/wifi-setup"
+      - "requirements.txt"
+      - ".github/workflows/lcd.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install LCD packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            python3-pil python3-numpy fonts-dejavu-core
+          # Separately: a missing package would make apt install nothing.
+          sudo apt-get install -y -qq --no-install-recommends python3-segno ||
+            echo "::warning::python3-segno is not packaged on this runner (optional: the Wi-Fi QR code falls back to text)"
+
+      # Fails here, not in a test, if python3 is not the interpreter apt
+      # installed into.
+      - name: Show interpreter and packages
+        run: |
+          python3 -c 'import sys, PIL, numpy; print(sys.executable, sys.version.split()[0], "Pillow", PIL.__version__, "numpy", numpy.__version__)'
+
+      - name: Test
+        run: python3 -m unittest discover -s tests

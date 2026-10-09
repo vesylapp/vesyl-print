@@ -158,6 +158,14 @@ dist/
 # Never commit OTA private keys (public PEM in keys/ is fine)
 *update_private.pem
 *_private.pem
+# Nor the factory Tailscale auth key or any other local key: in keys/ only
+# update_public.pem and README.md belong in git. keys/tailscale.key is still
+# tracked, and these rules do not cover a tracked file until it leaves the
+# index (git rm --cached; see keys/README.md).
+tailscale.key
+keys/*.key
+keys/*.pem
+!keys/update_public.pem
 
 # Environments
 .env
@@ -228,3 +236,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Rust binary at the release root (built by scripts/build-release.sh)
+/vesyl-print

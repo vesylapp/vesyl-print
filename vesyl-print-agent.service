@@ -1,3 +1,5 @@
+# setup.sh installs this unit with User= set to the service account and
+# /opt/vesyl-print replaced by its INSTALL_ROOT.
 [Unit]
 Description=VESYL Print — cloud agent (heartbeat / pairing / OTA)
 After=network-online.target cups.service
@@ -7,11 +9,25 @@ Wants=network-online.target
 Type=simple
 User=vesyl
 WorkingDirectory=/opt/vesyl-print/current
-ExecStart=/usr/bin/python3 /opt/vesyl-print/current/agent.py
+ExecStart=/opt/vesyl-print/current/vesyl-print agent
 Restart=on-failure
 RestartSec=5
+# A stop's SIGTERM goes to the agent alone, which finishes the step in
+# flight: an lp then never dies mid-submit (cupsd may already have the job,
+# and the next start would print it twice), and a pdftoppm or gs render
+# completes, and the job stays queued for the next start. Whatever is left
+# when TimeoutStopSec (90 s) runs out is SIGKILLed with the agent, as before.
+KillMode=mixed
+# A child the kernel kills for memory (pdftoppm or gs rendering a PDF) fails
+# its print job, and the agent carries on: the default, stop, would stop and
+# restart the whole agent. If the agent itself is killed, Restart= applies.
+OOMPolicy=continue
+# The agent and its renderers get at most half the RAM (about 450 MB on a
+# 1 GB Pi, 1.9 GB on a 4 GB one): a runaway render is killed here instead of
+# pushing the LCD and the rest of the system into the kernel's OOM killer.
+# Both need the kernel's memory cgroup controller; without it they do nothing.
+MemoryMax=50%
 # Do not put secrets in Environment= lines.
-Environment=PYTHONUNBUFFERED=1
 Environment=VESYL_PRINT_INSTALL_ROOT=/opt/vesyl-print
 
 [Install]

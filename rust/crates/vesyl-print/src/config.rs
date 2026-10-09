@@ -1,0 +1,598 @@
+//! Load vesyl-print configuration (paths, API base URL, intervals).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde_json::{json, Value};
+
+use crate::util::{create_dir_all_owned, py_int, py_str, truthy, write_durable};
+use crate::JsonObject;
+
+/// Version baked in at build time: `VESYL_PRINT_VERSION` (set by
+/// `scripts/build-release.sh` from the release tag), else the repo `VERSION` file.
+pub fn agent_version() -> &'static str {
+    match option_env!("VESYL_PRINT_VERSION") {
+        Some(v) if !v.is_empty() => v,
+        _ => include_str!("../../../../VERSION").trim(),
+    }
+}
+
+/// Preferred for Pis: direct API host (paths are /print/v1/...).
+pub const DEFAULT_API_BASE_URL: &str = "https://wms-api.vesyl.dev";
+/// GitHub Releases act as the artifact CDN (see OTA_UPDATES.md / release workflow).
+pub const DEFAULT_RELEASES_BASE_URL: &str =
+    "https://github.com/vesylapp/vesyl-print/releases/download";
+
+pub const ENV_API_URL: &str = "VESYL_PRINT_API_URL";
+pub const ENV_CONFIG_DIR: &str = "VESYL_PRINT_CONFIG_DIR";
+pub const ENV_STATE_DIR: &str = "VESYL_PRINT_STATE_DIR";
+pub const ENV_INSTALL_ROOT: &str = "VESYL_PRINT_INSTALL_ROOT";
+
+/// e.g. linux-aarch64, linux-x86_64.
+pub fn default_platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// After `lp` accepts a job, how to track CUPS completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaitCups {
+    /// Block until the printer finishes (old behavior).
+    Sync,
+    /// Watch CUPS in the background so the next job can spool immediately.
+    #[default]
+    Async,
+    /// Do not watch CUPS.
+    Off,
+}
+
+impl WaitCups {
+    /// config.json's `wait_cups`: `true` / "sync" / "1" block, `false` /
+    /// "off" / "0" do not watch, anything else watches in the background.
+    pub fn from_json(raw: &Value) -> Self {
+        match raw {
+            Value::Bool(true) => return WaitCups::Sync,
+            Value::Bool(false) => return WaitCups::Off,
+            _ => {}
+        }
+        match py_str(raw).to_lowercase().as_str() {
+            "sync" | "true" | "1" => WaitCups::Sync,
+            "off" | "false" | "0" => WaitCups::Off,
+            _ => WaitCups::Async,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WaitCups::Sync => "sync",
+            WaitCups::Async => "async",
+            WaitCups::Off => "off",
+        }
+    }
+}
+
+/// One environment variable, `None` when unset (`Some("")` when set but
+/// empty). Everything here reads the environment through such a function,
+/// so tests can inject one.
+fn real_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// `key` when it is set to something other than "": Python's
+/// `os.environ.get(key)` in a truth test, how the LCD's config.py reads
+/// every variable but HOME.
+fn set_var(env: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<String> {
+    env(key).filter(|v| !v.is_empty())
+}
+
+/// The home directory config.py gets from `Path.home()`, so the agent and
+/// the LCD agree on the user dirs: HOME when set ("" meaning `/`), else the
+/// account's passwd entry; `/` when neither is known (where Python fails).
+fn home_dir(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    crate::util::home_dir(env).unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn user_config_dir(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    match set_var(env, "XDG_CONFIG_HOME") {
+        Some(xdg) => PathBuf::from(xdg).join("vesyl-print"),
+        None => home_dir(env).join(".config").join("vesyl-print"),
+    }
+}
+
+fn user_state_dir(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    match set_var(env, "XDG_STATE_HOME").or_else(|| set_var(env, "XDG_DATA_HOME")) {
+        Some(xdg) => PathBuf::from(xdg).join("vesyl-print"),
+        None => home_dir(env)
+            .join(".local")
+            .join("share")
+            .join("vesyl-print"),
+    }
+}
+
+fn resolve_config_dir_with(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    if let Some(dir) = set_var(env, ENV_CONFIG_DIR) {
+        return PathBuf::from(dir);
+    }
+    let system = Path::new("/etc/vesyl-print");
+    if system.is_dir() {
+        return system.to_path_buf();
+    }
+    user_config_dir(env)
+}
+
+fn resolve_state_dir_with(env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    if let Some(dir) = set_var(env, ENV_STATE_DIR) {
+        return PathBuf::from(dir);
+    }
+    let system = Path::new("/var/lib/vesyl-print");
+    if system.is_dir() {
+        return system.to_path_buf();
+    }
+    user_state_dir(env)
+}
+
+pub fn resolve_config_dir() -> PathBuf {
+    resolve_config_dir_with(&real_env)
+}
+
+pub fn resolve_state_dir() -> PathBuf {
+    resolve_state_dir_with(&real_env)
+}
+
+/// `e` with `path` in front, so the error says which directory or file it
+/// is about (not just "Permission denied (os error 13)").
+fn at_path(path: &Path) -> impl Fn(std::io::Error) -> std::io::Error + '_ {
+    move |e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
+/// Guess ActionCable URL from REST base (used when cable_url omitted).
+pub fn derive_cable_url(api_base_url: &str) -> String {
+    let base = api_base_url.trim_end_matches('/');
+    let origin = base.strip_suffix("/api").unwrap_or(base);
+    if let Some(rest) = origin.strip_prefix("https://") {
+        return format!("wss://{rest}/print/cable");
+    }
+    if let Some(rest) = origin.strip_prefix("http://") {
+        return format!("ws://{rest}/print/cable");
+    }
+    format!("{origin}/print/cable")
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub api_base_url: String,
+    pub cable_url: String,
+    pub heartbeat_seconds: i64,
+    pub pull_interval_seconds: i64,
+    /// Phase C: poll GET /print/v1/jobs/pending (disable if server lacks PR4).
+    pub pull_jobs_enabled: bool,
+    /// Phase D: ActionCable PrintNodeChannel push (pull remains safety net).
+    pub cable_enabled: bool,
+    pub wait_cups: WaitCups,
+    /// OTA (app): cloud sets desired_agent_version on heartbeat response.
+    pub auto_update_enabled: bool,
+    pub update_channel: String,
+    pub releases_base_url: String,
+    pub update_require_signature: bool,
+    /// Empty → keys/update_public.pem.
+    pub update_public_key_path: String,
+    /// Seconds after activate to pass whoami/local health before auto-rollback.
+    pub update_health_gate_seconds: i64,
+    pub config_dir: PathBuf,
+    pub state_dir: PathBuf,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            api_base_url: DEFAULT_API_BASE_URL.into(),
+            cable_url: String::new(),
+            heartbeat_seconds: 30,
+            pull_interval_seconds: 5,
+            pull_jobs_enabled: true,
+            cable_enabled: true,
+            wait_cups: WaitCups::Async,
+            auto_update_enabled: true,
+            update_channel: "stable".into(),
+            releases_base_url: DEFAULT_RELEASES_BASE_URL.into(),
+            update_require_signature: true,
+            update_public_key_path: String::new(),
+            update_health_gate_seconds: 120,
+            config_dir: resolve_config_dir(),
+            state_dir: resolve_state_dir(),
+        }
+        .normalized()
+    }
+}
+
+impl Config {
+    /// Trim trailing slashes, derive cable_url if empty.
+    pub fn normalized(mut self) -> Self {
+        self.api_base_url = self.api_base_url.trim_end_matches('/').to_string();
+        self.releases_base_url = self.releases_base_url.trim_end_matches('/').to_string();
+        if self.cable_url.is_empty() {
+            self.cable_url = derive_cable_url(&self.api_base_url);
+        }
+        self
+    }
+
+    pub fn credentials_path(&self) -> PathBuf {
+        self.config_dir.join("credentials.json")
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.config_dir.join("config.json")
+    }
+
+    pub fn status_path(&self) -> PathBuf {
+        self.state_dir.join("status.json")
+    }
+
+    /// The agent's latest printer inventory, for the LCD display.
+    pub fn printers_path(&self) -> PathBuf {
+        self.state_dir.join("printers.json")
+    }
+
+    pub fn update_status_path(&self) -> PathBuf {
+        self.state_dir.join("update_status.json")
+    }
+
+    pub fn queue_dir(&self) -> PathBuf {
+        self.state_dir.join("queue")
+    }
+
+    pub fn processed_dir(&self) -> PathBuf {
+        self.state_dir.join("processed")
+    }
+
+    /// Create config/state dirs used by agent and CLI. Root (an operator
+    /// running the CLI) makes them the closest existing directory owner's,
+    /// so a `sudo vesyl-print …` on a fresh device leaves them to the
+    /// service user that owns the trees `setup.sh` made (and never follows
+    /// a symlink that user could have planted: see
+    /// [`create_dir_all_owned`]). An error names the directory.
+    pub fn ensure_dirs(&self) -> std::io::Result<()> {
+        for dir in [
+            &self.config_dir,
+            &self.state_dir,
+            &self.queue_dir(),
+            &self.processed_dir(),
+        ] {
+            create_dir_all_owned(dir).map_err(at_path(dir))?;
+        }
+        Ok(())
+    }
+
+    /// Apply config.json keys. A bad value stops processing at that key
+    /// (earlier keys stay applied), as existing devices' files have always
+    /// been read.
+    fn apply_file(&mut self, data: &JsonObject) -> Result<(), ()> {
+        let get = |k: &str| data.get(k);
+        if let Some(url) = get("api_base_url").filter(|v| truthy(v)) {
+            self.api_base_url = py_str(url).trim_end_matches('/').to_string();
+        }
+        if let Some(cable) = get("cable_url").filter(|v| truthy(v)) {
+            self.cable_url = py_str(cable);
+        }
+        if let Some(v) = get("heartbeat_seconds") {
+            self.heartbeat_seconds = py_int(v).ok_or(())?;
+        }
+        if let Some(v) = get("pull_interval_seconds") {
+            self.pull_interval_seconds = py_int(v).ok_or(())?;
+        }
+        if let Some(v) = get("pull_jobs_enabled") {
+            self.pull_jobs_enabled = truthy(v);
+        }
+        if let Some(v) = get("cable_enabled") {
+            self.cable_enabled = truthy(v);
+        }
+        if let Some(v) = get("wait_cups") {
+            self.wait_cups = WaitCups::from_json(v);
+        }
+        if let Some(v) = get("auto_update_enabled") {
+            self.auto_update_enabled = truthy(v);
+        }
+        if let Some(ch) = get("update_channel").filter(|v| truthy(v)) {
+            self.update_channel = py_str(ch);
+        }
+        if let Some(rb) = get("releases_base_url").filter(|v| truthy(v)) {
+            self.releases_base_url = py_str(rb).trim_end_matches('/').to_string();
+        }
+        if let Some(v) = get("update_require_signature") {
+            self.update_require_signature = truthy(v);
+        }
+        if let Some(kp) = get("update_public_key_path").filter(|v| truthy(v)) {
+            self.update_public_key_path = py_str(kp);
+        }
+        if let Some(v) = get("update_health_gate_seconds") {
+            if let Some(n) = py_int(v) {
+                self.update_health_gate_seconds = n.max(15);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Load config.json + env overrides. Missing file is fine (defaults).
+pub fn load_config(config_dir: Option<&Path>, state_dir: Option<&Path>) -> Config {
+    load_config_with(config_dir, state_dir, &real_env)
+}
+
+pub(crate) fn load_config_with(
+    config_dir: Option<&Path>,
+    state_dir: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Config {
+    let cdir = config_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| resolve_config_dir_with(env));
+    let sdir = state_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| resolve_state_dir_with(env));
+    let mut cfg = Config {
+        config_dir: cdir,
+        state_dir: sdir,
+        ..Config::default()
+    };
+
+    let mut file_cable: Option<String> = None;
+    let path = cfg.config_path();
+    if path.is_file() {
+        if let Ok(Value::Object(data)) = fs::read_to_string(&path)
+            .map_err(|_| ())
+            .and_then(|s| serde_json::from_str::<Value>(&s).map_err(|_| ()))
+        {
+            if let Some(c) = data.get("cable_url").filter(|v| truthy(v)) {
+                file_cable = Some(py_str(c));
+            }
+            let _ = cfg.apply_file(&data);
+        }
+    }
+
+    if let Some(url) = set_var(env, ENV_API_URL) {
+        cfg.api_base_url = url;
+    }
+    cfg.api_base_url = cfg.api_base_url.trim_end_matches('/').to_string();
+    // Env API change should re-derive cable unless config.json set it explicitly.
+    cfg.cable_url = file_cable.unwrap_or_else(|| derive_cable_url(&cfg.api_base_url));
+    cfg
+}
+
+/// Write a starter config.json if missing. Returns path written/existing.
+/// Root (`sudo vesyl-print claim`) writes it as the config dir's owner,
+/// like every file [`write_durable`] writes. An error names the file.
+pub fn write_default_config(path: Option<&Path>) -> std::io::Result<PathBuf> {
+    let cfg = load_config(None, None);
+    let out = path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cfg.config_path());
+    if out.is_file() {
+        return Ok(out);
+    }
+    let payload = json!({
+        "api_base_url": cfg.api_base_url,
+        "cable_url": cfg.cable_url,
+        "heartbeat_seconds": cfg.heartbeat_seconds,
+        "pull_interval_seconds": cfg.pull_interval_seconds,
+        "pull_jobs_enabled": true,
+        "cable_enabled": true,
+        "wait_cups": "async",
+        "auto_update_enabled": true,
+        "update_channel": "stable",
+        "releases_base_url": DEFAULT_RELEASES_BASE_URL,
+    });
+    let mut raw = serde_json::to_string_pretty(&payload).expect("static json");
+    raw.push('\n');
+    write_durable(&out, raw.as_bytes(), 0o644, false).map_err(at_path(&out))?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn env_api_url_override() {
+        let td = tempfile::tempdir().unwrap();
+        let cdir = td.path().join("cfg");
+        let sdir = td.path().join("state");
+        fs::create_dir_all(&cdir).unwrap();
+        fs::create_dir_all(&sdir).unwrap();
+        fs::write(
+            cdir.join("config.json"),
+            r#"{"api_base_url": "https://file.example/api", "heartbeat_seconds": 15}"#,
+        )
+        .unwrap();
+        let env: HashMap<&str, String> = HashMap::from([
+            (ENV_API_URL, "https://wms-api.vesyl.dev".to_string()),
+            (ENV_CONFIG_DIR, cdir.display().to_string()),
+            (ENV_STATE_DIR, sdir.display().to_string()),
+        ]);
+        let cfg = load_config_with(None, None, &|k| env.get(k).cloned());
+        assert_eq!(cfg.api_base_url, "https://wms-api.vesyl.dev");
+        assert_eq!(cfg.heartbeat_seconds, 15);
+        assert_eq!(cfg.cable_url, "wss://wms-api.vesyl.dev/print/cable");
+        assert_eq!(cfg.config_dir, cdir);
+    }
+
+    #[test]
+    fn file_cable_url_wins_over_derived() {
+        let td = tempfile::tempdir().unwrap();
+        fs::write(
+            td.path().join("config.json"),
+            r#"{"cable_url": "wss://custom/print/cable", "wait_cups": "sync"}"#,
+        )
+        .unwrap();
+        let cfg = load_config_with(Some(td.path()), Some(td.path()), &|_| None);
+        assert_eq!(cfg.cable_url, "wss://custom/print/cable");
+        assert_eq!(cfg.wait_cups, WaitCups::Sync);
+    }
+
+    #[test]
+    fn direct_api_default_cable() {
+        let cfg = Config {
+            api_base_url: "https://wms.api.vesyl.com".into(),
+            cable_url: String::new(),
+            ..Config::default()
+        }
+        .normalized();
+        assert_eq!(cfg.cable_url, "wss://wms.api.vesyl.com/print/cable");
+    }
+
+    #[test]
+    fn edge_api_prefix_cable() {
+        let cfg = Config {
+            api_base_url: "https://wms.staging.vesyl.com/api".into(),
+            cable_url: String::new(),
+            ..Config::default()
+        }
+        .normalized();
+        assert_eq!(cfg.cable_url, "wss://wms.staging.vesyl.com/print/cable");
+    }
+
+    #[test]
+    fn defaults() {
+        let cfg = Config::default();
+        assert!(cfg.cable_enabled);
+        assert_eq!(cfg.wait_cups, WaitCups::Async);
+    }
+
+    #[test]
+    fn wait_cups_normalization() {
+        assert_eq!(WaitCups::from_json(&json!(true)), WaitCups::Sync);
+        assert_eq!(WaitCups::from_json(&json!("OFF")), WaitCups::Off);
+        assert_eq!(WaitCups::from_json(&json!(0)), WaitCups::Off);
+        assert_eq!(WaitCups::from_json(&json!("whatever")), WaitCups::Async);
+    }
+
+    /// The starter config.json: 0644, its directory made if missing, and
+    /// never written over an existing one.
+    #[test]
+    fn default_config_is_written_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("etc/vesyl-print/config.json");
+        assert_eq!(write_default_config(Some(&path)).unwrap(), path);
+        let data: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(data["auto_update_enabled"], true);
+        assert_eq!(data["releases_base_url"], DEFAULT_RELEASES_BASE_URL);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        let own = "{\"heartbeat_seconds\": 15}\n";
+        fs::write(&path, own).unwrap();
+        assert_eq!(write_default_config(Some(&path)).unwrap(), path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), own);
+    }
+
+    /// The user dirs come from the injected environment like config.py's
+    /// `Path.home()`: HOME wins (even "", which is `/`), and without it the
+    /// passwd home is used, never `/`. Empty XDG variables count as unset.
+    #[test]
+    fn user_dirs_follow_home_like_the_lcd() {
+        let home = |h: &'static str| move |k: &str| (k == "HOME").then(|| h.to_string());
+        assert_eq!(
+            user_config_dir(&home("/home/vesyl")),
+            Path::new("/home/vesyl/.config/vesyl-print")
+        );
+        assert_eq!(
+            user_state_dir(&home("/home/vesyl/")),
+            Path::new("/home/vesyl/.local/share/vesyl-print")
+        );
+        assert_eq!(
+            user_config_dir(&home("")),
+            Path::new("/.config/vesyl-print")
+        );
+        let env: HashMap<&str, String> = HashMap::from([
+            ("HOME", "/home/vesyl".to_string()),
+            ("XDG_CONFIG_HOME", String::new()),
+            ("XDG_STATE_HOME", String::new()),
+            ("XDG_DATA_HOME", "/data".to_string()),
+            (ENV_CONFIG_DIR, String::new()),
+        ]);
+        let env = |k: &str| env.get(k).cloned();
+        assert_eq!(
+            user_config_dir(&env),
+            Path::new("/home/vesyl/.config/vesyl-print")
+        );
+        assert_eq!(user_state_dir(&env), Path::new("/data/vesyl-print"));
+        if !Path::new("/etc/vesyl-print").is_dir() {
+            assert_eq!(
+                resolve_config_dir_with(&env),
+                Path::new("/home/vesyl/.config/vesyl-print")
+            );
+        }
+
+        // No HOME: the account's passwd entry (util's tests check that
+        // lookup against /etc/passwd), not `/`.
+        let passwd = crate::util::home_dir(&|_| None);
+        let dir = user_config_dir(&|_| None);
+        if let Some(passwd) = passwd.filter(|p| p != Path::new("/")) {
+            assert_eq!(dir, passwd.join(".config").join("vesyl-print"));
+            assert_eq!(
+                user_state_dir(&|_| None),
+                passwd.join(".local").join("share").join("vesyl-print")
+            );
+        }
+    }
+
+    /// A directory or config.json that cannot be made is named in the
+    /// error, not just the OS error ("Not a directory (os error 20)").
+    #[test]
+    fn dir_and_config_errors_name_the_path() {
+        let td = tempfile::tempdir().unwrap();
+        let file = td.path().join("file");
+        fs::write(&file, "x").unwrap();
+        let cfg = Config {
+            config_dir: td.path().join("etc"),
+            state_dir: file.join("state"),
+            ..Config::default()
+        };
+        let err = cfg.ensure_dirs().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory);
+        let prefix = format!("{}: ", cfg.state_dir.display());
+        assert!(err.to_string().starts_with(&prefix), "{err}");
+
+        let config = file.join("config.json");
+        let err = write_default_config(Some(&config)).unwrap_err();
+        let prefix = format!("{}: ", config.display());
+        assert!(err.to_string().starts_with(&prefix), "{err}");
+    }
+
+    /// `sudo vesyl-print claim` (or test-print, update …) on a fresh device:
+    /// the dirs and the starter config.json it makes are the service user's,
+    /// as `setup.sh` would have made them. Needs root (or a user namespace):
+    /// `unshare --map-root-user --map-auto <test binary> --include-ignored`.
+    #[test]
+    #[ignore = "needs root (or a user namespace) to chown"]
+    fn root_dirs_and_default_config_go_to_the_service_user() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(td.path(), Some(1000), Some(1000)).unwrap();
+        let cfg = Config {
+            config_dir: td.path().join("etc/vesyl-print"),
+            state_dir: td.path().join("var/lib/vesyl-print"),
+            ..Config::default()
+        };
+        cfg.ensure_dirs().unwrap();
+        let config = write_default_config(Some(&cfg.config_path())).unwrap();
+        for path in [
+            td.path().join("etc"),
+            cfg.config_dir.clone(),
+            td.path().join("var/lib"),
+            cfg.state_dir.clone(),
+            cfg.queue_dir(),
+            cfg.processed_dir(),
+            config.clone(),
+        ] {
+            let meta = fs::symlink_metadata(&path).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (1000, 1000), "{}", path.display());
+        }
+        assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o644);
+    }
+}

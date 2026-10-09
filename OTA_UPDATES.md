@@ -7,9 +7,9 @@ install layout, or OS strategy changes.
 | | |
 |--|--|
 | **Owner** | Print / device platform |
-| **Last reviewed** | 2026-07-16 |
-| **Status** | App OTA client + GitHub Releases CI + wms-api heartbeat OTA directives (fleet/node pin) |
-| **Related code** | `update.py`, `scripts/build-release.sh`, `scripts/apply-update`, `.github/workflows/release.yml`, `agent.py`, `cli.py`, `config.py`, `setup.sh`, `keys/` |
+| **Last reviewed** | 2026-10-08 |
+| **Status** | App OTA client (Rust) + GitHub Releases CI + wms-api heartbeat OTA directives (fleet/node pin) |
+| **Related code** | `rust/crates/vesyl-print/src/` (`update.rs`, `agent.rs`, `cli.rs`, `config.rs`), `scripts/build-release.sh`, `scripts/apply-update`, `.github/workflows/release.yml`, `setup.sh`, `keys/` |
 
 ---
 
@@ -19,7 +19,7 @@ install layout, or OS strategy changes.
 2. **Integrity** — TLS plus **Ed25519-signed manifests**; never trust “just a URL.”
 3. **Atomic install + rollback** — dual-slot layout; failed health → previous slot.
 4. **Preserve site state** — credentials, job queue, CUPS printers, config stay put.
-5. **Separate app vs OS** — ship Python/agent features weekly; patch OS/kernel on a slower, safer track.
+5. **Separate app vs OS** — ship agent/display features weekly; patch OS/kernel on a slower, safer track.
 6. **Observable** — cloud always knows `agent_version` and update status.
 
 ### Non-goals (for now)
@@ -82,12 +82,19 @@ Production (preferred):
 
 ```text
 /opt/vesyl-print/
-  current -> releases/0.4.0          # atomic symlink
+  current -> releases/0.5.1          # atomic symlink
   releases/
-    0.3.0/                           # previous (rollback)
-    0.4.0/                           # active tree (agent.py, main.py, …)
-  update/                            # download staging
+    0.5.0/                           # previous (rollback)
+    0.5.1/                           # active tree (vesyl-print binary, LCD *.py, assets)
+    0.5.2.staging/                   # an install, put together before it is swapped in
+  update/                            # downloads
 ```
+
+An install unpacks into a hidden `releases/.<version>.unpack/` first, then
+moves the release to `<version>.staging` (§4.3 steps 9-10). Leftovers it
+cannot delete (trees root unpacked) are renamed `.<name>.stale-<n>` and
+deleted by a later install. None of these names is a version: rollback, the
+`releases:` list of `vesyl-print version` and `apply-update` never take one.
 
 Lab/dev without root:
 
@@ -101,8 +108,11 @@ Lab/dev without root:
 - `/etc/vesyl-print/config.json` (site-specific)
 - `/var/lib/vesyl-print/**` (queue, processed, status)
 
-Systemd units run from `current` after `setup.sh` (factory path). Lab can still
-use a git checkout as the *source* tree; setup copies it into
+Systemd units run from `current` after `setup.sh` (factory path):
+`vesyl-print-agent.service` runs `current/vesyl-print agent`, and
+`vesyl-print-display.service` runs `python3 current/main.py` (the LCD stays
+Python for now). The source tree for `setup.sh` is an extracted release tarball
+(a git checkout has no binary); setup copies it into
 `/opt/vesyl-print/releases/<VERSION>` and points `current` there. OTA stages
 new versions beside it under the same install root.
 
@@ -114,8 +124,28 @@ CI (`.github/workflows/release.yml`) runs on tag `vX.Y.Z` and uploads:
 
 | Asset | Purpose |
 |-------|---------|
-| `vesyl-print-X.Y.Z-linux-aarch64.tar.gz` | App tree |
+| `vesyl-print-X.Y.Z-linux-aarch64.tar.gz` | App tree (below) |
 | `vesyl-print-X.Y.Z.manifest.json` | Metadata + sha256 + Ed25519 signature |
+
+**Tarball** (`vesyl-print-X.Y.Z/` at its root; entries owned by root):
+
+| Path | Purpose |
+|------|---------|
+| `vesyl-print` | Rust agent + CLI, aarch64, glibc ≥ 2.31 (Debian bullseye and newer) |
+| `*.py` | LCD display (Python, for now) |
+| `assets/` | logo, boot splash, 4x6 test labels (`vesyl-print test-print`) |
+| `base.jpg` | sample image (`vesyl-print print-test --file …/current/base.jpg`) |
+| `setup.sh`, `vesyl-print-*.service`, `scripts/` (not `build-release.sh`), `overlays/`, `keys/update_public.pem` | provisioning from the extracted tarball |
+| `VERSION`, `README.md`, `OTA_UPDATES.md` | version, docs |
+
+Nothing else ships: no `rust/`, `tests/`, `.github/`, `requirements.txt`,
+private keys or Tailscale keys. `build-release.sh` packages an allowlist and
+fails if a required file (binary, `main.py`, units, `scripts/apply-update`,
+test labels, …) is missing.
+
+The tarball holds no hard links (`build-release.sh` copies the tree with
+`rsync -a`, without `-H`): installed as root, an archive with one is refused
+(`bad_archive`).
 
 **URLs (device default `releases_base_url`):**
 
@@ -124,91 +154,334 @@ https://github.com/vesylapp/vesyl-print/releases/download/vX.Y.Z/vesyl-print-X.Y
 https://github.com/vesylapp/vesyl-print/releases/download/vX.Y.Z/vesyl-print-X.Y.Z-linux-aarch64.tar.gz
 ```
 
-Build locally: `./scripts/build-release.sh [VERSION]` with
-`UPDATE_PRIVATE_KEY` or `UPDATE_PRIVATE_KEY_FILE` set.
+**Building:** `scripts/build-release.sh [VERSION]` cross-compiles the binary
+with `cargo-zigbuild` (`aarch64-unknown-linux-gnu.2.31`), bakes the version in
+(`VESYL_PRINT_VERSION`), checks the binary needs no glibc symbol newer than
+2.31 (`readelf -V`) and reports that version (under qemu-aarch64 on x86 CI,
+where it must run), packages the tarball and signs the manifest. It needs
+cargo-zigbuild (CI pins it and zig in `.github/zigbuild-requirements.txt`),
+binutils, jq, rsync and openssl; no Python. The `aarch64` job of
+`.github/workflows/rust.yml` runs the same `BUILD_ONLY=1` build for pull
+requests and pushes to main (whenever the Rust tests run), with clippy and
+the unit tests for aarch64 (under qemu), so a change that breaks the Pi
+build fails there and not at the tag. CI runs the release in three jobs so
+the signing key never shares a runner with build code:
+
+| Mode | Job | Does | Tools |
+|------|-----|------|-------|
+| `BUILD_ONLY=1` | build | tarball only; never reads a key | cargo-zigbuild, readelf, rsync, tar, jq |
+| `SIGN_ONLY=1` | sign | hash the tarball, write the signed manifest | jq, openssl, sha256sum, coreutils |
+| `VERIFY_ONLY=1` | publish | refuse unless the manifest names this version, URL and sha256 and verifies with `keys/update_public.pem` | same as SIGN_ONLY |
+
+With no mode set it builds and signs in one go (local use:
+`UPDATE_PRIVATE_KEY_FILE=… ./scripts/build-release.sh 0.5.0`).
 
 **Manifest fields (contract):**
 
 ```json
 {
-  "version": "0.4.0",
+  "version": "0.5.0",
   "channel": "stable",
-  "min_agent_version": "0.3.0",
-  "artifact_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0-linux-aarch64.tar.gz",
+  "artifact_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.5.0/vesyl-print-0.5.0-linux-aarch64.tar.gz",
   "artifact_sha256": "<64 hex>",
-  "signature": "<base64 Ed25519>",
-  "released_at": "2026-07-16T00:00:00Z"
+  "min_agent_version": "0.4.0",
+  "released_at": "2026-10-08T16:05:00+00:00",
+  "signature": "<base64 Ed25519>"
 }
 ```
 
-**Signature:** Ed25519 over **canonical JSON** of the manifest **excluding**
-`signature` (sorted keys, compact separators). See `keys/README.md`.
+Optional: `changelog` (`RELEASE_CHANGELOG`). `channel` comes from
+`RELEASE_CHANNEL`. `min_agent_version` (`MIN_AGENT_VERSION`, default `0.4.0`) is
+the oldest agent that may install the release; older agents fail with
+`too_old`. The default keeps Python-era 0.3.x agents from installing a release
+whose binary their units cannot run (§4.2.1). The build refuses a `VERSION`
+below it, since devices on that release could never update again.
 
-**Public key locations (first match wins):**
+**Signature:** Ed25519 over the manifest's **canonical JSON**: every field
+except `signature` and nulls, keys sorted, compact separators, non-ASCII
+escaped as `\uXXXX` (Python `json.dumps(sort_keys=True, separators=(",", ":"))`
+form). The scripts produce it with `jq -S -c -a`; devices rebuild the same
+bytes in `update.rs` `ReleaseManifest::canonical_bytes()`. The Rust tests sign
+with the script and verify with the device code (including a non-ASCII
+changelog), and the other way round. See `keys/README.md`.
 
-1. `config.update_public_key_path`
-2. `/etc/vesyl-print/keys/update_public.pem` (installed by `setup.sh` if present in repo)
-3. Bundled `keys/update_public.pem` next to the app
-4. Optional baked-in PEM in `update.py` (empty by default)
+**Public key:** `config.update_public_key_path` when set, else the key compiled
+into the binary from `keys/update_public.pem` (rotate by shipping a release).
+`setup.sh` also installs `/etc/vesyl-print/keys/update_public.pem` for configs
+that point at it.
 
 Private key: CI secrets / HSM only — **never** on devices.
 
+### 4.2.1 Runtime: Rust agent + Python LCD; migrating Python-era devices
+
+The agent and CLI are the `vesyl-print` binary; there is no Python agent, no
+bridge and no fallback to one (they are in git history only). The LCD display
+stack (`main.py` and its modules) is still Python and ships in the same slot.
+It reads the agent's state files (`status.json`, `printers.json`,
+`update_status.json`) and calls the CLI
+(`vesyl-print claim CODE [--name N] --json`,
+`vesyl-print test-print --queue Q --format pdf|zpl --json`). Printer setup
+(new CUPS queues) runs in the agent, once per start; the LCD only reads
+`printers.json`, and shows every status as unknown once that file is older
+than 120 s.
+
+A slot is runnable only with the `vesyl-print` binary, which the agent unit
+execs from the slot root: the agent rejects archives without an executable
+one, rollback passes over slots without it, the health gate fails a slot
+without it, and `apply-update` refuses to activate a slot without an
+executable `vesyl-print` at its root.
+
+Devices provisioned by an older `setup.sh` (versions 0.3.x) run
+`python3 …/agent.py` from root-owned units, and OTA cannot rewrite those. Nor
+can they take the first Rust release over OTA: its `min_agent_version` 0.4.0
+makes a 0.3.x agent refuse it (`too_old`). They are **re-provisioned, not
+migrated by OTA**: run `setup.sh` from an extracted release tarball (over
+Tailscale or SSH). It removes the old release slots without the binary (the
+Python-only ones, so a rollback cannot pick one), rewrites both units, the
+CLI wrapper, `apply-update`, `wifi-setup` and sudoers, and keeps config,
+credentials (the pairing) and the queue. The lab Pi was moved this way.
+
+The lab Pi has run lab builds 0.4.0 through 0.4.3, signed with a throwaway
+lab key, so the first real release is numbered above them: 0.5.0 (§4.8).
+Those builds report 0.4.x, which the `min_agent_version` floor lets through,
+but the lab Pi refuses production-signed releases: when the dev server asked
+it for 0.3.17, it held that version as `bad_signature` on the first attempt
+(§4.3 step 18) and downloaded nothing more, and its LCD shows `Update failed`
+until the desired version changes. So the lab Pi is re-provisioned from the
+published 0.5.0 tarball, never from a build made before the tag and numbered
+0.5.0.
+
+A release tarball never holds `keys/tailscale.key`, so re-provisioning a
+device that is already on the tailnet leaves Tailscale alone ("No Tailscale
+auth key — skip Tailscale"). Afterwards `setup.sh` deletes the extracted
+`vesyl-print-X.Y.Z/` it ran from (`SKIP_SOURCE_CLEANUP=1` keeps it); it never
+deletes the install root, a slot, a git checkout or a directory with another
+name.
+
 ### 4.3 Device-side flow
 
-Implemented primarily in `update.py`, invoked from the agent after a successful
-heartbeat and from the CLI.
+Implemented in `rust/crates/vesyl-print/src/update.rs`, invoked from the agent
+after a successful heartbeat and from the CLI.
 
 ```text
 1. Heartbeat POST includes agent_version, platform, optional update status blob
-2. Response may include desired_agent_version (+ update_channel, update_url)
-3. If desired empty or == current → idle
+2. Response may include desired_agent_version (+ update_channel, update_url);
+   the desired version is normalized: a leading `v` is dropped
+3. If desired empty or == current → idle (a `rolled_back` status stays with
+   no desired version, and is over once desired == the running version ==
+   the `current` slot's version; the old process a rollback leaves running
+   until its restart does not end it; a `failed` one stays). A desired
+   version held here, or still backing off (step 18), is left alone:
+   nothing is fetched
 4. If auto_update_enabled false → record target only, do not install
-5. If jobs in flight (durable queue or buffered ActionCable jobs) →
-     defer install (stay idle, keep target); retry next heartbeat
+   (the agent; a manual `vesyl-print update apply` installs anyway, §4.7)
+5. If buffered ActionCable jobs, or a start-up drain held back by the health
+     gate, are still to run → defer install (stay idle, keep target); retry
+     next heartbeat
 6. Resolve manifest URL:
      - heartbeat.update_url if set
-     - else {releases_base_url}/vesyl-print-{desired}.manifest.json
-7. Fetch manifest → verify Ed25519 (if require_signature)
-8. Download tarball → verify SHA-256
-   (while status is downloading|installing|pending_health: **pause**
-    REST job pull and ActionCable print_job processing)
-9. Extract to releases/<version>/ (path-escape rejected)
-10. Write VERSION file; ensure agent.py or main.py present
+     - else {releases_base_url}/v{desired}/vesyl-print-{desired}.manifest.json
+       (GitHub Releases; any other base gets no /v{desired}/)
+     - neither → failed; checked again on each heartbeat (nothing fetched,
+       no failed attempt counted)
+7. Fetch manifest → its `version` must equal the desired version, else the
+   update is refused before any download (version_mismatch); check
+   min_agent_version (too_old) and verify Ed25519 (if require_signature)
+8. Download tarball → verify SHA-256, into `update/`, opened once: the
+   `.part` file is made, renamed and removed, and the artifact removed after
+   the install, relative to that directory (as root too, a symlink swapped
+   in for `update/` meanwhile takes nothing elsewhere). A stop ends the
+   download after the read in progress, and the `.part` is removed
+   (while status is downloading|installing|pending_health: **pause** REST
+    job pull, ActionCable print_job processing and the start-up drain of
+    queue/*.json; after a health gate rolls back and restarts the services,
+    the agent also takes no job until its restart, or for 120 s if none
+    comes)
+9. Extract to releases/<version>.staging (path-escape rejected): the archive
+   unpacks into a hidden `.<version>.unpack` beside the slot, and the release
+   (its single top-level directory, else all of it) moves to
+   `<version>.staging`. An archive whose top-level directory is
+   `vesyl-print-<another version>` is refused (version_mismatch). As root
+   (the binary run by path; `sudo vesyl-print` runs it as the service
+   user), the archive is unpacked through
+   descriptors into a root-owned 0700 `.<version>.unpack` (a directory at
+   that name that is not root's own and closed to others is refused), with
+   no hard links. Before the release leaves it, group and others lose write
+   on every directory and file, whatever modes the archive or the operator's
+   umask gave. The slot is handed to the owner of `releases/` only once it
+   is in place (step 10)
+10. In staging, before the slot is touched: require an executable
+    vesyl-print at the slot root (else bad_archive, and an installed slot
+    of that version stays as it was), write VERSION, and syncfs. Then put
+    it in place:
+      - no slot of that version yet: the new slot is renamed in
+      - a slot of that version, including the one `current` points at (a
+        re-apply or repair): swapped with renameat2(RENAME_EXCHANGE) and
+        the old tree removed, so `current` never dangles
+      - on a filesystem without RENAME_EXCHANGE the active slot is never
+        replaced (the install fails with no_exchange); any other slot is
+        cleared and replaced
+    As root, the slot (VERSION included) then goes to the owner of releases/
 11. Activate:
-      - preferred: sudo -n apply-update activate <release> <current>
-      - else: atomic symlink flip as the service user (lab install root)
+      - where apply-update is installed (appliances), only through
+        sudo -n apply-update activate <release> <current>; if it refuses,
+        the update fails and `current` is not flipped some other way
+      - with no helper (lab install root, tests): atomic symlink flip as
+        the service user
 12. Persist `update_status.json` with `status=pending_health`,
-    `previous_version`, and `health_deadline_at` (default 120s)
-13. Restart services (apply-update restart or systemctl)
+    `previous_version`, `health_deadline_at` (default 120s) and `armed_at`
+13. Restart services (apply-update restart or systemctl), unless the agent
+    is stopping (see Stopping during an OTA, below)
 14. New agent process runs the **health gate**:
-      - local: `current` has agent/main + VERSION matches target
+      - local: `current` has the vesyl-print binary + VERSION matches target
       - if paired: `GET /print/v1/whoami` must reach the API (`ok` or
         `unauthorized` both count — proves the new code talks to cloud)
       - if unpaired: local checks only
-15. Health OK → `status=idle` (OTA success); job pull/push resume
+15. Health OK → `status=idle` (OTA success); job pull/push resume, and jobs
+    left queued from before the restart print before any new job
 16. Health not ready → stay `pending_health` and retry each cycle
 17. Hard local failure **or** deadline exceeded → auto-rollback to
     `previous_version`, restart services, `status=rolled_back`
-18. Pre-activate failure: leave previous `current`; `status=failed`;
-    no half-open symlink
+      - no previous slot, or it cannot run → `status=failed`, last_error
+        "health failed: …" ("… (no previous slot to roll back to)" or
+        "…; rollback error: …"). The slot stays active, jobs are not
+        paused, and the gate is not re-armed. It clears to `idle`, without
+        a new gate, on the first later agent cycle where that version runs
+        from a runnable slot and whoami does not fail (`ok`,
+        `unauthorized`, or unpaired)
+      - a gate rollback during a `systemctl stop` flips `current` but
+        restarts nothing
+18. Pre-activate failure: leave `current` alone (no half-open symlink);
+    `status=failed` with `last_error` and `last_error_code`
+      - failures another try would only repeat (bad_manifest,
+        bad_signature, bad_checksum, bad_archive, too_old,
+        version_mismatch, no_exchange) hold that version like a failed
+        health gate: no new download until the desired version changes or
+        an operator runs `update apply`
+      - any other failure (network, any HTTP status including 404/429/5xx,
+        disk full or permissions, the helper, the key file) is retried
+        after 1 min, doubling to 1 h (`attempts`, `retry_at` in
+        update_status.json)
+      - the counter resets when the desired version changes or an install
+        succeeds
 ```
 
-**Rollback:** `vesyl-print update rollback` flips `current` to the previous
-release directory (or an explicit version). Auto-rollback after a failed
-health gate uses the same path.
+Errors (`last_error`, which the heartbeat and the LCD carry) and log lines
+name manifest and artifact URLs, and any redirect target the HTTP client
+could not follow, without their userinfo, query or fragment, cut to 200
+characters, so a presigned URL's signature never reaches them.
+
+**Stopping during an OTA:** a `systemctl stop` that lands before the new
+slot is put in place abandons the update. That covers mid-download, before
+the extract, and while the unpacked release is checked in staging. The
+status becomes `idle` with last_error "update stopped …: the agent is
+stopping"; failed-attempt counters are cleared, and the download and
+staging are removed. A reinstall of the active slot leaves that slot exactly
+as it was. The update is retried on the next start, not held.
+
+- After activation the services are not restarted, because that restart
+  would replace the stop job: `pending_health` stays, and the next start
+  runs the new slot and its gate. The gate deadline keeps running while
+  stopped; if it has passed, a failing first whoami at that start rolls back
+  at once. The display service keeps running the old slot's code until it is
+  itself restarted.
+- A gate rollback during a stop flips `current` but restarts nothing.
+- A connection that stalls entirely still holds a read for up to the
+  artifact idle timeout (300 s), so systemd's 90 s stop timeout can SIGKILL
+  such a download; only a slow download is ended promptly. The next start
+  marks that update `failed` ("update interrupted before it finished") and
+  tries it again.
+
+**Rollback:** `vesyl-print update rollback` points `current` at the newest
+other release whose slot can run (an executable `vesyl-print` at its root),
+passing over and logging slots that cannot; `--version X` picks X, and is
+refused (`not_runnable`) when its slot cannot run. It activates as step 11
+does: through `apply-update` when that is installed, whose refusal is final,
+else with the in-process symlink flip. Auto-rollback after a failed health
+gate uses the same path.
+
+`update rollback` then records `update_status.json` as `rolled_back`, with
+`target_version` the version it left (X) and last_error "manual rollback from
+X to Y", and prints "holding X: …". The agent then does not install X again
+while the server still desires it, only once the desired version changes or
+`update apply` installs a version. An `update apply` that installs nothing
+(the version asked for already runs) leaves the hold as it is, and so does a
+reinstall of the active slot with `--restart` (it arms no gate then: there is
+no other slot to roll back to). An open health gate is closed at once. A gate
+rollback (step 17) holds the version it left the same way, unless the
+restart into that version never happened (it never ran). Once the server
+desires the version running, a rollback is over: the status goes back to
+`idle`, and the LCD stops showing "Rolled back".
+
+A gate that `update apply … --restart` arms while the agent is downloading
+an update survives the agent's stop: before it returns, the agent's heartbeat
+reads `update_status.json` again, and keeps a `pending_health` or manual
+rollback another process wrote there meanwhile rather than write its own
+status over it.
 
 ### 4.4 Privileges (`setup.sh`)
 
 | Path | Role |
 |------|------|
 | `/usr/local/lib/vesyl-print/apply-update` | Root helper: `activate`, `restart`, `rollback` |
-| `/etc/sudoers.d/vesyl-print` | `$RUN_USER ALL=(root) NOPASSWD: /usr/local/lib/vesyl-print/apply-update` only |
+| `/usr/local/lib/vesyl-print/wifi-setup` | Root helper for the LCD's Wi-Fi setup (NetworkManager hotspot / scan / connect) |
+| `/etc/sudoers.d/vesyl-print` | `$RUN_USER ALL=(root) NOPASSWD:` those two helpers only |
+| `/usr/local/bin/vesyl-print` | CLI wrapper: runs `current/vesyl-print`, as `$RUN_USER` when root runs it |
 
 Rules:
 
 - Drop-in mode **0440**, validated with `visudo -cf` before install.
-- Helper owned by root, not writable by the service user.
+- Helpers owned by root, not writable by the service user. `setup.sh` writes
+  the install root into each one (`INSTALL_ROOT=` in `apply-update`,
+  `INSTALL_ROOT = Path(…)` in `wifi-setup`) and stops before changing
+  anything if that line is not there exactly once. It writes it in plain
+  form, the same in the units: absolute, trailing slashes dropped, no `.`,
+  `..` or empty component (it refuses those), since `apply-update` compares
+  it as a string with the paths the agent builds from the units' value.
 - No shell wrappers or `NOPASSWD: ALL`.
+- The service user owns every release slot, so root never runs a slot's
+  binary through the CLI wrapper: `sudo vesyl-print …` runs it as
+  `$RUN_USER` (`runuser -u`), and its privileged steps (activate, restart)
+  go through `apply-update` like the agent's. Running the binary as root by
+  path still runs code the service user can change.
+- **Known issue: `wifi-setup` is a root-escalation path for the service
+  user.** The helper file is root-owned, but it runs as root through
+  NOPASSWD sudo and imports `wifi_setup.py` (and `sysinfo.py`) from
+  `<install root>/current`, a tree the service user owns, and
+  `wifi_setup.py` spawns the `wifi_portal.py` beside it (so the active
+  slot's) as root. Whatever the service user writes into the active slot
+  runs as root. The helper no longer writes Python bytecode into the slot
+  (`sys.dont_write_bytecode`, and `PYTHONDONTWRITEBYTECODE=1` for the portal
+  it spawns), so it leaves no root-owned `__pycache__` there that the agent
+  could never delete; the imports from the slot remain. Planned fix, not
+  implemented yet: `setup.sh` installs root-owned copies of
+  `wifi_setup.py`, `sysinfo.py` and `wifi_portal.py` next to the helper in
+  `/usr/local/lib/vesyl-print/` and the helper imports only from its own
+  directory; the portal, spawned from beside `wifi_setup.py`, then comes
+  from there too. Those copies would change only when `setup.sh` runs, not
+  with OTA: a trade-off for the maintainers to decide. Until provisioning
+  changes, the image's cloud-init also gives the service user
+  `NOPASSWD: ALL` sudo, so these helper restrictions do not limit what that
+  account can do as root.
+
+`apply-update` trusts none of its arguments as a path, since sudoers lets the
+service user pass anything:
+
+- the install root is fixed in the installed file (`setup.sh` writes it);
+  `activate` takes only `<root>/releases/<version>` and `<root>/current`,
+  `rollback` only `<root>` and a version;
+- the version must be a release version, as `update.rs` `is_version`
+  judges it (never `.`, `..`, a `/`, or an interrupted extract's
+  `<version>.staging`);
+- the slot must be a real directory, not a symlink, holding an executable
+  `vesyl-print`, so a Python-era or broken slot is never activated;
+- the only write is the `current` symlink, swapped atomically through
+  `current.new` (`ln -T` / `mv -T`, never followed);
+- it runs with a fixed `PATH` and `LC_ALL=C`; `restart` restarts the display,
+  then the agent, with `--no-block`.
+
+A rejected call changes nothing. `rust/crates/vesyl-print/tests/apply_update.rs`
+covers each rule.
 
 ### 4.5 Control plane (wms-api) — plan A
 
@@ -219,19 +492,25 @@ separate `GET /print/v1/update` for v1).
 
 ```json
 {
-  "agent_version": "0.3.0",
+  "agent_version": "0.5.0",
   "hostname": "VESYL-PRINT-…",
   "platform": "linux-aarch64",
   "printers": [ … ],
   "update": {
-    "status": "idle|downloading|installing|failed|rolled_back",
-    "current_version": "0.3.0",
+    "status": "idle|checking|downloading|installing|pending_health|failed|rolled_back",
+    "current_version": "0.5.0",
     "target_version": null,
     "last_error": null,
     "last_checked_at": "…"
   }
 }
 ```
+
+The `update` blob is the agent's `update_status.json`, which also always
+carries `channel`, `previous_version`, `health_deadline_at` and
+`health_attempts`. The optional keys `last_error_code`, `attempts` and
+`retry_at` (§4.3 step 18) are sent only while set, as is `armed_at` (an open
+health gate).
 
 **Server → agent (response fields):**
 
@@ -241,9 +520,9 @@ separate `GET /print/v1/update` for v1).
   "node_id": "…",
   "status": "online",
   "last_seen_at": "…",
-  "desired_agent_version": "0.4.0",
+  "desired_agent_version": "0.5.1",
   "update_channel": "stable",
-  "update_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.4.0/vesyl-print-0.4.0.manifest.json"
+  "update_url": "https://github.com/vesylapp/vesyl-print/releases/download/v0.5.1/vesyl-print-0.5.1.manifest.json"
 }
 ```
 
@@ -272,17 +551,19 @@ When the server does not yet send these fields, the agent stays idle (safe).
   "update_channel": "stable",
   "releases_base_url": "https://github.com/vesylapp/vesyl-print/releases/download",
   "update_require_signature": true,
-  "update_public_key_path": "/etc/vesyl-print/keys/update_public.pem"
+  "update_public_key_path": "/etc/vesyl-print/keys/update_public.pem",
+  "update_health_gate_seconds": 120
 }
 ```
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `auto_update_enabled` | `true` | If false, log desired version but do not install |
+| `auto_update_enabled` | `true` | If false, the agent logs the desired version but does not install it (at info when the desired version changes or the agent starts, at debug on the heartbeats between). A manual `vesyl-print update apply` (or `--version`) still installs (§4.7); the Python CLI did not |
 | `update_channel` | `stable` | Informational / future channel latest index |
-| `releases_base_url` | GitHub `…/releases/download` | Prefix; device appends `/vX.Y.Z/vesyl-print-X.Y.Z.manifest.json` |
+| `releases_base_url` | GitHub `…/releases/download` | Prefix; device appends `/vX.Y.Z/vesyl-print-X.Y.Z.manifest.json` (GitHub Releases; any other base gets `/vesyl-print-X.Y.Z.manifest.json`) |
 | `update_require_signature` | `true` | Lab may set false only with care |
 | `update_public_key_path` | empty | Explicit PEM path |
+| `update_health_gate_seconds` | `120` | Health gate deadline after an activation (§4.3 step 12); at least 15 |
 
 Env: `VESYL_PRINT_INSTALL_ROOT` overrides install root.
 
@@ -292,35 +573,125 @@ Env: `VESYL_PRINT_INSTALL_ROOT` overrides install root.
 vesyl-print version
 vesyl-print update check              # heartbeat; print desired if paired
 vesyl-print update apply              # use cloud desired + update_url
-vesyl-print update apply --version 0.4.0
-vesyl-print update apply --manifest-url https://…
-vesyl-print update apply --file ./rel.tar.gz --manifest ./rel.manifest.json
+vesyl-print update apply --version 0.5.0
+vesyl-print update apply --manifest-url https://… [--version 0.5.0] [--restart]
+vesyl-print update apply --file ./rel.tar.gz --manifest ./rel.manifest.json [--version 0.5.0] [--restart]
 vesyl-print update rollback [--version X] [--restart]
 ```
+
+`--version` accepts a leading `v` (`v0.5.0`); anything else that is not a
+release version is refused before any network call. `update apply
+--file/--manifest` (like `print-test --file`) expands a leading `~/` from
+`$HOME`, also in the `--file=~/…` form the shell leaves alone. `update
+check` shows the heartbeat's manifest URL without its query or userinfo,
+where a presigned URL carries its signature.
+
+Every command but `agent` writes its warnings (a release passed over, a
+symlink root would not follow, a file it could not hand to the service user)
+to stderr; `VESYL_PRINT_LOG=info` or `debug` shows more.
+
+`update apply` with no source (the cloud's desired version, or `--version`)
+runs the heartbeat path of §4.3: install, `pending_health`, restart the
+services, and the new agent runs the health gate. It installs even with
+`auto_update_enabled: false`, which only keeps the agent from installing on
+its own (the Python CLI installed nothing then), and even a version the agent
+holds or backs off (§4.3 step 18): it starts from a fresh status. When the
+version asked for already runs it installs nothing, and leaves a hold on
+another version as it is (it prints that record, not `idle`).
+`--version X` installs X from `releases_base_url` (§4.6); it uses the
+heartbeat's `update_url` only when the server desires exactly `X` (a leading
+`v` aside), since that URL is the manifest of the server's version. When the
+server does not desire `X` and `releases_base_url` is empty, it fails ("no
+manifest URL for X … (pass --manifest-url)"). Any online manifest for
+another version than the one asked for is refused before installing
+(version_mismatch).
+
+`--manifest-url` and `--file` only install and activate the slot. `--file`
+runs the same checks as an online install: the manifest's
+`min_agent_version` and signature, the tarball's SHA-256 against the
+manifest, and an executable `vesyl-print` at the root of the unpacked slot
+(§4.3 step 10); it activates as step 11 does, through `apply-update` when
+that is installed. With them `--version` is optional and is the version the
+release must be. It is validated first: a leading `v` is allowed, anything
+else is refused before the manifest is fetched or read. A manifest for
+another version is refused ("manifest is for version Y, not X", exit 1)
+before anything is downloaded, unpacked or activated. Without `--version`
+they install whatever version their manifest names. With `--restart` they
+also arm the health gate (`pending_health`, deadline
+`update_health_gate_seconds`, rollback to the slot that was active) and then
+restart the services; a reinstall of the active slot while another version
+is held arms no gate and keeps the hold (§4.3 **Rollback**). Without
+`--restart` nothing is restarted and no gate
+is armed (the running agent could only let it expire and roll back): the new
+slot starts on the next service restart, and no health gate checks it.
+
+`update rollback [--version X] [--restart]` records the hold described under
+**Rollback** in §4.3 and prints "holding X: …"; its `--version` also accepts
+a leading `v`.
+
+Run as root (the binary by path: `sudo vesyl-print update …` runs it as
+the service user, see §4.4), the CLI hands what it writes to the service
+user that owns the tree it writes in. That means the download
+and the unpacked slot (with its `VERSION`) under the install root, and
+`update_status.json` in the state dir. On its way there it follows a symlink
+only when root owns the link and the directory that holds it, and nobody
+else can write to that directory (README, App stack). `/opt/vesyl-print`
+itself may be such a link in `/opt`: `setup.sh` hands over the tree it
+points at and keeps the link root's.
 
 ### 4.8 Version source of truth
 
 - Repo / release tree: `VERSION` file  
-- `config.AGENT_VERSION` reads `VERSION` at import  
-- Heartbeat and CLI report that version  
+- The binary bakes its version in at build time (`VESYL_PRINT_VERSION`, set
+  from the tag by `build-release.sh`; else `VERSION`), and the build checks the
+  packaged binary reports it  
+- Heartbeat, CLI and the LCD footer report that version  
 
 Release process must bump `VERSION` (and tags) in the same commit as the ship.
+
+**First Rust-only release: v0.5.0.** The lab Pi has run lab builds 0.4.0
+through 0.4.3, signed with a throwaway lab key. A device whose running
+version equals the desired one stays idle (§4.3 step 3), so a real 0.4.x
+would never replace the lab build of the same number. Tag `v0.5.0` with
+`VERSION` bumped to 0.5.0 in the same commit. `MIN_AGENT_VERSION` keeps its
+default of 0.4.0, the Python-era cutoff (§4.2).
+
+Versions compare as semver orders them (`update.rs` `version_cmp`): by
+number first, then a pre-release below its release (0.9.1-rc.1 < 0.9.1,
+pre-releases by their identifiers), and any other suffix (`+b7`, `.lab`)
+above the bare release, by its text. So two differently written releases are
+never the same version: a device on 0.5.0-rc.1 or 0.5.0.lab installs the real
+v0.5.0 when the cloud asks for it. (Until this was fixed, a suffix was
+ignored and such a device stayed where it was.) The scripts' floor check
+(`build-release.sh` `version_core_ge`, `min_agent_version`) still compares
+only the numbers, which is right for a floor. So:
+
+- Re-provision the lab Pi from the published v0.5.0 tarball (§4.2.1); its
+  lab key refuses the production-signed release over OTA anyway.
+- A tarball built before the tag must not be numbered exactly 0.5.0. Number
+  an interim lab build below 0.5.0, at or above `MIN_AGENT_VERSION` 0.4.0
+  and above the lab builds so far, e.g. 0.4.4:
+  `BUILD_ONLY=1 ./scripts/build-release.sh 0.4.4`. Give the version: until
+  the release bumps it, `VERSION` is 0.3.17, below the floor, and
+  `build-release.sh` refuses it.
 
 ### 4.9 Implementation map
 
 | Component | Path |
 |-----------|------|
-| Core logic | `update.py` |
+| Core logic | `rust/crates/vesyl-print/src/update.rs` |
 | Root helper | `scripts/apply-update` → `/usr/local/lib/vesyl-print/apply-update` |
-| Heartbeat hook | `agent.py` → `maybe_update_from_heartbeat` |
-| HTTP client | `cloud.py` `heartbeat(..., update=)` |
-| Config | `config.py` |
-| CLI | `cli.py` `version` / `update *` |
-| Provisioning | `setup.sh` (helper + sudoers + optional public key) |
-| Build + sign | `scripts/build-release.sh` |
+| Heartbeat hook | `agent.rs` → `update::maybe_update_from_heartbeat` |
+| HTTP client | `cloud.rs` `CloudClient::heartbeat`; downloads through `net.rs` |
+| Root-safe writes (CLI run as root) | `util.rs` `write_durable`, `create_dir_all_owned`, `open_dir_owned`, `hand_tree_to_parent_owner` |
+| Config | `config.rs` |
+| CLI | `cli.rs` `version` / `update *` |
+| Provisioning | `setup.sh` (units, CLI wrapper, helpers + sudoers, public key) |
+| Build, sign, verify | `scripts/build-release.sh` |
 | CI publish | `.github/workflows/release.yml` → GitHub Releases |
+| CI checks | `.github/workflows/rust.yml`: tests, and the aarch64 release build (`BUILD_ONLY=1`, glibc floor, `--version` under qemu); `lcd.yml`: LCD tests |
 | Signing docs | `keys/README.md` |
-| Tests | `tests/test_update.py` |
+| Tests | `update.rs` unit tests; `rust/crates/vesyl-print/tests/build_release.rs`, `apply_update.rs` and `setup_sh.rs` (drive the scripts; the `root_*` ones run `setup.sh` in a chroot) |
 
 ---
 
@@ -330,7 +701,7 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 
 - [x] Dual-slot install + rollback APIs  
 - [x] Manifest parse, sha256 download verify  
-- [x] Ed25519 verify via `cryptography` (when key present)  
+- [x] Ed25519 verify in the binary (`ed25519-dalek`; key compiled in, config can override)  
 - [x] Heartbeat request carries update status; response drives desired version (**plan A**)  
 - [x] CLI check / apply / rollback  
 - [x] `setup.sh` installs apply-update + sudoers  
@@ -343,6 +714,9 @@ Release process must bump `VERSION` (and tags) in the same commit as the ship.
 - [x] Post-update health gate (whoami / local checks; auto-rollback on failure)  
 - [x] Pause job pull during install; avoid updating mid-job  
 - [x] LCD “Updating…” / failed update messaging (+ agent version on footer)  
+- [x] Hold a release that cannot be installed, back off other failures (§4.3 step 18)  
+- [x] Reinstall of the active version swapped in one step (`renameat2` `RENAME_EXCHANGE`)  
+- [x] Versions with a suffix compare as semver orders them (0.9.1-rc.1 < 0.9.1, §4.8)  
 
 ### Open (must land for fleet OTA)
 
@@ -374,6 +748,11 @@ stack reliably. Plan OS work as a **second track**.
 3. **No** agent-driven `apt full-upgrade`.  
 4. **Inventory:** report OS version / kernel in heartbeat later (field TBD) for
    support.
+5. **Memory cgroup:** Raspberry Pi OS boots with `cgroup_disable=memory`, so
+   the agent unit's `OOMPolicy=continue` and `MemoryMax=50%` are inert.
+   Enabling them means `cgroup_enable=memory` in `cmdline.txt` and a reboot:
+   decide it for the image (README, Services). Unit changes reach a device
+   only through `setup.sh`; OTA never rewrites units.
 
 ### 6.2 Medium term
 
@@ -406,7 +785,7 @@ keep app OTA as the daily driver.
 
 | Layer | Mechanism | Owner |
 |-------|-----------|--------|
-| App (Python agent/display) | Signed OTA tarball | This repo + CI + wms-api |
+| App (Rust agent/CLI + Python LCD) | Signed OTA tarball | This repo + CI + wms-api |
 | Debian security packages | unattended-upgrades (curated) | Image / platform |
 | Kernel / firmware / SPI | Image rebuild or A/B OTA | Platform (later) |
 | CUPS / printer drivers | Image or careful apt policy | Platform |
@@ -417,24 +796,38 @@ keep app OTA as the daily driver.
 
 | Failure | Expected behavior |
 |---------|-------------------|
-| Bad signature / checksum | Do not flip `current`; `update.status=failed` |
-| Download interrupted | No activate; retry on later heartbeat |
-| Disk full | Fail before extract; report error |
+| Bad signature / checksum | Do not flip `current`; `update.status=failed`; held for that desired version: no new download until it changes or `update apply` |
+| Download interrupted | No activate; retry after 1 min, doubling to 1 h (`retry_at`) |
+| Disk full | Fail before activation; retried with the same backoff |
 | Activate succeeds, whoami never succeeds | Auto-rollback after `update_health_gate_seconds` (default 120) |
-| Activate succeeds, slot missing entrypoints | Immediate auto-rollback (hard local fail) |
+| Gate fails and cannot roll back (no previous slot, or it cannot run) | Status `failed` "health failed: …", not re-armed on later cycles, and jobs are not paused. It clears to `idle` by itself on the first cycle where that version runs from a runnable slot and whoami does not fail. Otherwise (the slot cannot run, or another version runs) it needs an operator |
+| Archive without the `vesyl-print` binary | Rejected before activate, and held; `apply-update` also refuses such a slot |
+| Manifest or archive of another version than desired (or than `--version`) | Refused before download (manifest) or install (archive), `version_mismatch`; held when the agent fetched it |
+| Reinstall of the version `current` points at | Swapped in one step; a bad artifact, or a stop before it is put in place, leaves the slot intact; refused (`no_exchange`, held) on a filesystem without RENAME_EXCHANGE |
+| Activate succeeds, slot missing the binary | Immediate auto-rollback (hard local fail) |
 | Agent self-restart SIGTERM during `apply-update restart` | **Not** a failure — restart is detached/`--no-block`; sticky false `failed` is recovered when version matches target |
-| Agent crash-loops before health gate runs | No process to roll back; support: `vesyl-print update rollback --restart` |
+| Power loss after `current` flipped, before `pending_health` was written | The next start marks the leftover `installing` failed; its first heartbeat turns that back into the health gate (version matches target, slot healthy), and jobs left queued wait for that gate |
+| `systemctl stop` during an OTA | See **Stopping during an OTA** in §4.3 |
+| New binary never starts (crash-loop) | No process to roll back, and the CLI is the same binary. Support, as root: `/usr/local/lib/vesyl-print/apply-update rollback /opt/vesyl-print <previous>` then `apply-update restart` |
 | Server omits desired version | No update attempt |
-| `auto_update_enabled: false` | Log desired only; support can apply via CLI on-site |
+| `auto_update_enabled: false` | The agent logs the desired version only, at info when it changes or the agent starts (debug in between); on site, `vesyl-print update apply` installs it anyway (the Python CLI installed nothing with the setting off) |
 | GitHub blocked, CDN allowed | Still works if artifacts on CDN |
 | CDN blocked | No app OTA until IT allowlists release host |
+
+While a release that cannot be installed is held, the LCD footer shows red
+`Update failed` (with the error) until the desired version changes. The lab
+Pi shows it for the dev server's 0.3.17 (§4.2.1).
 
 **Support playbook (short):**
 
 1. `vesyl-print version` / `update check`  
 2. `journalctl -u vesyl-print-agent` for update errors  
 3. `cat /var/lib/vesyl-print/update_status.json`  
-4. `vesyl-print update rollback --restart` if new slot is bad  
+4. `vesyl-print update rollback --restart` if new slot is bad (if the binary
+   itself will not run: `sudo /usr/local/lib/vesyl-print/apply-update rollback
+   /opt/vesyl-print <previous>` + `sudo /usr/local/lib/vesyl-print/apply-update restart`).
+   The manual rollback sticks: the agent holds the version it left. To
+   resume, change the desired version or run `update apply`  
 5. Confirm credentials still present under `/etc/vesyl-print/`  
 
 ---
@@ -463,7 +856,8 @@ keep app OTA as the daily driver.
 
 ### Phase 1 — Device app OTA (this repo)
 
-- [x] `update.py` + CLI + agent heartbeat hook (plan A)  
+- [x] OTA client (`update.rs`) + CLI + agent heartbeat hook (plan A)  
+- [x] Agent + CLI in Rust; Python only for the LCD; Python-era devices re-provisioned with `setup.sh`  
 - [x] apply-update + sudoers via `setup.sh`  
 - [x] CI publish to GitHub Releases  
 - [x] Factory path always uses `/opt/vesyl-print/current`  

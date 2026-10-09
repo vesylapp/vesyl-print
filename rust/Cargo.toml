@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/vesyl-print"]
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

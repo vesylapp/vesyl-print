@@ -1,17 +1,46 @@
-"""LCD messaging helpers (no Pillow / framebuffer dependency).
+"""LCD messaging helpers and the display's glue to the Rust agent.
 
 Maps agent + OTA status into short labels the display loop can paint.
 Also owns paired-page ordering and idle-home logic for touch navigation.
+No Pillow / framebuffer dependency.
+
+The display shares files and a CLI with the agent, never Python modules:
+
+- ``update_status.json`` (the agent's OTA state): :func:`read_update_status`
+  and the ``STATUS_*`` values;
+- printer rows built from the agent's ``printers.json`` (:func:`printer_rows`);
+- the ``vesyl-print`` binary of this release slot (:data:`VESYL_PRINT_BIN`),
+  run with ``--json`` for the test print (:func:`submit_test_print`) and the
+  stream page's claim (:func:`run_vesyl_print`).
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-import update as update_mod
 from config import AGENT_VERSION
+
+log = logging.getLogger("vesyl-print.display")
+
+# The running release slot (``/opt/vesyl-print/releases/<ver>/``, symlinks
+# resolved): main.py, VERSION and the vesyl-print binary sit side by side.
+SLOT_DIR = Path(__file__).resolve().parent
+VESYL_PRINT_BIN = SLOT_DIR / "vesyl-print"
+TEST_PRINT_TIMEOUT_S = 90.0
+
+# update_status.json ``status`` values (written by the agent's OTA code).
+STATUS_IDLE = "idle"
+STATUS_DOWNLOADING = "downloading"
+STATUS_INSTALLING = "installing"
+STATUS_PENDING_HEALTH = "pending_health"
+STATUS_FAILED = "failed"
+STATUS_ROLLED_BACK = "rolled_back"
 
 # RGB tuples kept here so tests can assert colors without importing main.
 OK = (80, 220, 120)
@@ -480,8 +509,6 @@ def jobs_strip_label(queued: int) -> str:
 
 def count_queue_jobs(queue_dir: Any) -> int:
     """Count ``*.json`` job files under the durable queue directory."""
-    from pathlib import Path
-
     p = Path(queue_dir) if queue_dir is not None else None
     if p is None or not p.is_dir():
         return 0
@@ -491,28 +518,258 @@ def count_queue_jobs(queue_dir: Any) -> int:
         return 0
 
 
-def _looks_like_post_activate_glitch(ust: update_mod.UpdateStatus) -> bool:
+def printer_rows(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ops / test-print rows from the agent's printer inventory items."""
+    return [
+        {
+            "name": str(item.get("display_name") or item.get("cups_name") or "—"),
+            "cups_name": str(item.get("cups_name") or ""),
+            "status": item.get("status"),
+            "message": item.get("status_message"),
+            "supports_raw": bool(item.get("supports_raw")),
+        }
+        for item in items
+    ]
+
+
+# ── vesyl-print CLI ─────────────────────────────────────────────────
+
+
+class CliError(Exception):
+    """A failed ``vesyl-print`` call; ``message`` is short and safe to show."""
+
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+def cli_option(flag: str, value: str) -> list[str]:
+    """``[flag, value]``, or ``[flag=value]`` when the value starts with ``-``
+    (clap would otherwise read it as another option)."""
+    if value.startswith("-"):
+        return [f"{flag}={value}"]
+    return [flag, value]
+
+
+def _json_object(text: str) -> dict[str, Any] | None:
+    """The JSON object a ``--json`` command printed (whole output, else the
+    last line holding one)."""
+    candidates = [text.strip()] + [ln.strip() for ln in reversed(text.splitlines())]
+    for chunk in candidates:
+        if not chunk.startswith("{"):
+            continue
+        try:
+            data = json.loads(chunk)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _stderr_reason(stderr: str) -> str:
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    for ln in lines:
+        if ln.lower().startswith("error"):
+            return ln[:200]
+    return lines[-1][:200] if lines else ""
+
+
+def run_vesyl_print(
+    args: list[str],
+    *,
+    timeout: float,
+    env: dict[str, str] | None = None,
+    binary: str | Path | None = None,
+) -> dict[str, Any]:
+    """Run ``vesyl-print <args>`` (a ``--json`` command) and return its JSON object.
+
+    Not being able to run it, a timeout, or output without a JSON object also
+    come back as ``{"ok": False, "error": <short reason>}``, so callers handle
+    one shape. A JSON ``ok: true`` with a non-zero exit status counts as failed.
+    """
+    exe = str(binary or VESYL_PRINT_BIN)
+    what = args[0] if args else "vesyl-print"
+    try:
+        proc = subprocess.run(
+            [exe, *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("vesyl-print %s timed out after %gs", what, timeout)
+        return {"ok": False, "error": f"timed out after {timeout:g}s"}
+    except FileNotFoundError:
+        log.warning("vesyl-print %s: %s not found", what, exe)
+        return {"ok": False, "error": "vesyl-print not found"}
+    except OSError as e:
+        log.warning("vesyl-print %s: cannot run %s: %s", what, exe, e)
+        return {"ok": False, "error": f"cannot run vesyl-print: {e.strerror or e}"}
+    except ValueError as e:  # e.g. an argument holding a NUL byte
+        log.warning("vesyl-print %s: bad arguments: %s", what, e)
+        return {"ok": False, "error": f"cannot run vesyl-print: {e}"}
+
+    data = _json_object(proc.stdout or "")
+    if data is None or (data.get("ok") is True and proc.returncode != 0):
+        reason = _stderr_reason(proc.stderr or "")
+        if not reason:
+            if proc.returncode < 0:
+                reason = f"vesyl-print killed by signal {-proc.returncode}"
+            else:
+                reason = f"vesyl-print exited with status {proc.returncode}"
+        log.warning(
+            "vesyl-print %s failed (exit %s): %s",
+            what,
+            proc.returncode,
+            (proc.stderr or proc.stdout or "").strip()[-500:],
+        )
+        return {"ok": False, "error": reason}
+    if data.get("ok") is not True:
+        log.info("vesyl-print %s: %s", what, data.get("error"))
+    return data
+
+
+def submit_test_print(
+    cups_name: str,
+    fmt: str,
+    *,
+    binary: str | Path | None = None,
+    timeout: float = TEST_PRINT_TIMEOUT_S,
+) -> str:
+    """Print the sample label: ``vesyl-print test-print --queue Q --format F --json``.
+
+    The binary queues it in a private job store and returns once ``lp`` took
+    it. Returns the job state (``delivered``); raises :class:`CliError`.
+    """
+    queue = (cups_name or "").strip()
+    kind = (fmt or "").strip().lower()
+    out = run_vesyl_print(
+        [
+            "test-print",
+            *cli_option("--queue", queue),
+            *cli_option("--format", kind),
+            "--json",
+        ],
+        timeout=timeout,
+        binary=binary,
+    )
+    if out.get("ok") is not True:
+        code = out.get("code")
+        raise CliError(
+            str(out.get("error") or "") or "test print failed",
+            code=str(code) if code else None,
+        )
+    return str(out.get("state") or "delivered")
+
+
+# ── update_status.json (agent OTA state) ────────────────────────────
+
+
+@dataclass
+class UpdateStatus:
+    status: str = STATUS_IDLE
+    current_version: str = ""
+    target_version: str | None = None
+    last_error: str | None = None
+    last_checked_at: str | None = None
+    channel: str | None = None
+    previous_version: str | None = None
+
+
+def package_version() -> str:
+    """This slot's version: the VERSION file next to main.py, else AGENT_VERSION."""
+    try:
+        text = (SLOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        text = ""
+    return text or AGENT_VERSION
+
+
+def parse_version(v: str) -> tuple[int, ...]:
+    core = v.split("-", 1)[0].split("+", 1)[0]
+    out: list[int] = []
+    for p in core.split("."):
+        try:
+            out.append(int(p))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
+
+
+def version_cmp(a: str, b: str) -> int:
+    """Return -1 if a<b, 0 if equal, 1 if a>b (numeric semver-ish)."""
+    ta, tb = parse_version(a), parse_version(b)
+    n = max(len(ta), len(tb))
+    ta = ta + (0,) * (n - len(ta))
+    tb = tb + (0,) * (n - len(tb))
+    if ta < tb:
+        return -1
+    if ta > tb:
+        return 1
+    return 0
+
+
+def read_update_status(path: Path | str) -> UpdateStatus | None:
+    """``update_status.json``, or None when missing or unreadable.
+
+    ``status`` defaults to ``idle`` and ``current_version`` to
+    :func:`package_version`; the other fields are passed through as stored.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return UpdateStatus(
+        status=str(data.get("status") or STATUS_IDLE),
+        current_version=str(data.get("current_version") or package_version()),
+        target_version=data.get("target_version"),
+        last_error=data.get("last_error"),
+        last_checked_at=data.get("last_checked_at"),
+        channel=data.get("channel"),
+        previous_version=data.get("previous_version"),
+    )
+
+
+def _looks_like_post_activate_glitch(ust: UpdateStatus) -> bool:
     """True when activate likely succeeded but status was marked failed (self-restart).
 
     Classic case: ``apply-update restart`` SIGTERMs the agent while it is still
     waiting; status becomes ``failed`` even though ``current`` already points at
     the new release. LCD should show Verifying…, not Update failed.
+
+    Never a gate that judged the version and could not roll it back
+    (``last_error`` starts ``health failed``, as update.rs writes it): its
+    version stays current, but it failed.
     """
     target = (ust.target_version or "").strip()
     if not target:
+        return False
+    if (ust.last_error or "").startswith("health failed"):
         return False
     err = (ust.last_error or "").lower()
     if "sigterm" in err or "apply-update" in err and "restart" in err:
         return True
     # After activate we set current_version == target before restart.
     cur = (ust.current_version or "").strip()
-    if cur and update_mod.version_cmp(cur, target) == 0:
+    if cur and version_cmp(cur, target) == 0:
         return True
     return False
 
 
 def ota_display_message(
-    ust: update_mod.UpdateStatus | None,
+    ust: UpdateStatus | None,
 ) -> tuple[str, tuple[int, int, int]] | None:
     """Map update_status → (footer label, color) for the LCD, or None if idle."""
     if ust is None:
@@ -520,21 +777,21 @@ def ota_display_message(
     target = (ust.target_version or "").strip().lstrip("v")
     s = ust.status
 
-    if s == update_mod.STATUS_DOWNLOADING:
+    if s == STATUS_DOWNLOADING:
         label = f"Updating {target}…".strip() if target else "Updating…"
         return label, WARN
-    if s == update_mod.STATUS_INSTALLING:
+    if s == STATUS_INSTALLING:
         label = f"Installing {target}…".strip() if target else "Installing…"
         return label, WARN
-    if s == update_mod.STATUS_PENDING_HEALTH:
+    if s == STATUS_PENDING_HEALTH:
         label = f"Verifying {target}…".strip() if target else "Verifying…"
         return label, WARN
-    if s == update_mod.STATUS_FAILED:
+    if s == STATUS_FAILED:
         # Don't flash red "Update failed" for self-restart false negatives.
         if _looks_like_post_activate_glitch(ust):
             label = f"Verifying {target}…".strip() if target else "Verifying…"
             return label, WARN
         return "Update failed", DOWN
-    if s == update_mod.STATUS_ROLLED_BACK:
+    if s == STATUS_ROLLED_BACK:
         return "Rolled back", WARN
     return None

@@ -7,31 +7,87 @@
 #   apply-update activate <release_dir> <current_symlink>
 #   apply-update restart
 #   apply-update rollback <install_root> <version>
+#
+# The sudoers rule lets the service user run this as root with any arguments,
+# so no argument is trusted as a path. The install root is fixed below;
+# activate accepts only <install_root>/releases/<version> and
+# <install_root>/current, rollback only <install_root> and <version>, and the
+# only thing ever written is the symlink <install_root>/current ->
+# releases/<version> (through <install_root>/current.new). <version> must be a
+# release version (so it is never "." or "..", has no "/", and is never an
+# interrupted extract's <version>.staging dir), and its slot must be a real
+# directory (not a symlink) holding the executable vesyl-print binary that the
+# systemd units and the CLI wrapper run.
 set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C
+export PATH LC_ALL
+
+# Fixed, never taken from the caller. setup.sh rewrites this line when it
+# installs the helper for a non-default INSTALL_ROOT.
+INSTALL_ROOT=/opt/vesyl-print
+# A release version, checked as update.rs is_version checks it: this
+# pattern, with a last dot-component of "staging" refused (activate_version),
+# since <version>.staging is the directory an interrupted extract leaves
+# beside its slot.
+VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$'
+# What the units exec. A slot without it (for example a Python-era release)
+# would leave the agent unable to start, so it is never activated.
+BINARY=vesyl-print
+
+die() {
+  echo "apply-update: $*" >&2
+  exit 1
+}
+
+usage() {
+  echo "Usage: $0 activate <release_dir> <current_symlink> | restart | rollback <install_root> <version>" >&2
+  exit 2
+}
 
 if [[ $EUID -ne 0 ]]; then
   echo "apply-update must run as root" >&2
   exit 1
 fi
 
+# Point $INSTALL_ROOT/current at releases/<version>, atomically.
+activate_version() {
+  local version="$1"
+  [[ "$version" =~ $VERSION_RE && "$version" != *.staging ]] ||
+    die "invalid release version: $version"
+  local releases="$INSTALL_ROOT/releases"
+  local release_dir="$releases/$version"
+  [[ -d "$releases" && ! -L "$releases" ]] || die "not a directory: $releases"
+  [[ -d "$release_dir" && ! -L "$release_dir" ]] || die "missing release_dir: $release_dir"
+  [[ -f "$release_dir/$BINARY" && -x "$release_dir/$BINARY" ]] ||
+    die "release $version has no executable $BINARY binary (not a Rust release?)"
+
+  local current_link="$INSTALL_ROOT/current"
+  local tmp="$INSTALL_ROOT/current.new"
+  # -T: never treat an existing current.new (e.g. a symlink to a directory)
+  # as a directory to create the link inside; -n: do not follow it.
+  ln -sfnT "releases/$version" "$tmp"
+  mv -Tf "$tmp" "$current_link"
+  echo "activated $release_dir -> $current_link"
+}
+
 cmd="${1:-}"
 shift || true
 
 case "$cmd" in
   activate)
-    release_dir="${1:?release_dir}"
-    current_link="${2:?current_symlink}"
-    [[ -d "$release_dir" ]] || { echo "missing release_dir: $release_dir" >&2; exit 1; }
-    parent="$(dirname "$current_link")"
-    mkdir -p "$parent"
-    rel="$(realpath --relative-to="$parent" "$release_dir" 2>/dev/null || echo "$release_dir")"
-    tmp="${current_link}.new"
-    rm -f "$tmp"
-    ln -s "$rel" "$tmp"
-    mv -Tf "$tmp" "$current_link"
-    echo "activated $release_dir -> $current_link"
+    [[ $# -eq 2 ]] || usage
+    release_dir="$1"
+    current_link="$2"
+    [[ "$current_link" == "$INSTALL_ROOT/current" ]] ||
+      die "current_symlink must be $INSTALL_ROOT/current, not: $current_link"
+    prefix="$INSTALL_ROOT/releases/"
+    [[ "$release_dir" == "$prefix"* ]] ||
+      die "release_dir must be $prefix<version>, not: $release_dir"
+    activate_version "${release_dir#"$prefix"}"
     ;;
   restart)
+    [[ $# -eq 0 ]] || usage
     # --no-block: agent calls this to restart itself; waiting would hang until
     # SIGTERM and look like an OTA failure to the parent process.
     # Restart display *before* agent so LCD always loads the new slot even if
@@ -41,14 +97,15 @@ case "$cmd" in
     echo "restarted services"
     ;;
   rollback)
-    install_root="${1:?install_root}"
-    version="${2:?version}"
-    release_dir="${install_root}/releases/${version}"
-    current_link="${install_root}/current"
-    exec "$0" activate "$release_dir" "$current_link"
+    [[ $# -eq 2 ]] || usage
+    install_root="$1"
+    version="$2"
+    # Tolerate a trailing slash from a hand-typed path, nothing else.
+    [[ "$install_root" == "$INSTALL_ROOT" || "$install_root" == "$INSTALL_ROOT/" ]] ||
+      die "install_root must be $INSTALL_ROOT, not: $install_root"
+    activate_version "$version"
     ;;
   *)
-    echo "Usage: $0 activate|restart|rollback …" >&2
-    exit 2
+    usage
     ;;
 esac
