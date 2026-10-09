@@ -1845,6 +1845,49 @@ mod tests {
         assert_eq!(body["update"]["status"], "idle");
     }
 
+    /// The unpaired path's health gate gets the agent's `stop` too: an
+    /// unpaired node whose new slot cannot run rolls back to the previous
+    /// one, but restarts nothing once the agent is stopping (that restart
+    /// would replace the `systemctl stop` under way); not stopping, it
+    /// restarts into the previous slot.
+    #[test]
+    fn unpaired_health_gate_restarts_nothing_while_stopping() {
+        for (stopping, restarts) in [(true, 0), (false, 1)] {
+            let td = tempfile::tempdir().unwrap();
+            let mut agent = test_agent(td.path(), "http://127.0.0.1:9");
+            // Counted by restarts_during, never run.
+            agent.update_env.restart = true;
+            let root = agent.update_env.install_root.clone();
+            let ver = agent_version();
+            // The gate's slot lost its binary's exec bit: a local hard fail.
+            for (version, mode) in [("0.0.1", 0o755), (ver, 0o644)] {
+                let slot = root.join("releases").join(version);
+                fs::create_dir_all(&slot).unwrap();
+                fs::write(slot.join("vesyl-print"), b"bin").unwrap();
+                crate::util::set_mode(&slot.join("vesyl-print"), mode).unwrap();
+            }
+            update::flip_current(&root, ver).unwrap();
+            let mut pending = UpdateStatus::default();
+            update::mark_pending_health(&mut pending, ver, Some("0.0.1".into()), 120, None);
+            update::write_update_status(&agent.cfg.update_status_path(), &pending).unwrap();
+
+            let stop = AtomicBool::new(stopping);
+            let (st, seen) = update::restarts_during(|| agent.run_once_with_stop(false, &stop));
+            assert_eq!(st.pairing, PairingState::Unpaired);
+            let ust = update::read_update_status(&agent.cfg.update_status_path()).unwrap();
+            assert_eq!(ust.status, update::STATUS_ROLLED_BACK, "{ust:?}");
+            let error = ust.last_error.unwrap_or_default();
+            assert!(
+                error.starts_with("health failed: current slot has no executable")
+                    && error.ends_with("; rolled back to 0.0.1"),
+                "{error}"
+            );
+            let current = fs::read_link(root.join("current")).unwrap();
+            assert!(current.ends_with("0.0.1"), "{}", current.display());
+            assert_eq!(seen, restarts, "stopping: {stopping}");
+        }
+    }
+
     #[test]
     fn heartbeat_failure_keeps_last_seen() {
         let td = tempfile::tempdir().unwrap();
