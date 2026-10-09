@@ -369,6 +369,10 @@ pub enum JobOutcome {
     /// keeps its queue record, and the next start prints it, or (once `lp`
     /// has it) finishes following it in CUPS.
     Interrupted,
+    /// Canceled (`job_canceled`, on the cable thread) while it ran, before
+    /// `lp`: not printed, its queue record gone, nothing reported (the cloud
+    /// canceled it).
+    Canceled,
 }
 
 impl JobOutcome {
@@ -377,6 +381,7 @@ impl JobOutcome {
             JobOutcome::Printed => "printed",
             JobOutcome::Delivered => "delivered",
             JobOutcome::Interrupted => "interrupted",
+            JobOutcome::Canceled => "canceled",
         }
     }
 }
@@ -1037,6 +1042,34 @@ struct LocalState {
     attempts: u32,
     /// Set once `lp` has accepted the job.
     submitted: Option<Submission>,
+    /// The run of the agent ([`this_run`]) that recorded the last attempt.
+    /// One that was stopping when it ended ([`JobStore::note_stop_began`])
+    /// was killed by the stop (systemd's SIGKILL after `TimeoutStopSec`, a
+    /// second signal), not by the job: that attempt does not count.
+    run: Option<String>,
+}
+
+/// This run of the agent (this process): a random id, the same for every
+/// call, recorded with each attempt ([`LocalState::run`]).
+fn this_run() -> &'static str {
+    static RUN: OnceLock<String> = OnceLock::new();
+    RUN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+/// Runs kept in [`JobStore::stop_marker_path`]: the newest ones, enough for
+/// many starts that were stopped before reaching an old record.
+const STOPPED_RUNS_KEPT: usize = 32;
+
+/// Held while a queue record is rewritten in place ([`JobStore::write_local`])
+/// or a canceled job's record is dropped ([`JobStore::cancel`]): a
+/// `job_canceled` arrives on the cable thread while the main loop runs the
+/// job, and the rewrite must not bring back the record it just deleted.
+static RECORDS: Mutex<()> = Mutex::new(());
+
+fn lock_records() -> MutexGuard<'static, ()> {
+    RECORDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// `lp` accepted the job: CUPS has it.
@@ -1070,11 +1103,15 @@ impl LocalState {
                 cups_job_id: text("cups_job_id"),
                 submitted_at,
             }),
+            run: text("run"),
         }
     }
 
     fn to_value(&self) -> Value {
         let mut v = json!({ "attempts": self.attempts });
+        if let Some(run) = &self.run {
+            v["run"] = json!(run);
+        }
         if let Some(s) = &self.submitted {
             v["cups_job_id"] = json!(s.cups_job_id);
             v["submitted_at"] = json!(s.submitted_at);
@@ -1159,8 +1196,25 @@ impl JobStore {
 
     /// What queue/<job_id>.json records about earlier runs of the job:
     /// nothing for a record without notes, or one that cannot be read. Only
-    /// the notes are kept from the file, not its content.
+    /// the notes are kept from the file, not its content. An attempt that a
+    /// stop ended ([`LocalState::run`]) is not counted.
     fn local_state(&self, job_id: &str) -> LocalState {
+        let mut local = self.recorded_state(job_id);
+        if local.submitted.is_none()
+            && local.attempts > 0
+            && local
+                .run
+                .as_ref()
+                .is_some_and(|run| self.stopped_runs().contains(run))
+        {
+            local.attempts -= 1;
+            local.run = None;
+        }
+        local
+    }
+
+    /// [`JobStore::local_state`] as the record has it.
+    fn recorded_state(&self, job_id: &str) -> LocalState {
         #[derive(Deserialize)]
         struct Notes {
             // LOCAL_KEY (an attribute takes a literal only).
@@ -1180,6 +1234,12 @@ impl JobStore {
     /// Rewrite queue/<job.id>.json as `job` with the notes `local`, as
     /// durably as [`JobStore::write_queue`] (a new file, fsynced, renamed
     /// over the old one, directory fsynced).
+    ///
+    /// Only a record that is there, of a job not yet processed, is
+    /// rewritten; anything else fails with `NotFound` and creates nothing. A
+    /// `job_canceled` ([`JobStore::cancel`]) may have deleted the record
+    /// while the job ran, and bringing it back would have the next start
+    /// report the canceled job printed (or print it).
     fn write_local(&self, job: &PrintJob, local: &LocalState) -> std::io::Result<()> {
         if !valid_job_id(&job.id) {
             return Err(invalid_id_error());
@@ -1188,7 +1248,69 @@ impl JobStore {
         data.insert(LOCAL_KEY.into(), local.to_value());
         let mut raw = serde_json::to_string_pretty(&data).map_err(std::io::Error::other)?;
         raw.push('\n');
+        let _records = lock_records();
+        if !self.has_queue_file(&job.id) || self.is_processed(&job.id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("job {} has no queue record (canceled?)", job.id),
+            ));
+        }
         write_durable(&self.queue_path(&job.id), raw.as_bytes(), 0o600, true)
+    }
+
+    /// Drop a canceled job: its queue record goes, and the processed marker
+    /// keeps a late redelivery from printing it. Never interleaved with
+    /// [`JobStore::write_local`], so a job running meanwhile cannot bring
+    /// the record back.
+    pub fn cancel(&self, job_id: &str) -> std::io::Result<()> {
+        if !valid_job_id(job_id) {
+            return Err(invalid_id_error());
+        }
+        let _records = lock_records();
+        if self.is_processed(job_id) {
+            self.delete_queue(job_id);
+            return Ok(());
+        }
+        if self.has_queue_file(job_id) {
+            log::info!(target: LOG, "job {job_id} canceled — dropping queue file");
+            self.delete_queue(job_id);
+        }
+        self.mark_processed(job_id)
+    }
+
+    /// Where the agent lists its runs that began to stop
+    /// (`queue/.stopped-runs`, one [`this_run`] id per line, newest last):
+    /// not a `*.json` file, so it is never taken for a job.
+    pub fn stop_marker_path(&self) -> PathBuf {
+        self.queue_dir.join(".stopped-runs")
+    }
+
+    /// Record that this run began to stop (SIGTERM or SIGINT): whatever
+    /// ends it from here on (systemd's SIGKILL once `TimeoutStopSec` runs
+    /// out, a second signal) is the stop, and the attempt in flight then
+    /// does not count as a death in its job ([`JobStore::local_state`]).
+    pub fn note_stop_began(&self) -> std::io::Result<()> {
+        let mut runs = self.stopped_runs();
+        let run = this_run().to_string();
+        if runs.contains(&run) {
+            return Ok(());
+        }
+        runs.push(run);
+        let skip = runs.len().saturating_sub(STOPPED_RUNS_KEPT);
+        let text: String = runs[skip..].iter().map(|r| format!("{r}\n")).collect();
+        self.ensure()?;
+        write_durable(&self.stop_marker_path(), text.as_bytes(), 0o600, true)
+    }
+
+    /// The runs [`JobStore::note_stop_began`] recorded.
+    fn stopped_runs(&self) -> Vec<String> {
+        fs::read_to_string(self.stop_marker_path())
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
     }
 
     /// Write the processed/<job_id> marker (a timestamp). It goes through
@@ -1729,8 +1851,10 @@ pub struct Pipeline {
     pub work_dir: Option<PathBuf>,
     /// Set when the agent is stopping (the agent's stop flag; never, by
     /// default): the drain takes no further job, no job goes to `lp`, and a
-    /// CUPS wait ends early. Each such job keeps its queue record for the
-    /// next start ([`JobOutcome::Interrupted`]).
+    /// CUPS wait ends early; a conversion or `lp` that fails meanwhile (the
+    /// stop's signal may have killed it) is no failure of the job. Each such
+    /// job keeps its queue record for the next start
+    /// ([`JobOutcome::Interrupted`]).
     pub stop: Arc<AtomicBool>,
 }
 
@@ -1865,8 +1989,15 @@ impl Pipeline {
         let attempt = LocalState {
             attempts: local.attempts + 1,
             submitted: None,
+            run: Some(this_run().to_string()),
         };
         if let Err(e) = store.write_local(job, &attempt) {
+            if store.is_processed(job_id) {
+                return Ok(self.canceled(job, store));
+            }
+            // The record may be in place, its directory fsync the failure:
+            // the agent lives on, so this attempt must not count.
+            self.end_attempt(job, store, &local);
             let e = JobError::new(format!("could not record the attempt: {e}"), "job_error");
             return Err(self.failed(job, store, e));
         }
@@ -1899,6 +2030,14 @@ impl Pipeline {
             self.end_attempt(job, store, &local);
         }
         result.map_err(|e| self.failed(job, store, e))
+    }
+
+    /// The job was canceled while it ran ([`JobStore::cancel`]): drop any
+    /// queue record its run (re)wrote meanwhile; nothing is reported.
+    fn canceled(&self, job: &PrintJob, store: &JobStore) -> JobOutcome {
+        log::info!(target: LOG, "job {} canceled while it ran — not printed", job.id);
+        store.delete_queue(&job.id);
+        JobOutcome::Canceled
     }
 
     /// Put back `before`, the record's notes from before an attempt that
@@ -1951,7 +2090,17 @@ impl Pipeline {
             zpl_opts
                 .entry("cups_name")
                 .or_insert_with(|| json!(job.cups_name));
-            let zpl_path = zpl::write_zpl_file(&path, &conv_dir, job_id, &zpl_opts)?;
+            let zpl_path = match zpl::write_zpl_file(&path, &conv_dir, job_id, &zpl_opts) {
+                Ok(p) => p,
+                // The stop's SIGTERM reached the renderer too (Ctrl-C's
+                // process group, a unit without KillMode=mixed): not the
+                // job's failure, and not a permanent one.
+                Err(e) if self.stopping() => {
+                    log::info!(target: LOG, "stopping — job {job_id} conversion ended ({}); it stays queued for the next start", e.message);
+                    return Ok(JobOutcome::Interrupted);
+                }
+                Err(e) => return Err(e.into()),
+            };
             log::info!(
                 target: LOG,
                 "job {job_id} converted {} → ZPL for raw queue {}",
@@ -1972,7 +2121,11 @@ impl Pipeline {
             log::info!(target: LOG, "stopping — job {job_id} not sent to CUPS; it stays queued for the next start");
             return Ok(JobOutcome::Interrupted);
         }
-        let cups_id = (self.lp)(
+        // Nor does a job canceled meanwhile.
+        if store.is_processed(job_id) {
+            return Ok(self.canceled(job, store));
+        }
+        let lp_result = (self.lp)(
             &job.cups_name,
             &path,
             &LpArgs {
@@ -1980,7 +2133,17 @@ impl Pipeline {
                 copies,
                 raw: use_raw,
             },
-        )?;
+        );
+        let cups_id = match lp_result {
+            Ok(id) => id,
+            // As for the conversion: the stop's signal may have ended `lp`.
+            // The record stays for the next start.
+            Err(e) if self.stopping() => {
+                log::info!(target: LOG, "stopping — job {job_id} lp ended ({}); it stays queued for the next start", e.message);
+                return Ok(JobOutcome::Interrupted);
+            }
+            Err(e) => return Err(e),
+        };
         let cups_job = cups_id.filter(|s| !s.trim().is_empty());
         // On disk before anything else: should the agent stop or die before
         // the job is marked processed, the next start must not print it again.
@@ -4109,6 +4272,7 @@ mod tests {
                 &LocalState {
                     attempts: 1,
                     submitted: Some(sub),
+                    run: None,
                 },
             )
             .unwrap();
@@ -4242,9 +4406,76 @@ mod tests {
         let local = LocalState {
             attempts,
             submitted: None,
+            run: None,
         };
         st.write_local(&j, &local).unwrap();
         j
+    }
+
+    /// J5 with a stop: a stop that outlasts TimeoutStopSec (a slow content
+    /// fetch, a long render) ends in systemd's SIGKILL with the attempt on
+    /// disk. The stop was recorded first, so that kill is not a death in
+    /// the job, and stops alone never retire it as crash_loop.
+    #[test]
+    fn an_attempt_a_stop_ended_is_not_a_death() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        died_in(&st, "slow", MAX_ATTEMPTS - 1);
+        // The run is stopping when lp runs; what a SIGKILL there leaves on
+        // disk is the record as it is then.
+        let left = Arc::new(Mutex::new(String::new()));
+        let (s, l) = (st.clone(), left.clone());
+        let p = Pipeline {
+            lp: Arc::new(move |_, _, _| {
+                s.note_stop_began().unwrap();
+                *l.lock().unwrap() = fs::read_to_string(s.queue_path("slow")).unwrap();
+                Ok(None)
+            }),
+            ..test_pipeline()
+        };
+        p.process(&png_job("slow"), &st).unwrap();
+        let left = left.lock().unwrap().clone();
+        assert_eq!(
+            serde_json::from_str::<Value>(&left).unwrap()[LOCAL_KEY]["attempts"],
+            MAX_ATTEMPTS
+        );
+        fs::remove_file(st.processed_path("slow")).unwrap();
+        fs::write(st.queue_path("slow"), &left).unwrap();
+        assert_eq!(st.local_state("slow").attempts, MAX_ATTEMPTS - 1);
+        assert_eq!(
+            test_pipeline().drain(&st),
+            [("slow".to_string(), "delivered".to_string())]
+        );
+
+        // A run that never began to stop died in the job: that counts.
+        let j = png_job("oom");
+        st.write_queue(&j).unwrap();
+        let local = LocalState {
+            attempts: MAX_ATTEMPTS,
+            submitted: None,
+            run: Some("a-run-that-died".into()),
+        };
+        st.write_local(&j, &local).unwrap();
+        assert_eq!(
+            test_pipeline().drain(&st),
+            [("oom".to_string(), format!("error:{CRASH_LOOP}"))]
+        );
+
+        // Only the newest runs are kept, this one once.
+        fs::write(
+            st.stop_marker_path(),
+            (0..STOPPED_RUNS_KEPT + 5)
+                .map(|i| format!("run-{i}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        st.note_stop_began().unwrap();
+        st.note_stop_began().unwrap();
+        let runs = st.stopped_runs();
+        assert_eq!(runs.len(), STOPPED_RUNS_KEPT);
+        assert_eq!(runs.last().map(String::as_str), Some(this_run()));
+        assert!(!runs.contains(&"run-5".to_string()));
+        assert!(st.list_queued_ids().is_empty(), "the marker is no job");
     }
 
     /// J5: the attempt is on disk before the steps that can kill the agent
@@ -4334,6 +4565,192 @@ mod tests {
         assert_eq!(
             test_pipeline().drain(&st),
             [("offline".to_string(), "delivered".to_string())]
+        );
+    }
+
+    /// Reports as `<state>:<detail>`; the Printing report also sets `stop`,
+    /// as a SIGTERM arriving just after the job started would.
+    fn stop_once_printing(events: &Events, stop: &Arc<AtomicBool>) -> StateFn {
+        let (ev, stop) = (events.clone(), stop.clone());
+        Arc::new(move |_, state, detail| {
+            ev.lock()
+                .unwrap()
+                .push(format!("{}:{}", state.as_str(), detail.unwrap_or("")));
+            if state == JobState::Printing {
+                stop.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        })
+    }
+
+    /// A stop kills the renderer (systemd's SIGTERM reaches every process of
+    /// the unit unless KillMode=mixed, Ctrl-C the whole process group): the
+    /// conversion error it causes is the stop's doing, not the job's, so the
+    /// job stays queued for the next start instead of being retired as a
+    /// permanent `pdf_render` failure.
+    #[test]
+    fn a_conversion_failing_while_stopping_leaves_the_job_queued() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(&td.path().join("state"));
+        let pdf = td.path().join("label.pdf");
+        fs::write(&pdf, b"%PDF-1.4\nno pages: every renderer fails on this\n").unwrap();
+        let j = job(
+            "pdfjob",
+            "Zebra_ZD220-203dpi_ZPL",
+            "local_path",
+            pdf.display().to_string(),
+        );
+        let events: Events = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let p = Pipeline {
+            report_state: stop_once_printing(&events, &stop),
+            supports_raw: Arc::new(|_| Ok(true)),
+            lp: Arc::new(|_, _, _| panic!("no lp once stopping")),
+            stop: stop.clone(),
+            ..test_pipeline()
+        };
+        assert_eq!(p.process(&j, &st).unwrap(), JobOutcome::Interrupted);
+        assert_eq!(*events.lock().unwrap(), ["printing:"]);
+        assert!(st.has_queue_file("pdfjob"));
+        assert!(!st.failed_dir().join("pdfjob.json").exists());
+        assert_eq!(notes(&st, "pdfjob")["attempts"], 0, "attempt taken back");
+
+        // Not stopping, the same failure is the job's own, and permanent.
+        let p = Pipeline {
+            stop: Arc::default(),
+            report_state: Arc::new(|_, _, _| Ok(())),
+            ..p
+        };
+        let err = p.process(&j, &st).unwrap_err();
+        assert_eq!(err.code, "pdf_render", "{}", err.message);
+        assert!(st.failed_dir().join("pdfjob.json").is_file());
+    }
+
+    /// An `lp` the stop killed mid-submit fails: the job stays queued for
+    /// the next start, reported as nothing but printing, its attempt taken
+    /// back.
+    #[test]
+    fn an_lp_failing_while_stopping_leaves_the_job_queued() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let events: Events = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let p = Pipeline {
+            report_state: stop_once_printing(&events, &Arc::default()),
+            lp: Arc::new(move |_, _, _| {
+                s.store(true, Ordering::SeqCst);
+                Err(JobError::new("lp: killed by SIGTERM", "unknown_queue"))
+            }),
+            stop: stop.clone(),
+            ..test_pipeline()
+        };
+        assert_eq!(
+            p.process(&png_job("lpkilled"), &st).unwrap(),
+            JobOutcome::Interrupted
+        );
+        assert_eq!(*events.lock().unwrap(), ["printing:"]);
+        assert!(st.has_queue_file("lpkilled"));
+        assert_eq!(notes(&st, "lpkilled")["attempts"], 0);
+    }
+
+    /// A job_canceled (handled on the cable thread) that lands while the job
+    /// is being acked or reported: the attempt record must not bring the
+    /// deleted queue file back, so a later drain never reports the canceled
+    /// job printed, and nothing goes to `lp`.
+    #[test]
+    fn a_cancel_during_the_ack_is_not_undone_by_the_attempt_record() {
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let events: Events = Arc::default();
+        let s = st.clone();
+        let p = Pipeline {
+            ack: Arc::new(move |j| {
+                crate::agent::handle_job_canceled(&j.id, &s).unwrap();
+                Ok(())
+            }),
+            report_state: per_job_state(&events),
+            fetch_url: Arc::new(|_| Err(Box::new(HttpStatusError { status: 503 }))),
+            lp: Arc::new(|_, _, _| panic!("a canceled job must not print")),
+            ..test_pipeline()
+        };
+        let j = job(
+            "cj",
+            "TestPrinter",
+            "png_uri",
+            "https://x.test/l.png".into(),
+        );
+        let _ = p.process(&j, &st);
+        assert!(!st.has_queue_file("cj"), "queue record brought back");
+        assert!(st.is_processed("cj"));
+        assert!(test_pipeline().drain(&st).is_empty());
+        assert!(
+            !events.lock().unwrap().iter().any(|e| e == "cj:printed"),
+            "{:?}",
+            events.lock().unwrap()
+        );
+
+        // Canceled while its content downloads: the content arrives, but
+        // the job never reaches lp, and its record stays gone.
+        let s = st.clone();
+        let p = Pipeline {
+            ack: Arc::new(|_| Ok(())),
+            fetch_url: Arc::new(move |_| {
+                crate::agent::handle_job_canceled("cj2", &s).unwrap();
+                Ok(base64::engine::general_purpose::STANDARD
+                    .decode(PNG_1X1_B64)
+                    .unwrap())
+            }),
+            ..p
+        };
+        let j = job(
+            "cj2",
+            "TestPrinter",
+            "png_uri",
+            "https://x.test/l.png".into(),
+        );
+        let _ = p.process(&j, &st);
+        assert!(!st.has_queue_file("cj2"));
+        assert!(st.is_processed("cj2"));
+    }
+
+    /// The attempt record renamed into place, but its directory fsync failed
+    /// (a failing SD card): the agent did not die, so the attempt is taken
+    /// back, and repeats of it never retire the job as crash_loop.
+    #[test]
+    fn a_failed_attempt_write_is_not_counted_as_a_death() {
+        if is_root() {
+            // Root opens queue/ whatever its mode: its fsync cannot fail here.
+            eprintln!("skipping: running as root");
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let st = store(td.path());
+        let lp_calls = Arc::new(AtomicUsize::new(0));
+        let (q, calls) = (st.queue_dir.clone(), lp_calls.clone());
+        let p = Pipeline {
+            // After write_queue's own fsync: only the attempt's fails.
+            ack: Arc::new(move |_| {
+                fs::set_permissions(&q, fs::Permissions::from_mode(0o300)).unwrap();
+                Ok(())
+            }),
+            lp: Arc::new(move |_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }),
+            ..test_pipeline()
+        };
+        let j = png_job("fsyncfail");
+        for _ in 0..=MAX_ATTEMPTS {
+            let err = p.process(&j, &st).unwrap_err();
+            fs::set_permissions(&st.queue_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(err.code, "job_error", "{}", err.message);
+            assert_eq!(notes(&st, "fsyncfail")["attempts"], 0);
+        }
+        assert_eq!(lp_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            test_pipeline().drain(&st),
+            [("fsyncfail".to_string(), "delivered".to_string())]
         );
     }
 
