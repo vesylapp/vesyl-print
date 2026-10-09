@@ -544,12 +544,12 @@ impl Agent {
     /// its health gate, or this process waits for its own restart. The
     /// update status counts as the next heartbeat will find it: a `failed`
     /// one that heartbeat turns back into a health gate (an install cut off
-    /// after its flip, see [`update::recover_false_update_failure`], which
-    /// writes nothing) pauses jobs already.
+    /// after its flip, see [`update::should_pause_jobs_once_recovered`],
+    /// which writes and logs nothing) pauses jobs already.
     fn jobs_paused(&self) -> bool {
-        let st = update::read_update_status(&self.cfg.update_status_path())
-            .map(|st| update::recover_false_update_failure(st, &self.cfg, &self.update_env));
-        update::should_pause_jobs(st.as_ref()) || self.awaiting_own_restart()
+        let st = update::read_update_status(&self.cfg.update_status_path());
+        update::should_pause_jobs_once_recovered(st.as_ref(), &self.update_env)
+            || self.awaiting_own_restart()
     }
 
     fn prune_processed_markers(&self) {

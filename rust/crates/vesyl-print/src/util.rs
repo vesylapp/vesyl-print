@@ -239,7 +239,7 @@ fn write_durable_with(
         tmp.set_permissions(fs::Permissions::from_mode(mode))?;
         (&tmp).write_all(data)?;
         tmp.sync_all()?;
-        rename_at(&dir, &tmp_name, name)
+        rename_at(&dir, &tmp_name, &dir, name)
     })();
     if let Err(e) = written {
         let _ = unlink_at(&dir, &tmp_name);
@@ -259,32 +259,39 @@ fn parent_or_cwd(path: &Path) -> &Path {
     }
 }
 
-/// A new file `.<name>.<random>.tmp` in `dir`, mode 0600, open for writing.
-/// O_EXCL: never a file that was there already, nor a symlink planted at
-/// that name.
+/// A new file `.<name>.<random>.tmp` in `dir`, mode 0600, open for writing
+/// ([`create_file_at`]).
 fn create_temp(dir: &File, name: &OsStr) -> io::Result<(OsString, File)> {
-    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let mut taken = None;
     for _ in 0..TEMP_TRIES {
         let random = uuid::Uuid::new_v4().simple().to_string();
         let mut tmp = OsString::from(".");
         tmp.push(name);
         tmp.push(format!(".{}.tmp", &random[..12]));
-        let c = CString::new(tmp.as_bytes())?;
-        // SAFETY: `dir` is an open descriptor and `c` a NUL-terminated
-        // string; O_CREAT reads the mode passed.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o600 as libc::c_uint) };
-        if fd >= 0 {
-            // SAFETY: `fd` was just opened here and nothing else owns it.
-            return Ok((tmp, unsafe { File::from_raw_fd(fd) }));
+        match create_file_at(dir, &tmp, 0o600) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => taken = Some(e),
+            Err(e) => return Err(e),
         }
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
-        taken = Some(e);
     }
     Err(taken.unwrap_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists)))
+}
+
+/// A new file `name` in `dir` (a directory from [`open_dir_owned`]), open
+/// for reading and writing, with `mode` less the umask. O_EXCL and
+/// O_NOFOLLOW: never a file that was there already, nor a symlink planted
+/// at that name (AlreadyExists for both).
+pub fn create_file_at(dir: &File, name: &OsStr, mode: u32) -> io::Result<File> {
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let c = CString::new(name.as_bytes())?;
+    // SAFETY: `dir` is an open descriptor and `c` a NUL-terminated string;
+    // O_CREAT reads the mode passed.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode as libc::c_uint) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened here and nothing else owns it.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// `(uid, gid)` of a file or directory.
@@ -305,7 +312,8 @@ fn owner_for_rewrite(euid: u32, existing: Option<Owner>, dir: Option<Owner>) -> 
     }
 }
 
-fn euid() -> u32 {
+/// This process's effective uid.
+pub fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }
@@ -371,6 +379,22 @@ pub fn create_dir_all_owned(dir: &Path) -> io::Result<()> {
     match root_walk() {
         Some(trusted) => walk_dir(dir, trusted, true, &|_| {}).map(drop),
         None => fs::create_dir_all(dir),
+    }
+}
+
+/// [`create_dir_all_owned`], returning the directory it reached, open: a
+/// handle (O_PATH) to make, rename and remove names in with the `*_at`
+/// functions here. Whatever is swapped in for a name on the way afterwards
+/// (the service user may rename anything in a directory it owns), they act
+/// in the directory that was opened. As the service user (the agent), the
+/// path is resolved as usual, symlinks followed.
+pub fn open_dir_owned(dir: &Path) -> io::Result<File> {
+    match root_walk() {
+        Some(trusted) => walk_dir(dir, trusted, true, &|_| {}),
+        None => {
+            fs::create_dir_all(dir)?;
+            open_dir(dir)
+        }
     }
 }
 
@@ -504,10 +528,10 @@ fn open_dir(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// The directory `name` in `dir`, as [`open_dir`] opens one. A symlink
-/// there is not followed: the open fails (ENOTDIR, as O_DIRECTORY is
+/// The directory `name` in `dir`, opened as [`open_dir_owned`] opens one. A
+/// symlink there is not followed: the open fails (ENOTDIR, as O_DIRECTORY is
 /// checked first).
-fn open_dir_at(dir: &File, name: &OsStr) -> io::Result<File> {
+pub fn open_dir_at(dir: &File, name: &OsStr) -> io::Result<File> {
     open_at(
         dir,
         name,
@@ -562,17 +586,20 @@ fn read_link_at(dir: &File, name: &OsStr) -> io::Result<PathBuf> {
 /// mkdirat(2) with `create_dir_all`'s mode: `Ok(true)` when this call made
 /// `name`, `Ok(false)` when something already has that name.
 fn mkdir_at(parent: &File, name: &OsStr) -> io::Result<bool> {
+    match create_dir_at(parent, name, 0o777) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// A new directory `name` in `dir` (mkdirat(2)), with `mode` less the
+/// umask. Something already at that name, a symlink included, is an error
+/// (AlreadyExists).
+pub fn create_dir_at(dir: &File, name: &OsStr, mode: u32) -> io::Result<()> {
     let c = CString::new(name.as_bytes())?;
-    // SAFETY: `parent` is an open descriptor and `c` a NUL-terminated string.
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o777) } == 0 {
-        return Ok(true);
-    }
-    let e = io::Error::last_os_error();
-    if e.kind() == io::ErrorKind::AlreadyExists {
-        Ok(false)
-    } else {
-        Err(e)
-    }
+    // SAFETY: `dir` is an open descriptor and `c` a NUL-terminated string.
+    os_result(unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) })
 }
 
 /// Hand `dir`, just made by root's walk (at `at`), to `to` through its
@@ -594,17 +621,23 @@ fn chown_at(dir: &File, name: &OsStr, (uid, gid): Owner, flags: libc::c_int) -> 
     os_result(unsafe { libc::fchownat(dir.as_raw_fd(), c.as_ptr(), uid, gid, flags) })
 }
 
-/// rename(2) `from` to `to`, both in `dir`.
-fn rename_at(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+/// rename(2) `from` in `from_dir` to `to` in `to_dir` (renameat(2)): a
+/// symlink at either name is renamed or replaced itself, never followed.
+pub fn rename_at(from_dir: &File, from: &OsStr, to_dir: &File, to: &OsStr) -> io::Result<()> {
     let (from, to) = (CString::new(from.as_bytes())?, CString::new(to.as_bytes())?);
-    // SAFETY: `dir` is an open descriptor and both strings are NUL-terminated.
+    // SAFETY: both are open descriptors and both strings are NUL-terminated.
     os_result(unsafe {
-        libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr())
+        libc::renameat(
+            from_dir.as_raw_fd(),
+            from.as_ptr(),
+            to_dir.as_raw_fd(),
+            to.as_ptr(),
+        )
     })
 }
 
-/// unlink(2) `name` in `dir`.
-fn unlink_at(dir: &File, name: &OsStr) -> io::Result<()> {
+/// unlink(2) `name` in `dir` (unlinkat(2)): a symlink is removed itself.
+pub fn unlink_at(dir: &File, name: &OsStr) -> io::Result<()> {
     let c = CString::new(name.as_bytes())?;
     // SAFETY: as above.
     os_result(unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) })
@@ -646,16 +679,17 @@ fn dir_synced(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-/// Hand `file`, just created in `dir`, to `dir`'s owner when root created it
-/// (an operator running the CLI), as [`write_durable`] does with the files it
-/// writes. Through the open file, so nothing is resolved by path. Best
+/// Hand `file`, just created in the open directory `dir` (at `at`, for
+/// messages), to `dir`'s owner when root created it (an operator running
+/// the CLI), as [`write_durable`] does with the files it writes. Through
+/// the open file and directory, so nothing is resolved by path. Best
 /// effort: a failure is logged.
-pub fn hand_new_file_to_dir_owner(file: &File, dir: &Path) {
+pub fn hand_new_file_to_dir_owner(file: &File, dir: &File, at: &Path) {
     let euid = euid();
     if euid != 0 {
         return;
     }
-    let dir_owner = fs::metadata(dir).ok().map(|m| owner(&m));
+    let dir_owner = dir.metadata().ok().map(|m| owner(&m));
     let Some((uid, gid)) = owner_for_rewrite(euid, None, dir_owner) else {
         return;
     };
@@ -663,7 +697,7 @@ pub fn hand_new_file_to_dir_owner(file: &File, dir: &Path) {
         log::warn!(
             target: LOG,
             "could not hand a new file in {} to uid {uid} gid {gid}: {e}",
-            dir.display()
+            at.display()
         );
     }
 }
@@ -729,6 +763,41 @@ fn hand_entry_over(
         hand_entry_over(&sub, &entry.file_name(), &entry.path(), to, before_entries)?;
     }
     chown_at(&sub, OsStr::new(""), to, libc::AT_EMPTY_PATH)
+}
+
+/// The open file or directory `file` as a path: its link in
+/// `/proc/self/fd`, which leads to it, not to wherever its name is now.
+pub fn fd_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Take write permission from group and others on the open directory
+/// `dir` and on all it holds, at any depth, whatever mode it was made
+/// with (the umask's, say). Through descriptors: no name is followed, and
+/// a symlink is left as it is.
+pub fn clear_group_other_write(dir: &File) -> io::Result<()> {
+    clear_group_other_write_on(dir)?;
+    for entry in fs::read_dir(fd_path(dir))? {
+        let name = entry?.file_name();
+        let entry = open_at(dir, &name, libc::O_PATH | libc::O_NOFOLLOW)?;
+        let kind = entry.metadata()?.file_type();
+        if kind.is_dir() {
+            clear_group_other_write(&entry)?;
+        } else if kind.is_file() {
+            clear_group_other_write_on(&entry)?;
+        }
+    }
+    Ok(())
+}
+
+/// [`clear_group_other_write`] for `file` alone, open (O_PATH will do):
+/// chmod(2) through [`fd_path`].
+fn clear_group_other_write_on(file: &File) -> io::Result<()> {
+    let mode = file.metadata()?.mode() & 0o7777;
+    if mode & 0o022 == 0 {
+        return Ok(());
+    }
+    fs::set_permissions(fd_path(file), fs::Permissions::from_mode(mode & !0o022))
 }
 
 pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
@@ -965,6 +1034,105 @@ mod tests {
                 .map(|e| e.unwrap().file_name())
                 .collect();
             assert_eq!(left, ["job-1.json"], "temp file left behind ({walk:?})");
+        }
+    }
+
+    /// A directory [`open_dir_owned`] opened is where the `*_at` functions
+    /// act, whatever is swapped in for its name afterwards: a file made,
+    /// renamed and removed there, a directory made there. A symlink at a
+    /// name is never followed, nor taken for a new file or directory.
+    #[test]
+    fn names_made_in_an_open_dir_stay_in_it() {
+        let td = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let update = td.path().join("install").join("update");
+        let dir = open_dir_owned(&update).unwrap();
+        assert!(update.is_dir());
+        swap_dir_for_link(&update, elsewhere.path());
+
+        let part = create_file_at(&dir, OsStr::new("a.part"), 0o644).unwrap();
+        (&part).write_all(b"artifact").unwrap();
+        rename_at(&dir, OsStr::new("a.part"), &dir, OsStr::new("a")).unwrap();
+        create_dir_at(&dir, OsStr::new("private"), 0o700).unwrap();
+        let private = open_dir_at(&dir, OsStr::new("private")).unwrap();
+        rename_at(&dir, OsStr::new("a"), &private, OsStr::new("a")).unwrap();
+        let moved = td.path().join("install/update.moved");
+        assert_eq!(fs::read(moved.join("private/a")).unwrap(), b"artifact");
+        assert_eq!(
+            fs::metadata(moved.join("private/a")).unwrap().mode() & 0o133,
+            0
+        );
+        assert_eq!(
+            fs::metadata(moved.join("private")).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+
+        // Nothing is made over what is there, a symlink included.
+        std::os::unix::fs::symlink(elsewhere.path().join("x"), moved.join("link")).unwrap();
+        for name in ["link", "private"] {
+            let err = create_file_at(&dir, OsStr::new(name), 0o644).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{name}");
+            let err = create_dir_at(&dir, OsStr::new(name), 0o700).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{name}");
+        }
+        let err = open_dir_at(&dir, OsStr::new("link")).unwrap_err();
+        assert!(refused_link(&err), "{err}");
+        unlink_at(&dir, OsStr::new("link")).unwrap();
+        assert_eq!(
+            unlink_at(&dir, OsStr::new("link")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    /// As the agent, the directory is reached as `create_dir_all` reaches
+    /// it: a symlinked directory is followed.
+    #[test]
+    fn the_service_user_opens_a_symlinked_dir() {
+        if euid() == 0 {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let real = td.path().join("real");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, td.path().join("install")).unwrap();
+        let dir = open_dir_owned(&td.path().join("install").join("update")).unwrap();
+        create_file_at(&dir, OsStr::new("a"), 0o644).unwrap();
+        assert!(real.join("update/a").is_file());
+    }
+
+    /// [`clear_group_other_write`] takes write from group and others on a
+    /// tree, at any depth, and keeps every other bit. A symlink in it, to a
+    /// file or a directory elsewhere, is not followed: what it points at
+    /// keeps its mode.
+    #[test]
+    fn group_and_others_lose_write_in_a_tree_and_nowhere_else() {
+        let td = tempfile::tempdir().unwrap();
+        let tree = td.path().join("tree");
+        let elsewhere = td.path().join("elsewhere");
+        fs::create_dir_all(tree.join("lib/web")).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        for file in [tree.join("lib/web/a.py"), elsewhere.join("f")] {
+            fs::write(file, b"x").unwrap();
+        }
+        std::os::unix::fs::symlink(elsewhere.join("f"), tree.join("file-link")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tree.join("dir-link")).unwrap();
+        let modes = [
+            (tree.clone(), 0o777, 0o755),
+            (tree.join("lib"), 0o1777, 0o1755),
+            (tree.join("lib/web"), 0o775, 0o755),
+            (tree.join("lib/web/a.py"), 0o666, 0o644),
+            (elsewhere.clone(), 0o777, 0o777),
+            (elsewhere.join("f"), 0o666, 0o666),
+        ];
+        for (path, before, _) in &modes {
+            set_mode(path, *before).unwrap();
+        }
+        clear_group_other_write(&open_dir(&tree).unwrap()).unwrap();
+        for (path, _, after) in &modes {
+            let mode = fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+            assert_eq!(mode, *after, "{}: {mode:o}", path.display());
         }
     }
 
@@ -1444,6 +1612,10 @@ mod tests {
             }
             let err = create_dir_all_owned(&link.join("new")).unwrap_err();
             assert!(refused_link(&err), "{err}");
+            for dir in [link.clone(), link.join("new")] {
+                let err = open_dir_owned(&dir).unwrap_err();
+                assert!(refused_link(&err), "{err}");
+            }
         }
         // Swapped in after the walk opened the directory.
         let queue = td.path().join("state").join("queue");

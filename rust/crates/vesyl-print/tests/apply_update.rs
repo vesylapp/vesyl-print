@@ -16,7 +16,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use common::{have_tools, path_str, repo_root, run, sh_quote, snapshot, write, write_exe, Run};
-use vesyl_print::update::slot_is_runnable;
+use vesyl_print::update::{is_version, slot_is_runnable};
 
 /// The helper's fixed PATH; GNU ln and mv must be found there.
 const HELPER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
@@ -390,6 +390,34 @@ fn version_must_look_like_a_release() {
             r.log()
         );
     }
+}
+
+/// Only what `update::is_version` takes is a version to the helper too, and
+/// a runnable slot under any other name is never activated: digits other
+/// than ASCII ones (the helper's `[0-9]`, in the C locale; `is_version`'s
+/// `\d` once took them), and `<version>.staging`, the dir an interrupted
+/// install leaves.
+#[test]
+fn only_what_is_version_takes_is_activated() {
+    let (h, _) = rejecting!();
+    for version in ["١.٢.٣", "1.2.٣", "１.２.３", "1.2.4.staging"] {
+        h.release(version);
+        assert!(!is_version(version), "{version}");
+        let r = h.assert_activate_rejected(version);
+        assert!(
+            r.stderr.contains("invalid release version"),
+            "{version}: {}",
+            r.log()
+        );
+        let r = h.assert_rejected(&["rollback", &s(&h.root), version], None);
+        assert!(
+            r.stderr.contains("invalid release version"),
+            "{version}: {}",
+            r.log()
+        );
+    }
+    assert!(is_version("1.2.4"));
+    assert_eq!(h.current(), Some(PathBuf::from("releases/1.2.3")));
 }
 
 #[test]
