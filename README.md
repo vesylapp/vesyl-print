@@ -134,11 +134,10 @@ with a throwaway lab key, and it refuses production-signed releases: when the
 dev server asked it for 0.3.17, it held that version as `bad_signature` on
 the first attempt and downloaded nothing more. Re-provision it the same way,
 from the published v0.5.0 tarball (or a later release). A tarball built
-before that tag must not be numbered 0.5.0 or 0.5.0-anything: the agent
-ignores a `-` suffix when it compares versions
-([OTA_UPDATES.md §4.8](./OTA_UPDATES.md#48-version-source-of-truth)), so a
-device running such a build would take v0.5.0 as already installed and never
-update to it. Number an interim lab build below 0.5.0, at or above the 0.4.0
+before that tag must not be numbered 0.5.0: a device running such a build
+would take v0.5.0 as already installed and never update to it. (A suffix
+makes another version: 0.5.0-rc.1 sorts below 0.5.0, as semver has it, see
+[OTA_UPDATES.md §4.8](./OTA_UPDATES.md#48-version-source-of-truth).) Number an interim lab build below 0.5.0, at or above the 0.4.0
 floor and above the lab builds so far, e.g.
 `BUILD_ONLY=1 ./scripts/build-release.sh 0.4.4` (give the version: until the
 release bumps it, the checkout's `VERSION` is 0.3.17, below the floor, and a
@@ -515,7 +514,8 @@ journalctl -u vesyl-print-agent -f
 ```
 
 Agent logs never include `device_token`. `VESYL_PRINT_LOG=debug` raises the
-agent's log level.
+agent's log level. The other commands (`update`, `claim`, …) write their
+warnings to stderr; `VESYL_PRINT_LOG=info` or `debug` shows more.
 
 The agent unit sets `OOMPolicy=continue` and `MemoryMax=50%`: a PDF renderer
 (`pdftoppm`, `gs`) the kernel kills for memory fails its print job while the
@@ -561,11 +561,10 @@ tracked `keys/tailscale.key` (see `keys/README.md`).
 reports the desired version does nothing, so a real 0.4.x would never
 replace the lab build of the same number. Tag above them, with `VERSION`
 bumped to 0.5.0 in the same commit. `MIN_AGENT_VERSION` keeps its default,
-0.4.0: the Python-era cutoff, not the release version. The agent compares
-versions by number and ignores a `-` suffix (0.9.1-rc.1 counts as 0.9.1, an
-open item), so tag releases `vX.Y.Z` only, and a build made before the tag
-must not be numbered 0.5.0 or 0.5.0-anything either: number an interim lab
-build below 0.5.0 and above the lab builds (e.g. 0.4.4), and re-provision the
+0.4.0: the Python-era cutoff, not the release version. The agent orders
+versions as semver does (0.9.1-rc.1 is below 0.9.1, and no longer counts as
+it), and a build made before the tag must not be numbered 0.5.0 either:
+number an interim lab build below 0.5.0 and above the lab builds (e.g. 0.4.4), and re-provision the
 lab Pi from the published v0.5.0 tarball
 ([Re-provisioning](#re-provisioning-a-python-era-device)).
 
@@ -660,7 +659,10 @@ helper refuses, `current` stays where it was. It then records the version it
 left as held (`update_status.json`: `rolled_back`, "manual rollback from X to
 Y") and prints "holding X: …": the agent does not install X again while the
 server still asks for it, only once the desired version changes or
-`update apply` runs. An open health gate closes at once.
+`update apply` installs a version (one that installs nothing, the version
+asked for running already, keeps the hold). An open health gate closes at
+once. Once the server asks for the version running, the rollback is over:
+`idle` again, and the LCD stops showing "Rolled back".
 
 ### Config (`/etc/vesyl-print/config.json`)
 

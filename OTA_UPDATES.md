@@ -249,7 +249,7 @@ it for 0.3.17, it held that version as `bad_signature` on the first attempt
 (§4.3 step 18) and downloaded nothing more, and its LCD shows `Update failed`
 until the desired version changes. So the lab Pi is re-provisioned from the
 published 0.5.0 tarball, never from a build made before the tag and numbered
-0.5.0 or 0.5.0-anything.
+0.5.0.
 
 A release tarball never holds `keys/tailscale.key`, so re-provisioning a
 device that is already on the tailnet leaves Tailscale alone ("No Tailscale
@@ -267,8 +267,12 @@ after a successful heartbeat and from the CLI.
 1. Heartbeat POST includes agent_version, platform, optional update status blob
 2. Response may include desired_agent_version (+ update_channel, update_url);
    the desired version is normalized: a leading `v` is dropped
-3. If desired empty or == current → idle. A desired version held here, or
-   still backing off (step 18), is left alone: nothing is fetched
+3. If desired empty or == current → idle (a `rolled_back` status stays with
+   no desired version, and is over once desired == the running version ==
+   the `current` slot's version; the old process a rollback leaves running
+   until its restart does not end it; a `failed` one stays). A desired
+   version held here, or still backing off (step 18), is left alone:
+   nothing is fetched
 4. If auto_update_enabled false → record target only, do not install
    (the agent; a manual `vesyl-print update apply` installs anyway, §4.7)
 5. If buffered ActionCable jobs, or a start-up drain held back by the health
@@ -399,9 +403,20 @@ gate uses the same path.
 `target_version` the version it left (X) and last_error "manual rollback from
 X to Y", and prints "holding X: …". The agent then does not install X again
 while the server still desires it, only once the desired version changes or
-`update apply` runs. An open health gate is closed at once. A gate rollback
-(step 17) holds the version it left the same way, unless the restart into
-that version never happened (it never ran).
+`update apply` installs a version. An `update apply` that installs nothing
+(the version asked for already runs) leaves the hold as it is, and so does a
+reinstall of the active slot with `--restart` (it arms no gate then: there is
+no other slot to roll back to). An open health gate is closed at once. A gate
+rollback (step 17) holds the version it left the same way, unless the
+restart into that version never happened (it never ran). Once the server
+desires the version running, a rollback is over: the status goes back to
+`idle`, and the LCD stops showing "Rolled back".
+
+A gate that `update apply … --restart` arms while the agent is downloading
+an update survives the agent's stop: before it returns, the agent's heartbeat
+reads `update_status.json` again, and keeps a `pending_health` or manual
+rollback another process wrote there meanwhile rather than write its own
+status over it.
 
 ### 4.4 Privileges (`setup.sh`)
 
@@ -560,14 +575,22 @@ vesyl-print update rollback [--version X] [--restart]
 `--version` accepts a leading `v` (`v0.5.0`); anything else that is not a
 release version is refused before any network call. `update apply
 --file/--manifest` (like `print-test --file`) expands a leading `~/` from
-`$HOME`, also in the `--file=~/…` form the shell leaves alone.
+`$HOME`, also in the `--file=~/…` form the shell leaves alone. `update
+check` shows the heartbeat's manifest URL without its query or userinfo,
+where a presigned URL carries its signature.
+
+Every command but `agent` writes its warnings (a release passed over, a
+symlink root would not follow, a file it could not hand to the service user)
+to stderr; `VESYL_PRINT_LOG=info` or `debug` shows more.
 
 `update apply` with no source (the cloud's desired version, or `--version`)
 runs the heartbeat path of §4.3: install, `pending_health`, restart the
 services, and the new agent runs the health gate. It installs even with
 `auto_update_enabled: false`, which only keeps the agent from installing on
 its own (the Python CLI installed nothing then), and even a version the agent
-holds or backs off (§4.3 step 18): it starts from a fresh status.
+holds or backs off (§4.3 step 18): it starts from a fresh status. When the
+version asked for already runs it installs nothing, and leaves a hold on
+another version as it is (it prints that record, not `idle`).
 `--version X` installs X from `releases_base_url` (§4.6); it uses the
 heartbeat's `update_url` only when the server desires exactly `X` (a leading
 `v` aside), since that URL is the manifest of the server's version. When the
@@ -589,7 +612,9 @@ before anything is downloaded, unpacked or activated. Without `--version`
 they install whatever version their manifest names. With `--restart` they
 also arm the health gate (`pending_health`, deadline
 `update_health_gate_seconds`, rollback to the slot that was active) and then
-restart the services. Without `--restart` nothing is restarted and no gate
+restart the services; a reinstall of the active slot while another version
+is held arms no gate and keeps the hold (§4.3 **Rollback**). Without
+`--restart` nothing is restarted and no gate
 is armed (the running agent could only let it expire and roll back): the new
 slot starts on the next service restart, and no health gate checks it.
 
@@ -622,20 +647,21 @@ would never replace the lab build of the same number. Tag `v0.5.0` with
 `VERSION` bumped to 0.5.0 in the same commit. `MIN_AGENT_VERSION` keeps its
 default of 0.4.0, the Python-era cutoff (§4.2).
 
-That equality ignores suffixes, an open item (§5): `update.rs` `version_cmp`
-compares only the numbers before any `-` or `+` (a part that is not a
-number counts as 0), so 0.9.1-rc.1 counts as 0.9.1, and 0.5.0-rc.1 and
-0.5.0.lab are both 0.5.0. Tag releases `vX.Y.Z`, without a suffix. A device
-running a build numbered like that stays idle when the cloud asks for the
-real v0.5.0, as it does for `update apply --version 0.5.0`, and
-`update check` calls it up to date. Moving it takes a manual
-`update apply --manifest-url …` (or `--file`) or another re-provision. So:
+Versions compare as semver orders them (`update.rs` `version_cmp`): by
+number first, then a pre-release below its release (0.9.1-rc.1 < 0.9.1,
+pre-releases by their identifiers), and any other suffix (`+b7`, `.lab`)
+above the bare release, by its text. So two differently written releases are
+never the same version: a device on 0.5.0-rc.1 or 0.5.0.lab installs the real
+v0.5.0 when the cloud asks for it. (Until this was fixed, a suffix was
+ignored and such a device stayed where it was.) The scripts' floor check
+(`build-release.sh` `version_core_ge`, `min_agent_version`) still compares
+only the numbers, which is right for a floor. So:
 
 - Re-provision the lab Pi from the published v0.5.0 tarball (§4.2.1); its
   lab key refuses the production-signed release over OTA anyway.
-- A tarball built before the tag must not be numbered 0.5.0 or anything that
-  reads as 0.5.0. Number an interim lab build below 0.5.0, at or above
-  `MIN_AGENT_VERSION` 0.4.0 and above the lab builds so far, e.g. 0.4.4:
+- A tarball built before the tag must not be numbered exactly 0.5.0. Number
+  an interim lab build below 0.5.0, at or above `MIN_AGENT_VERSION` 0.4.0
+  and above the lab builds so far, e.g. 0.4.4:
   `BUILD_ONLY=1 ./scripts/build-release.sh 0.4.4`. Give the version: until
   the release bumps it, `VERSION` is 0.3.17, below the floor, and
   `build-release.sh` refuses it.
@@ -681,12 +707,12 @@ real v0.5.0, as it does for `update apply --version 0.5.0`, and
 - [x] LCD “Updating…” / failed update messaging (+ agent version on footer)  
 - [x] Hold a release that cannot be installed, back off other failures (§4.3 step 18)  
 - [x] Reinstall of the active version swapped in one step (`renameat2` `RENAME_EXCHANGE`)  
+- [x] Versions with a suffix compare as semver orders them (0.9.1-rc.1 < 0.9.1, §4.8)  
 
 ### Open (must land for fleet OTA)
 
 - [ ] Fleet metrics: version histogram, failure rate  
 - [ ] Optional: mirror GitHub Release assets to `releases.vesyl.com` if customers block github.com  
-- [ ] Version comparison ignores pre-release suffixes (0.9.1-rc.1 counts as 0.9.1): until fixed, tag releases `vX.Y.Z` (§4.8)  
 
 ### Explicitly deferred
 

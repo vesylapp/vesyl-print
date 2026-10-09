@@ -519,3 +519,63 @@ fn shipped_helper_is_executable() {
         .mode();
     assert_ne!(mode & 0o111, 0, "scripts/apply-update must be executable");
 }
+
+// --- the CLI's own warnings -------------------------------------------------
+
+/// A root CLI command (`update rollback` here) shows its warnings on stderr:
+/// it ran with no logger, so they were lost (a release passed over, a
+/// symlink root would not follow, a file it could not hand to the service
+/// user), and only the agent's went anywhere.
+#[test]
+fn cli_commands_show_their_warnings() {
+    if Path::new("/usr/local/lib/vesyl-print/apply-update").exists() {
+        // The CLI would activate through the installed helper, for real.
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let base = td.path().canonicalize().unwrap();
+    let root = base.join("install");
+    for (version, runnable) in [("0.1.0", true), ("0.2.0", false), ("0.3.0", true)] {
+        let slot = root.join("releases").join(version);
+        if runnable {
+            write_exe(&slot.join("vesyl-print"), "#!/bin/sh\n");
+        } else {
+            write(&slot.join("VERSION"), version);
+        }
+    }
+    symlink("releases/0.3.0", root.join("current")).unwrap();
+    let env: Vec<(String, String)> = [
+        ("VESYL_PRINT_INSTALL_ROOT", root.clone()),
+        ("VESYL_PRINT_CONFIG_DIR", base.join("cfg")),
+        ("VESYL_PRINT_STATE_DIR", base.join("state")),
+        ("HOME", base.clone()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), s(&v)))
+    .collect();
+    let r = run(
+        Path::new(env!("CARGO_BIN_EXE_vesyl-print")),
+        &["update", "rollback"],
+        &env,
+    );
+    assert!(r.ok(), "{}", r.log());
+    assert!(
+        r.stdout.starts_with("rolled back to 0.1.0\n"),
+        "{}",
+        r.log()
+    );
+    assert!(
+        r.stderr.contains(
+            "WARNING vesyl-print.update: passing over releases without an executable \
+             vesyl-print: 0.2.0"
+        ),
+        "{}",
+        r.log()
+    );
+    // Warnings only: not the info line that says what stdout says.
+    assert!(!r.stderr.contains("INFO"), "{}", r.log());
+    assert_eq!(
+        fs::read_link(root.join("current")).unwrap(),
+        PathBuf::from("releases/0.1.0")
+    );
+}
