@@ -63,7 +63,9 @@ jobs:
           persist-credentials: false
 
       # zpl.rs's PDF tests run against every rasterizer on PATH and skip
-      # without one: install both (pdfinfo comes with poppler-utils).
+      # without one, except where VESYL_PRINT_REQUIRE_RENDERERS=1 (the Test
+      # step below) makes a missing one fail them: install both (pdfinfo
+      # comes with poppler-utils).
       - name: Install PDF renderers
         run: |
           sudo apt-get update -qq
@@ -87,6 +89,8 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
+        env:
+          VESYL_PRINT_REQUIRE_RENDERERS: "1"
         run: cargo test --locked
 
   aarch64:

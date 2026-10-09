@@ -37,15 +37,17 @@ const MAX_DPI: i64 = 600;
 /// Most PDF pages converted for one job. A longer document fails instead of
 /// building a huge raw stream (and temp files) on the Pi.
 const MAX_PDF_PAGES: i64 = 50;
-/// Most pixels one PDF page may rasterize to; a bigger page fails with
-/// `pdf_page_too_large` before the renderer starts. pdftoppm holds the page
-/// as one RGB bitmap, about 4 bytes a pixel (a 9000 pt page at 203 dpi took
-/// it to 2.4 GB), and the agent decodes its PNG with about as much again.
-/// At 50 MP each peaked near 200 MB, which a 1 GB Pi has to spare beside
-/// CUPS and the display (scaling the page onto the label can add up to
-/// 335 MB, see [`MAX_RESIZE_BYTES`]). It still takes US Legal at 600 dpi
-/// (42.8 MP); a 4×6 label at 600 dpi is 8.6 MP. A page's PNG on disk is at
-/// most ~150 MB.
+/// Most pixels one PDF page may rasterize to. A bigger page that is scaled
+/// onto the label anyway is drawn at a lower dpi that keeps it within this
+/// ([`page_resolution`]); one printed at its own size (`zpl_fit` none) fails
+/// with `pdf_page_too_large`, before the renderer starts. pdftoppm holds the
+/// page as one RGB bitmap, about 4 bytes a pixel (a 9000 pt page at 203 dpi
+/// took it to 2.4 GB), and the agent decodes its PNG with about as much
+/// again. At 50 MP each peaked near 200 MB, which a 1 GB Pi has to spare
+/// beside CUPS and the display (scaling the page onto the label can add up
+/// to 335 MB, see [`MAX_RESIZE_BYTES`]). It still takes US Legal at 600 dpi
+/// (42.8 MP) at full resolution; a 4×6 label at 600 dpi is 8.6 MP. A page's
+/// PNG on disk is at most ~150 MB.
 const MAX_PAGE_PIXELS: u64 = 50_000_000;
 /// Pillow's decompression-bomb limit (2 × `Image.MAX_IMAGE_PIXELS`): a
 /// bigger image fails with `image_bad` from its header, before any pixel is
@@ -99,42 +101,81 @@ fn round_half_even(x: f64) -> i64 {
     }
 }
 
-/// Render one PDF page to PNG. Prefers pdftoppm; falls back to Ghostscript.
+/// Render one PDF page to PNG, at `dpi` (a page too large to print at its
+/// own size fails). Prefers pdftoppm; falls back to Ghostscript.
 pub fn pdf_to_png(
     pdf_path: &Path,
     out_dir: &Path,
     dpi: i64,
     page: i64,
 ) -> Result<PathBuf, ZplError> {
-    render_page(&Renderer::find()?, pdf_path, out_dir, dpi, page)
+    render_page(&Renderer::find()?, pdf_path, out_dir, dpi, page, None).map(|p| p.png)
 }
 
-/// [`pdf_to_png`] with a given renderer. A page pdfinfo can size is held to
-/// [`MAX_PAGE_PIXELS`] before rendering, and the PNG is checked after (see
-/// [`check_rendered`]).
+/// A PDF page rendered to PNG.
+#[derive(Debug)]
+struct DrawnPage {
+    png: PathBuf,
+    /// The resolution it was drawn at: the job's, or a lower one that kept
+    /// it within [`MAX_PAGE_PIXELS`] (see [`page_resolution`]).
+    dpi: i64,
+}
+
+impl DrawnPage {
+    /// Label dots per pixel of the page at its own size at the job's `dpi`:
+    /// 1, unless it was drawn below that.
+    fn native_scale(&self, dpi: i64) -> f64 {
+        max(72, dpi) as f64 / self.dpi as f64
+    }
+}
+
+/// [`pdf_to_png`] with a given renderer, for a page scaled into the label
+/// box `fitted` (`None`: printed at its own size). A page pdfinfo can size
+/// is drawn at the resolution [`page_resolution`] gives it, and the PNG is
+/// checked after (see [`finish_page`]).
 fn render_page(
     renderer: &Renderer,
     pdf_path: &Path,
     out_dir: &Path,
     dpi: i64,
     page: i64,
-) -> Result<PathBuf, ZplError> {
+    fitted: Option<(i64, i64)>,
+) -> Result<DrawnPage, ZplError> {
     // pdftoppm draws page 1 for a page number below 1, the first box pdfinfo
     // lists then.
-    let expected = match PdfInfo::read(pdf_path, page, page)
+    let (res, expected) = match PdfInfo::read(pdf_path, page, page)
         .and_then(|info| info.media_boxes.first().copied())
     {
-        Some((n, w, h)) => Some(check_page_budget(n, w, h, dpi)?),
-        None => None,
+        Some((n, w, h)) => {
+            let (res, size) = page_resolution(n, w, h, dpi, fitted)?;
+            (res, Some(size))
+        }
+        None => (max(72, dpi), None),
     };
     fs::create_dir_all(out_dir).map_err(|e| ZplError::new(e.to_string(), "pdf_render"))?;
+    let (png, stderr) = draw_page(renderer, pdf_path, out_dir, res, page)?;
+    let drawn = DrawnPage { png, dpi: res };
+    finish_page(
+        renderer, pdf_path, out_dir, page, drawn, expected, &stderr, fitted,
+    )
+}
+
+/// Run the renderer for `page` alone at `dpi`, into `out_dir`; returns the
+/// PNG and the tool's stderr.
+fn draw_page(
+    renderer: &Renderer,
+    pdf_path: &Path,
+    out_dir: &Path,
+    dpi: i64,
+    page: i64,
+) -> Result<(PathBuf, String), ZplError> {
     let stem_name = pdf_path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let stem = out_dir.join(format!("{stem_name}_p{page}"));
     let png = PathBuf::from(format!("{}.png", stem.display()));
-    let res = max(72, dpi).to_string();
+    let res = dpi.to_string();
     let page_s = page.to_string();
     let pdf = pdf_path.display().to_string();
 
@@ -180,8 +221,55 @@ fn render_page(
     if !out.success || !png.is_file() {
         return Err(render_error(tool, out));
     }
-    check_rendered(renderer, &png, page.max(1), expected, &out.stderr)?;
-    Ok(png)
+    Ok((png, out.stderr))
+}
+
+/// Check page `page` as it was `drawn` ([`check_rendered`], against the
+/// size it was `expected` at).
+///
+/// A page over [`MAX_PAGE_PIXELS`] once drawn, though pdfinfo's box was
+/// within it or there was none to go by (gs scales by a /UserUnit pdfinfo
+/// and pdftoppm ignore; no pdfinfo), is drawn again, alone, into `out_dir`,
+/// at the resolution [`page_resolution`] would have given its real size,
+/// when it is scaled into the label box `fitted`. gs bands its memory, so
+/// the first drawing cost disk, not RAM.
+#[allow(clippy::too_many_arguments)] // render_page's, and what the drawing gave
+fn finish_page(
+    renderer: &Renderer,
+    pdf_path: &Path,
+    out_dir: &Path,
+    page: i64,
+    drawn: DrawnPage,
+    expected: Option<(u64, u64)>,
+    stderr: &str,
+    fitted: Option<(i64, i64)>,
+) -> Result<DrawnPage, ZplError> {
+    let refused = match check_rendered(renderer, &drawn.png, page.max(1), expected, stderr) {
+        Ok(()) => return Ok(drawn),
+        Err(e) => e,
+    };
+    let Some(label) = fitted.filter(|_| refused.code == "pdf_page_too_large") else {
+        return Err(refused);
+    };
+    let Some((w, h)) = png_dimensions(&drawn.png) else {
+        return Err(refused);
+    };
+    // Its size in points as this renderer sees it, a pixel over for gs's
+    // rounding.
+    let pt = |px: u32| (f64::from(px) + 1.0) * 72.0 / drawn.dpi as f64;
+    let Some((dpi, _)) = within_page_budget(pt(w), pt(h), label) else {
+        return Err(refused);
+    };
+    log::info!(
+        target: LOG,
+        "PDF page {} came out at {w} x {h} pixels at {} dpi; drawing it again at {dpi} dpi",
+        page.max(1),
+        drawn.dpi
+    );
+    let _ = fs::remove_file(&drawn.png);
+    let (png, stderr) = draw_page(renderer, pdf_path, out_dir, dpi, page)?;
+    check_rendered(renderer, &png, page.max(1), None, &stderr)?;
+    Ok(DrawnPage { png, dpi })
 }
 
 /// `pdf_render` error from a failed tool run: stderr, else stdout.
@@ -285,17 +373,22 @@ impl PdfInfo {
     }
 }
 
+/// The size pdftoppm draws a `w`×`h` pt page at `dpi` (it rounds up; gs
+/// rounds).
+fn drawn_size(w: f64, h: f64, dpi: f64) -> (f64, f64) {
+    // Multiplied before dividing, as poppler does: 432 × (600 / 72) is a
+    // hair over 3600.
+    ((w * dpi / 72.0).ceil(), (h * dpi / 72.0).ceil())
+}
+
 /// Hold a `w`×`h` pt page to [`MAX_PAGE_PIXELS`] at `dpi` before rendering;
-/// returns the size pdftoppm will draw it (it rounds up; gs rounds).
+/// returns the size pdftoppm will draw it.
 ///
 /// gs also scales by a page's /UserUnit, which pdfinfo and pdftoppm ignore:
 /// such a page is caught once rendered (gs bands its memory, so rendering it
 /// costs disk, not RAM).
 fn check_page_budget(page: i64, w: f64, h: f64, dpi: i64) -> Result<(u64, u64), ZplError> {
-    // Multiplied before dividing, as poppler does: 432 × (600 / 72) is a
-    // hair over 3600.
-    let res = max(72, dpi) as f64;
-    let (pw, ph) = ((w * res / 72.0).ceil(), (h * res / 72.0).ceil());
+    let (pw, ph) = drawn_size(w, h, max(72, dpi) as f64);
     let pixels = pw * ph;
     if pixels.is_nan() || pixels > MAX_PAGE_PIXELS as f64 {
         return Err(ZplError::new(
@@ -309,6 +402,80 @@ fn check_page_budget(page: i64, w: f64, h: f64, dpi: i64) -> Result<(u64, u64), 
         ));
     }
     Ok((pw as u64, ph as u64))
+}
+
+/// The dpi to draw a PDF page at, and the size pdftoppm draws it there.
+type Resolution = (i64, (u64, u64));
+
+/// The resolution to draw a `w`×`h` pt page at: `dpi` (at least 72) when
+/// [`check_page_budget`] passes.
+///
+/// A bigger page that is scaled into the label box `fitted` (any `zpl_fit`
+/// but none) is drawn at the highest dpi that keeps it within
+/// [`MAX_PAGE_PIXELS`] instead, as long as it still covers the box there
+/// ([`within_page_budget`]): the fit then scales it down onto the label as
+/// it would the page drawn at `dpi`, so the label loses nothing it could
+/// print. A page printed at its own size (`fitted` is `None`), or one that
+/// could not cover the box within the budget (only a box of more dots than
+/// the budget has pixels, or a page kilometres across, could not be
+/// covered), fails with `pdf_page_too_large`.
+fn page_resolution(
+    page: i64,
+    w: f64,
+    h: f64,
+    dpi: i64,
+    fitted: Option<(i64, i64)>,
+) -> Result<Resolution, ZplError> {
+    let refused = match check_page_budget(page, w, h, dpi) {
+        Ok(size) => return Ok((max(72, dpi), size)),
+        Err(e) => e,
+    };
+    let Some((res, size)) = fitted.and_then(|label| within_page_budget(w, h, label)) else {
+        return Err(refused);
+    };
+    log::info!(
+        target: LOG,
+        "PDF page {page} is {:.1} x {:.1} in: drawing it at {res} dpi, not {dpi}, to stay \
+         within the {MAX_PAGE_PIXELS} pixels a page may have",
+        w / 72.0,
+        h / 72.0
+    );
+    Ok((res, size))
+}
+
+/// The highest dpi at which a `w`×`h` pt page stays within
+/// [`MAX_PAGE_PIXELS`] and still covers the label box `(label_w, label_h)`
+/// (fills its width or its length: what the fit scales the page down to),
+/// with the size pdftoppm draws it there; `None` when there is none.
+fn within_page_budget(w: f64, h: f64, (label_w, label_h): (i64, i64)) -> Option<Resolution> {
+    // From the area, then down past pdftoppm's rounding up.
+    let mut dpi = (72.0 * (MAX_PAGE_PIXELS as f64 / (w * h)).sqrt()).floor();
+    let (pw, ph) = loop {
+        // A NaN comes from a broken box.
+        if dpi.is_nan() || dpi < 1.0 {
+            return None;
+        }
+        let (pw, ph) = drawn_size(w, h, dpi);
+        if pw * ph <= MAX_PAGE_PIXELS as f64 {
+            break (pw, ph);
+        }
+        dpi -= 1.0;
+    };
+    // Whole pixels only: gs rounds where pdftoppm rounds up. Either way
+    // round: the box pdfinfo gives is the page before its /Rotate.
+    let (whole_w, whole_h) = ((w * dpi / 72.0).floor(), (h * dpi / 72.0).floor());
+    let covers = |(a, b): (f64, f64)| a >= label_w as f64 || b >= label_h as f64;
+    (covers((whole_w, whole_h)) && covers((whole_h, whole_w)))
+        .then_some((dpi as i64, (pw as u64, ph as u64)))
+}
+
+/// A PNG's size, from its header.
+fn png_dimensions(png: &Path) -> Option<(u32, u32)> {
+    ImageReader::open(png)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(image::ImageError::IoError)
+        .and_then(|r| r.into_dimensions())
+        .ok()
 }
 
 /// Check a rendered page from its PNG header, before decoding it.
@@ -326,12 +493,8 @@ fn check_rendered(
     expected: Option<(u64, u64)>,
     stderr: &str,
 ) -> Result<(), ZplError> {
-    let dims = ImageReader::open(png)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(image::ImageError::IoError)
-        .and_then(|r| r.into_dimensions());
     // An unreadable PNG fails to decode next, as image_bad.
-    let Ok((w, h)) = dims else {
+    let Some((w, h)) = png_dimensions(png) else {
         return Ok(());
     };
     let (w64, h64) = (u64::from(w), u64::from(h));
@@ -365,24 +528,24 @@ fn check_rendered(
     ))
 }
 
-/// Render pages `1..=last` of a PDF into `out_dir` with one tool run (both
-/// tools stop at the document's real last page), each checked against
-/// `expected` (page → the size pdfinfo gives it, see [`check_rendered`]).
-/// Returns the PNGs in page order.
-fn pdf_pages_to_png(
+/// Render pages `first..=last` of a PDF at `dpi` into `dir` with one tool
+/// run (both tools stop at the document's real last page). Returns the
+/// PNGs in page order, and the tool's stderr.
+fn draw_pages(
     renderer: &Renderer,
     pdf_path: &Path,
-    out_dir: &Path,
+    dir: &Path,
     dpi: i64,
+    first: i64,
     last: i64,
-    expected: &[(i64, (u64, u64))],
-) -> Result<Vec<PathBuf>, ZplError> {
-    fs::create_dir_all(out_dir).map_err(|e| ZplError::new(e.to_string(), "pdf_render"))?;
-    let root = out_dir.join("page").display().to_string();
-    let res = max(72, dpi).to_string();
+) -> Result<(Vec<PathBuf>, String), ZplError> {
+    fs::create_dir_all(dir).map_err(|e| ZplError::new(e.to_string(), "pdf_render"))?;
+    let root = dir.join("page").display().to_string();
+    let res = dpi.to_string();
     let pdf = pdf_path.display().to_string();
     let (tool, args): (&str, Vec<String>) = match renderer {
-        // page-1.png, page-2.png …, zero-padded to the width of the page count.
+        // page-1.png, page-2.png …: the page number, zero-padded to the
+        // width of the page count.
         Renderer::Pdftoppm(tool) => (
             tool,
             vec![
@@ -390,21 +553,22 @@ fn pdf_pages_to_png(
                 "-r".into(),
                 res,
                 "-f".into(),
-                "1".into(),
+                first.to_string(),
                 "-l".into(),
                 last.to_string(),
                 pdf,
                 root,
             ],
         ),
-        // page-1.png, page-2.png …; a literal % in the path must be doubled.
+        // page-1.png, page-2.png …, numbered from 1 whatever `first` is; a
+        // literal % in the path must be doubled.
         Renderer::Ghostscript(tool) => (
             tool,
             vec![
                 "-dSAFER".into(),
                 "-dBATCH".into(),
                 "-dNOPAUSE".into(),
-                "-dFirstPage=1".into(),
+                format!("-dFirstPage={first}"),
                 format!("-dLastPage={last}"),
                 format!("-r{res}"),
                 "-sDEVICE=pnggray".into(),
@@ -414,15 +578,15 @@ fn pdf_pages_to_png(
         ),
     };
     // A single page keeps its 120 s; each further page adds 10 s.
-    let timeout = Duration::from_secs(120 + 10 * (last.max(1) as u64 - 1));
+    let timeout = Duration::from_secs(120 + 10 * (last - first).max(0) as u64);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = run_with_timeout(tool, &argv, timeout)
         .map_err(|e| ZplError::new(format!("{tool} failed: {e}"), "pdf_render"))?;
     if !out.success {
         return Err(render_error(tool, out));
     }
-    // Sort by page number: pdftoppm pads (page-01.png) and gs does not.
-    let mut pages: Vec<(u64, PathBuf)> = fs::read_dir(out_dir)
+    // Sort by number: pdftoppm pads (page-01.png) and gs does not.
+    let mut pages: Vec<(u64, PathBuf)> = fs::read_dir(dir)
         .map_err(|e| ZplError::new(e.to_string(), "pdf_render"))?
         .flatten()
         .filter_map(|e| {
@@ -443,17 +607,59 @@ fn pdf_pages_to_png(
             "pdf_render",
         ));
     }
-    for (page, png) in &pages {
-        let page = *page as i64;
-        let size = expected.iter().find(|(p, _)| *p == page).map(|(_, s)| *s);
-        check_rendered(renderer, png, page, size, &out.stderr)?;
-    }
-    Ok(pages.into_iter().map(|(_, png)| png).collect())
+    Ok((pages.into_iter().map(|(_, png)| png).collect(), out.stderr))
 }
 
-/// Render every page of a PDF, in order, up to [`MAX_PDF_PAGES`], each held
-/// to [`MAX_PAGE_PIXELS`] before any is rendered. `info` is what pdfinfo
-/// said (empty without it): with no page count, one page past the limit is
+/// Render pages `1..=last` of a PDF into `out_dir`, each at the resolution
+/// `plan` gives it (page → its dpi and the size pdfinfo puts it at there,
+/// from [`page_resolution`]), the job's `dpi` for a page it lacks: one tool
+/// run for each stretch of pages drawn alike, so one run for a document
+/// whose pages all fit the budget. Each page is then checked, for the label
+/// box `fitted` (see [`finish_page`]). Returns the pages in order.
+fn pdf_pages_to_png(
+    renderer: &Renderer,
+    pdf_path: &Path,
+    out_dir: &Path,
+    dpi: i64,
+    last: i64,
+    plan: &[(i64, Resolution)],
+    fitted: Option<(i64, i64)>,
+) -> Result<Vec<DrawnPage>, ZplError> {
+    let planned = |page: i64| plan.iter().find(|(p, _)| *p == page).map(|(_, r)| *r);
+    // (first page, last page, dpi) of each run.
+    let mut runs: Vec<(i64, i64, i64)> = Vec::new();
+    for page in 1..=last {
+        let res = planned(page).map_or(max(72, dpi), |(res, _)| res);
+        match runs.last_mut() {
+            Some((_, end, r)) if *r == res => *end = page,
+            _ => runs.push((page, page, res)),
+        }
+    }
+    let one_run = runs.len() == 1;
+    let mut pages = Vec::new();
+    for (first, end, res) in runs {
+        // gs numbers each run's files from 1: a directory of its own.
+        let dir = if one_run {
+            out_dir.to_path_buf()
+        } else {
+            out_dir.join(first.to_string())
+        };
+        let (pngs, stderr) = draw_pages(renderer, pdf_path, &dir, res, first, end)?;
+        for (page, png) in (first..).zip(pngs) {
+            let expected = planned(page).map(|(_, size)| size);
+            let drawn = DrawnPage { png, dpi: res };
+            pages.push(finish_page(
+                renderer, pdf_path, &dir, page, drawn, expected, &stderr, fitted,
+            )?);
+        }
+    }
+    Ok(pages)
+}
+
+/// Render every page of a PDF, in order, up to [`MAX_PDF_PAGES`], for the
+/// label box `fitted` (see [`render_page`]), each held to
+/// [`MAX_PAGE_PIXELS`] before any is rendered. `info` is what pdfinfo said
+/// (empty without it): with no page count, one page past the limit is
 /// rendered so an over-long document is still caught.
 fn pdf_all_pages_to_png(
     renderer: &Renderer,
@@ -461,7 +667,8 @@ fn pdf_all_pages_to_png(
     out_dir: &Path,
     dpi: i64,
     info: &PdfInfo,
-) -> Result<Vec<PathBuf>, ZplError> {
+    fitted: Option<(i64, i64)>,
+) -> Result<Vec<DrawnPage>, ZplError> {
     let too_many = |count: String| {
         ZplError::new(
             format!(
@@ -476,16 +683,16 @@ fn pdf_all_pages_to_png(
         Some(n) if n >= 1 => n,
         _ => MAX_PDF_PAGES + 1,
     };
-    let expected = info
+    let plan = info
         .media_boxes
         .iter()
-        .map(|&(page, w, h)| Ok((page, check_page_budget(page, w, h, dpi)?)))
+        .map(|&(page, w, h)| Ok((page, page_resolution(page, w, h, dpi, fitted)?)))
         .collect::<Result<Vec<_>, ZplError>>()?;
-    let pngs = pdf_pages_to_png(renderer, pdf_path, out_dir, dpi, last, &expected)?;
-    if pngs.len() as i64 > MAX_PDF_PAGES {
+    let pages = pdf_pages_to_png(renderer, pdf_path, out_dir, dpi, last, &plan, fitted)?;
+    if pages.len() as i64 > MAX_PDF_PAGES {
         return Err(too_many(format!("more than {MAX_PDF_PAGES}")));
     }
-    Ok(pngs)
+    Ok(pages)
 }
 
 fn max(a: i64, b: i64) -> i64 {
@@ -628,17 +835,51 @@ pub fn load_image_as_mono(
     let is_pdf = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
-    let mut img = if is_pdf {
+    let (img, native) = if is_pdf {
         let work = tempfile::Builder::new()
             .prefix("vesyl-zpl-pdf-")
             .tempdir()
             .map_err(|e| ZplError::new(e.to_string(), "image_bad"))?;
-        let png = pdf_to_png(path, work.path(), DEFAULT_DPI, 1)?;
-        open_gray(&png)?
+        // The box the fit scales the page into; no length is no limit.
+        let length = max_height_dots.filter(|h| *h != 0).unwrap_or(i64::MAX);
+        let fitted = (fit != Fit::None).then_some((max_width_dots.max(8), length));
+        let page = render_page(
+            &Renderer::find()?,
+            path,
+            work.path(),
+            DEFAULT_DPI,
+            1,
+            fitted,
+        )?;
+        (open_gray(&page.png)?, page.native_scale(DEFAULT_DPI))
     } else {
-        open_gray(path)?
+        (open_gray(path)?, 1.0)
     };
+    to_mono_label(
+        img,
+        max_width_dots,
+        max_height_dots,
+        threshold,
+        invert,
+        fit,
+        native,
+    )
+}
 
+/// [`load_image_as_mono`] for a decoded image. `native` is the scale of the
+/// image at its own size on the label: 1, or more for a PDF page drawn
+/// below the job's dpi ([`DrawnPage::native_scale`]). `Fit::Contain` scales
+/// down from that size and never up past it, so such a page comes out as
+/// it would have at the job's dpi.
+fn to_mono_label(
+    mut img: GrayImage,
+    max_width_dots: i64,
+    max_height_dots: Option<i64>,
+    threshold: i64,
+    invert: bool,
+    fit: Fit,
+    native: f64,
+) -> Result<GrayImage, ZplError> {
     // Optional invert (white-on-black PDF backgrounds).
     if invert {
         image::imageops::invert(&mut img);
@@ -657,7 +898,7 @@ pub fn load_image_as_mono(
     let max_w = max_width_dots.max(8) as f64;
     let max_h = max_height_dots.filter(|h| *h != 0).map(|h| h as f64);
     let (wf, hf) = (w as f64, h as f64);
-    let mut scale = 1.0f64;
+    let mut scale = native;
     match fit {
         Fit::Width => {
             scale = max_w / wf;
@@ -668,11 +909,11 @@ pub fn load_image_as_mono(
             }
         }
         Fit::Contain => {
-            if wf > max_w {
+            if wf * native > max_w {
                 scale = scale.min(max_w / wf);
             }
             if let Some(mh) = max_h {
-                if hf > mh {
+                if hf * native > mh {
                     scale = scale.min(mh / hf);
                 }
             }
@@ -978,28 +1219,42 @@ pub fn image_path_to_zpl(path: &Path, opts: &JsonObject) -> Result<String, ZplEr
     let is_pdf = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
-    // `_work` keeps the rendered pages until they are converted.
-    let (sources, _work) = if is_pdf {
+    // `_work` keeps the rendered pages until they are converted. Each
+    // source comes with its scale at its own size (see to_mono_label).
+    let (sources, _work): (Vec<(PathBuf, f64)>, _) = if is_pdf {
         // DPI only affects PDF rasterization.
         let work = tempfile::Builder::new()
             .prefix("vesyl-zpl-pdf-")
             .tempdir()
             .map_err(|e| ZplError::new(e.to_string(), "pdf_render"))?;
-        let pngs = if opts.get("zpl_page").is_some_and(|v| !v.is_null()) {
-            vec![pdf_to_png(
+        let renderer = Renderer::find()?;
+        // A page over the page budget may be drawn smaller when it is
+        // scaled into this box anyway (see page_resolution).
+        let fitted = (fit != Fit::None).then_some((max_w, max_h));
+        let pages = if opts.get("zpl_page").is_some_and(|v| !v.is_null()) {
+            let page = opt_int(opts, "zpl_page", 1);
+            vec![render_page(
+                &renderer,
                 path,
                 work.path(),
                 dpi,
-                opt_int(opts, "zpl_page", 1),
+                page,
+                fitted,
             )?]
         } else {
-            let renderer = Renderer::find()?;
             let info = PdfInfo::read(path, 1, MAX_PDF_PAGES + 1).unwrap_or_default();
-            pdf_all_pages_to_png(&renderer, path, work.path(), dpi, &info)?
+            pdf_all_pages_to_png(&renderer, path, work.path(), dpi, &info, fitted)?
         };
-        (pngs, Some(work))
+        let sources = pages
+            .into_iter()
+            .map(|p| {
+                let native = p.native_scale(dpi);
+                (p.png, native)
+            })
+            .collect();
+        (sources, Some(work))
     } else {
-        (vec![path.to_path_buf()], None)
+        (vec![(path.to_path_buf(), 1.0)], None)
     };
 
     let name = path
@@ -1011,8 +1266,9 @@ pub fn image_path_to_zpl(path: &Path, opts: &JsonObject) -> Result<String, ZplEr
         log::info!(target: LOG, "{name}: {pages} PDF pages, one ZPL label each");
     }
     let mut zpl = String::new();
-    for (i, source) in sources.iter().enumerate() {
-        let img = load_image_as_mono(source, max_w, Some(max_h), thr, invert, fit)?;
+    for (i, (source, native)) in sources.iter().enumerate() {
+        let gray = open_gray(source)?;
+        let img = to_mono_label(gray, max_w, Some(max_h), thr, invert, fit, *native)?;
         let gfa = mono_image_to_gfa_hex(&img);
         let page = if pages > 1 {
             format!(" page {}/{pages}", i + 1)
@@ -1339,19 +1595,35 @@ pub(crate) mod tests {
         p
     }
 
-    /// Every rasterizer installed here (CI may have neither).
+    /// `VESYL_PRINT_REQUIRE_RENDERERS=1` (set by CI's test job, which
+    /// installs poppler-utils and ghostscript) makes a missing PDF tool fail
+    /// the tests that need it: a runner without them must not pass those
+    /// tests without running them.
+    const REQUIRE_RENDERERS: &str = "VESYL_PRINT_REQUIRE_RENDERERS";
+
+    /// `tool` (pdftoppm, pdfinfo, gs) on PATH. Without it, a check that
+    /// needs it is skipped, unless [`REQUIRE_RENDERERS`] is set.
+    fn pdf_tool(tool: &str) -> Option<String> {
+        let found = which(tool);
+        if found.is_none() {
+            assert!(
+                std::env::var_os(REQUIRE_RENDERERS).is_none_or(|v| v != "1"),
+                "{tool} is not installed, but {REQUIRE_RENDERERS}=1"
+            );
+            eprintln!("no {tool} installed; skipping the PDF checks that need it");
+        }
+        found
+    }
+
+    /// Every rasterizer installed here (a machine may have neither).
     fn renderers() -> Vec<Renderer> {
-        let found: Vec<Renderer> = [
-            which("pdftoppm").map(Renderer::Pdftoppm),
-            which("gs").map(Renderer::Ghostscript),
+        [
+            pdf_tool("pdftoppm").map(Renderer::Pdftoppm),
+            pdf_tool("gs").map(Renderer::Ghostscript),
         ]
         .into_iter()
         .flatten()
-        .collect();
-        if found.is_empty() {
-            eprintln!("no pdftoppm or gs installed; skipping PDF rendering checks");
-        }
-        found
+        .collect()
     }
 
     /// The `^PW…` value of each label in a ZPL stream.
@@ -1406,11 +1678,11 @@ pub(crate) mod tests {
                 .path()
                 .join(format!("{renderer:?}").replace(['"', '/', ' '], "_"));
             let unknown = PdfInfo::default();
-            let pngs = pdf_all_pages_to_png(&renderer, &pdf, &out, 72, &unknown).unwrap();
-            let widths: Vec<u32> = pngs
+            let pages = pdf_all_pages_to_png(&renderer, &pdf, &out, 72, &unknown, None).unwrap();
+            let widths: Vec<u32> = pages
                 .iter()
                 .map(|p| {
-                    let (x0, _, x1, _) = content_bbox(&open_gray(p).unwrap()).unwrap();
+                    let (x0, _, x1, _) = content_bbox(&open_gray(&p.png).unwrap()).unwrap();
                     x1 - x0
                 })
                 .collect();
@@ -1431,7 +1703,8 @@ pub(crate) mod tests {
             pages: Some(51),
             ..PdfInfo::default()
         };
-        let err = pdf_all_pages_to_png(&r, Path::new("x.pdf"), td.path(), 72, &info).unwrap_err();
+        let err =
+            pdf_all_pages_to_png(&r, Path::new("x.pdf"), td.path(), 72, &info, None).unwrap_err();
         assert_eq!(err.code, "pdf_too_many_pages");
         assert!(err.message.contains("51 pages"), "{}", err.message);
 
@@ -1443,7 +1716,7 @@ pub(crate) mod tests {
                 .path()
                 .join(format!("{renderer:?}").replace(['"', '/', ' '], "_"));
             let unknown = PdfInfo::default();
-            let err = pdf_all_pages_to_png(&renderer, &pdf, &out, 72, &unknown).unwrap_err();
+            let err = pdf_all_pages_to_png(&renderer, &pdf, &out, 72, &unknown, None).unwrap_err();
             assert_eq!(err.code, "pdf_too_many_pages", "{renderer:?}");
             if let Some(info) = PdfInfo::read(&pdf, 1, MAX_PDF_PAGES + 1) {
                 assert_eq!(info.pages, Some(MAX_PDF_PAGES + 1));
@@ -1818,10 +2091,12 @@ pub(crate) mod tests {
         assert_eq!(PdfInfo::parse("", 1), PdfInfo::default());
     }
 
+    /// A page over the budget fails before anything is rendered where it
+    /// must print at its own size (zpl_fit none), or where no resolution
+    /// within the budget covers the label box it is scaled into.
     #[test]
     fn huge_pdf_pages_fail_before_anything_is_rendered() {
-        if which("pdfinfo").is_none() {
-            eprintln!("no pdfinfo installed; skipping the PDF page budget checks");
+        if pdf_tool("pdfinfo").is_none() {
             return;
         }
         let td = tempfile::tempdir().unwrap();
@@ -1850,38 +2125,49 @@ pub(crate) mod tests {
             "second.pdf",
             &pdf_with_pages(&[(288, 432, content), (2384, 3370, content)], ""),
         );
-        for (pdf, page) in [(&huge, 1), (&cropped, 1), (&second, 2)] {
-            let out = td.path().join("out");
-            let info = PdfInfo::read(pdf, 1, MAX_PDF_PAGES + 1).unwrap();
-            let err = pdf_all_pages_to_png(&absent, pdf, &out, 203, &info).unwrap_err();
-            assert_eq!(
-                err.code,
-                "pdf_page_too_large",
-                "{}: {}",
-                pdf.display(),
-                err.message
-            );
-            assert!(
-                err.message.starts_with(&format!("PDF page {page} is ")),
-                "{}",
-                err.message
-            );
-            assert!(!out.exists(), "nothing rendered for {}", pdf.display());
+        // At their own size; or into a box 32000 dots square, which none of
+        // them covers at the dpi that keeps it within the budget (7000 × 7000
+        // pixels for the 9000 pt page, 5927 × 8379 for A0).
+        for fitted in [None, Some((32_000, 32_000))] {
+            for (pdf, page) in [(&huge, 1), (&cropped, 1), (&second, 2)] {
+                let out = td.path().join("out");
+                let info = PdfInfo::read(pdf, 1, MAX_PDF_PAGES + 1).unwrap();
+                let err = pdf_all_pages_to_png(&absent, pdf, &out, 203, &info, fitted).unwrap_err();
+                assert_eq!(
+                    err.code,
+                    "pdf_page_too_large",
+                    "{} {fitted:?}: {}",
+                    pdf.display(),
+                    err.message
+                );
+                assert!(
+                    err.message.starts_with(&format!("PDF page {page} is ")),
+                    "{}",
+                    err.message
+                );
+                assert!(!out.exists(), "nothing rendered for {}", pdf.display());
 
-            // zpl_page selects the page and checks it the same way.
-            let err = render_page(&absent, pdf, &out, 203, page).unwrap_err();
-            assert_eq!(err.code, "pdf_page_too_large", "{}", err.message);
-            assert!(!out.exists());
+                // zpl_page selects the page and checks it the same way.
+                let err = render_page(&absent, pdf, &out, 203, page, fitted).unwrap_err();
+                assert_eq!(err.code, "pdf_page_too_large", "{}", err.message);
+                assert!(!out.exists());
+            }
         }
         // The other page of the two is fine on its own.
-        let err = render_page(&absent, &second, &td.path().join("p1"), 203, 1).unwrap_err();
+        let err = render_page(&absent, &second, &td.path().join("p1"), 203, 1, None).unwrap_err();
         assert_eq!(err.code, "pdf_render", "{}", err.message);
 
         // End to end, with the real renderer: an error, not a 2 GB bitmap.
         if !renderers().is_empty() {
-            for o in [json!({}), json!({"zpl_page": 1})] {
-                let err = image_path_to_zpl(&huge, &opts(o)).unwrap_err();
-                assert_eq!(err.code, "pdf_page_too_large");
+            let huge_box = json!({"zpl_fit": "width", "zpl_max_width_dots": 32000,
+                "zpl_max_height_dots": 32000});
+            for o in [
+                json!({"zpl_fit": "none"}),
+                json!({"zpl_fit": "none", "zpl_page": 1}),
+                huge_box,
+            ] {
+                let err = image_path_to_zpl(&huge, &opts(o.clone())).unwrap_err();
+                assert_eq!(err.code, "pdf_page_too_large", "{o}");
                 assert!(is_permanent(&err));
             }
         }
@@ -1963,37 +2249,78 @@ pub(crate) mod tests {
         png
     }
 
+    /// Install `script` as the executable `dir/name`; returns its path.
+    ///
+    /// A child `cp` writes it, so this process never holds it open for
+    /// writing: a child another test forks meanwhile would inherit that
+    /// descriptor, and running the script would then fail with ETXTBSY.
+    fn install_script(dir: &Path, name: &str, script: &str) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let source = dir.join(format!("{name}.sh"));
+        fs::write(&source, script).unwrap();
+        let tool = dir.join(name);
+        let (src, dst) = (source.display().to_string(), tool.display().to_string());
+        let cp = run_with_timeout("cp", &[&src, &dst], Duration::from_secs(30)).unwrap();
+        assert!(cp.success, "{}", cp.stderr);
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        dst
+    }
+
     /// A stand-in pdftoppm that cannot allocate the page bitmap: like the
     /// real one it then writes a 1×1 PNG, says "Out of memory" and exits 0.
-    ///
-    /// A child `cp` writes the script, so this process never holds it open
-    /// for writing: a child another test forks meanwhile would inherit that
-    /// descriptor, and running the script would then fail with ETXTBSY.
     fn out_of_memory_pdftoppm(dir: &Path) -> Renderer {
-        use std::os::unix::fs::PermissionsExt as _;
         let one = dir.join("one.png");
         image::RgbImage::from_pixel(1, 1, image::Rgb([255, 255, 255]))
             .save(&one)
             .unwrap();
-        let script = dir.join("pdftoppm.sh");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 for last; do :; done\n\
-                 case \" $* \" in *' -singlefile '*) out=\"$last.png\" ;; *) out=\"$last-1.png\" ;; esac\n\
-                 cp '{}' \"$out\"\n\
-                 echo 'Out of memory' >&2\n",
-                one.display()
-            ),
-        )
-        .unwrap();
-        let tool = dir.join("pdftoppm");
-        let (src, dst) = (script.display().to_string(), tool.display().to_string());
-        let cp = run_with_timeout("cp", &[&src, &dst], Duration::from_secs(30)).unwrap();
-        assert!(cp.success, "{}", cp.stderr);
-        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
-        Renderer::Pdftoppm(dst)
+        let script = format!(
+            "#!/bin/sh\n\
+             for last; do :; done\n\
+             case \" $* \" in *' -singlefile '*) out=\"$last.png\" ;; *) out=\"$last-1.png\" ;; esac\n\
+             cp '{}' \"$out\"\n\
+             echo 'Out of memory' >&2\n",
+            one.display()
+        );
+        Renderer::Pdftoppm(install_script(dir, "pdftoppm", &script))
+    }
+
+    /// `renderer` through a script that logs the arguments of each run, a
+    /// line each, to `dir/runs.log`.
+    fn logged(dir: &Path, renderer: &Renderer) -> Renderer {
+        let (Renderer::Pdftoppm(tool) | Renderer::Ghostscript(tool)) = renderer;
+        let log = dir.join("runs.log").display().to_string();
+        let script = format!("#!/bin/sh\necho \"$*\" >> '{log}'\nexec '{tool}' \"$@\"\n");
+        let tool = install_script(dir, "renderer", &script);
+        match renderer {
+            Renderer::Pdftoppm(_) => Renderer::Pdftoppm(tool),
+            Renderer::Ghostscript(_) => Renderer::Ghostscript(tool),
+        }
+    }
+
+    /// `(first page, last page, dpi)` of each run [`logged`] logged in
+    /// `dir`; the log starts over.
+    fn logged_runs(dir: &Path) -> Vec<(i64, i64, i64)> {
+        let log = dir.join("runs.log");
+        let runs = fs::read_to_string(&log).unwrap_or_default();
+        let _ = fs::remove_file(&log);
+        runs.lines()
+            .map(|line| {
+                let args: Vec<&str> = line.split(' ').collect();
+                // pdftoppm's `-f 2`, gs's `-dFirstPage=2`.
+                let arg = |flag: &str, prefix: &str| -> i64 {
+                    let value = match args.iter().position(|a| *a == flag) {
+                        Some(i) => args[i + 1],
+                        None => args.iter().find_map(|a| a.strip_prefix(prefix)).unwrap(),
+                    };
+                    value.parse().unwrap()
+                };
+                (
+                    arg("-f", "-dFirstPage="),
+                    arg("-l", "-dLastPage="),
+                    arg("-r", "-r"),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -2006,9 +2333,11 @@ pub(crate) mod tests {
             &pdf_with_boxes(288, 432, &[(36, 36, 72, 36)]),
         );
         // Sized by pdfinfo when it is installed; else the 1×1 alone tells.
+        // Scaled onto the label or not, it is not drawn again.
         let info = PdfInfo::read(&pdf, 1, MAX_PDF_PAGES + 1).unwrap_or_default();
-        let all = pdf_all_pages_to_png(&oom, &pdf, &td.path().join("all"), 203, &info);
-        let one = render_page(&oom, &pdf, &td.path().join("one"), 203, 1);
+        let label = Some((812, 1186));
+        let all = pdf_all_pages_to_png(&oom, &pdf, &td.path().join("all"), 203, &info, label);
+        let one = render_page(&oom, &pdf, &td.path().join("one"), 203, 1, None);
         for err in [all.unwrap_err(), one.unwrap_err()] {
             assert_eq!(err.code, "pdf_render", "{}", err.message);
             assert!(
@@ -2020,15 +2349,17 @@ pub(crate) mod tests {
         }
     }
 
+    /// gs scales a page by its /UserUnit, which pdfinfo (and pdftoppm) never
+    /// see: such a page is checked once rendered. At its own size it fails;
+    /// scaled onto the label, it is drawn again within the budget.
     #[test]
     fn gs_user_unit_pages_are_checked_once_rendered() {
-        let Some(gs) = which("gs") else {
-            eprintln!("no gs installed; skipping the /UserUnit check");
+        let Some(gs) = pdf_tool("gs") else {
             return;
         };
         let td = tempfile::tempdir().unwrap();
         // 4×6 in pt, but 25 times that in user units: 7200 × 10800 at 72 dpi
-        // for gs, which pdfinfo (and pdftoppm) never see.
+        // for gs.
         let pdf = write_pdf(
             td.path(),
             "uu.pdf",
@@ -2036,15 +2367,230 @@ pub(crate) mod tests {
         );
         let info = PdfInfo::read(&pdf, 1, MAX_PDF_PAGES + 1).unwrap_or_default();
         let r = Renderer::Ghostscript(gs);
-        let err = pdf_all_pages_to_png(&r, &pdf, &td.path().join("all"), 72, &info).unwrap_err();
+        let all = td.path().join("all");
+        let err = pdf_all_pages_to_png(&r, &pdf, &all, 72, &info, None).unwrap_err();
         assert_eq!(err.code, "pdf_page_too_large", "{}", err.message);
         assert!(
             err.message.contains("7200 x 10800 pixels"),
             "{}",
             err.message
         );
-        let err = render_page(&r, &pdf, &td.path().join("one"), 72, 1).unwrap_err();
+        let err = render_page(&r, &pdf, &td.path().join("one"), 72, 1, None).unwrap_err();
         assert_eq!(err.code, "pdf_page_too_large", "{}", err.message);
+
+        // Into a 4×6 label box: drawn again at 57 dpi, the most within the
+        // budget.
+        let label = Some((812, 1186));
+        let all = td.path().join("all-fitted");
+        let pages = pdf_all_pages_to_png(&r, &pdf, &all, 72, &info, label).unwrap();
+        assert_eq!(pages.len(), 1);
+        let one = render_page(&r, &pdf, &td.path().join("one-fitted"), 72, 1, label).unwrap();
+        for page in [&pages[0], &one] {
+            assert_eq!(page.dpi, 57, "{page:?}");
+            assert_eq!(png_dimensions(&page.png), Some((5700, 8550)), "{page:?}");
+        }
+    }
+
+    /// A page over the budget at the job's dpi that is scaled onto the label
+    /// anyway is drawn at the highest dpi within the budget: A0 at 203 dpi
+    /// (63.9 MP), Tabloid and A3 at 600 dpi (67.3 and 69.6 MP), a 9000 pt
+    /// page. At its own size it is refused as before.
+    #[test]
+    fn pages_over_the_budget_scaled_onto_the_label_are_drawn_at_a_lower_dpi() {
+        let label = Some((812, 1186));
+        let label_600 = Some((2454, 3568));
+        // Within the budget: the job's dpi, scaled or not.
+        for fitted in [None, label] {
+            assert_eq!(
+                page_resolution(1, 288.0, 432.0, 203, fitted).unwrap(),
+                (203, (812, 1218))
+            );
+            assert_eq!(
+                page_resolution(1, 612.0, 1008.0, 600, fitted).unwrap(),
+                (600, (5100, 8400))
+            );
+        }
+        for (w, h, dpi, fitted, want) in [
+            (2384.0, 3370.0, 203, label, (179, (5927, 8379))),
+            (792.0, 1224.0, 600, label_600, (517, (5687, 8789))),
+            (842.0, 1191.0, 600, label_600, (508, (5941, 8404))),
+            (9000.0, 9000.0, 203, label, (56, (7000, 7000))),
+            // A banner covers the box with its width alone.
+            (14400.0, 72.0, 600, label_600, (500, (100_000, 500))),
+        ] {
+            let (res, (pw, ph)) = page_resolution(2, w, h, dpi, fitted).unwrap();
+            assert_eq!((res, (pw, ph)), want, "{w} x {h} pt at {dpi} dpi");
+            assert!(pw * ph <= MAX_PAGE_PIXELS);
+            // One dpi more would be over it.
+            let (pw, ph) = drawn_size(w, h, (res + 1) as f64);
+            assert!(pw * ph > MAX_PAGE_PIXELS as f64, "{w} x {h} pt");
+            let err = page_resolution(2, w, h, dpi, None).unwrap_err();
+            assert_eq!(err.code, "pdf_page_too_large");
+            let unchanged = check_page_budget(2, w, h, dpi).unwrap_err();
+            assert_eq!(err.message, unchanged.message);
+        }
+        // Refused too where no dpi within the budget covers the label box,
+        // and for a broken box.
+        for (w, h, fitted) in [
+            (2384.0, 3370.0, Some((32_000, 32_000))),
+            (9000.0, 9000.0, Some((32_000, 32_000))),
+            (f64::NAN, 432.0, label),
+            (f64::INFINITY, 432.0, label),
+        ] {
+            let err = page_resolution(3, w, h, 203, fitted).unwrap_err();
+            assert_eq!(err.code, "pdf_page_too_large", "{w} x {h} pt");
+            assert!(err.message.starts_with("PDF page 3 is "), "{}", err.message);
+            assert!(is_permanent(&err));
+        }
+    }
+
+    /// A page drawn below the job's dpi keeps its size on the label: with
+    /// `zpl_fit` contain it is brought to the size it has at the job's dpi,
+    /// and only scaled down from there; width fills the box as ever.
+    #[test]
+    fn a_page_drawn_below_the_jobs_dpi_keeps_its_size_on_the_label() {
+        // A 100 × 150 design drawn at half the job's dpi, and the same
+        // design at the job's dpi.
+        let half = GrayImage::from_pixel(100, 150, Luma([0]));
+        let full = GrayImage::from_pixel(200, 300, Luma([0]));
+        let mono = |img: &GrayImage, fit, native, (w, h): (i64, i64)| {
+            to_mono_label(img.clone(), w, Some(h), 128, false, fit, native)
+                .unwrap()
+                .dimensions()
+        };
+        for fit in [Fit::Contain, Fit::Width] {
+            for label in [(812, 1186), (152, 1186), (812, 240)] {
+                assert_eq!(
+                    mono(&half, fit, 2.0, label),
+                    mono(&full, fit, 1.0, label),
+                    "{fit:?} into {label:?}"
+                );
+            }
+        }
+        assert_eq!(mono(&half, Fit::Contain, 2.0, (812, 1186)), (200, 300));
+        assert_eq!(mono(&half, Fit::Contain, 1.0, (812, 1186)), (104, 150));
+    }
+
+    /// An A0 page (2384 × 3370 pt) with a 3 × 4 in label in its top left
+    /// corner, which lands on whole pixels at any dpi.
+    const A0_LABEL: (u32, u32, &str) = (2384, 3370, "0 g 0 3082 216 288 re f");
+
+    /// The label of [`A0_LABEL`] on a 4×6 page of its own.
+    const PAGE_LABEL: (u32, u32, &str) = (288, 432, "0 g 0 144 216 288 re f");
+
+    /// The A0 page with [`A0_LABEL`] (`a0.pdf`) converts to a label of the
+    /// size the 4×6 page with [`PAGE_LABEL`] does, `width` dots wide, with
+    /// `zpl_fit` `fit` on a 203 dpi queue.
+    fn assert_a0_label_size(dir: &Path, fit: &str, width: i64) {
+        let page = write_pdf(dir, "page.pdf", &pdf_with_pages(&[PAGE_LABEL], ""));
+        let o = opts(json!({"cups_name": "Zebra_ZD421-203dpi_ZPL", "zpl_fit": fit}));
+        let big = image_path_to_zpl(&dir.join("a0.pdf"), &o).unwrap();
+        let small = image_path_to_zpl(&page, &o).unwrap();
+        assert_eq!(label_widths(&big), [width], "{fit}");
+        assert_eq!(label_widths(&big), label_widths(&small), "{fit}");
+        assert_eq!(label_lengths(&big), label_lengths(&small), "{fit}");
+        assert_eq!(label_fields(&big), label_fields(&small), "{fit}");
+    }
+
+    /// An A0 page on a 203 dpi queue (63.9 MP there), fitted to the width
+    /// as Python printed it (the page budget refused it): drawn at 179 dpi,
+    /// within the budget, it prints the label a 4×6 page with the same
+    /// design prints. At its own size it is still refused.
+    #[test]
+    fn an_a0_page_fitted_to_the_width_prints_a_normal_label() {
+        if pdf_tool("pdfinfo").is_none() {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        let a0 = write_pdf(td.path(), "a0.pdf", &pdf_with_pages(&[A0_LABEL], ""));
+        let info = PdfInfo::read(&a0, 1, MAX_PDF_PAGES + 1).unwrap();
+        // The 4×6 box at 203 dpi, below the 32-dot top margin.
+        let label = Some((812, 1186));
+        for renderer in renderers() {
+            let dir = td
+                .path()
+                .join(format!("{renderer:?}").replace(['"', '/', ' '], "_"));
+            let all = pdf_all_pages_to_png(&renderer, &a0, &dir.join("all"), 203, &info, label);
+            let one = render_page(&renderer, &a0, &dir.join("one"), 203, 1, label).unwrap();
+            for page in [&all.unwrap()[0], &one] {
+                assert_eq!(page.dpi, 179, "{renderer:?}");
+                // pdftoppm rounds up, gs rounds.
+                let (w, h) = png_dimensions(&page.png).unwrap();
+                assert!(w == 5927 && (8378..=8379).contains(&h), "{w} x {h}");
+                assert!(u64::from(w) * u64::from(h) <= MAX_PAGE_PIXELS);
+            }
+        }
+        if renderers().is_empty() {
+            return;
+        }
+        assert_a0_label_size(td.path(), "width", 816);
+        let native = json!({"cups_name": "Zebra_ZD421-203dpi_ZPL", "zpl_fit": "none"});
+        let err = image_path_to_zpl(&a0, &opts(native)).unwrap_err();
+        assert_eq!(err.code, "pdf_page_too_large");
+    }
+
+    /// With `zpl_fit` contain, the default, the label on the A0 page drawn
+    /// at 179 dpi prints at the size it has at 203 dpi, not 179/203 of it.
+    #[test]
+    fn a_label_on_an_a0_page_keeps_its_size() {
+        if renderers().is_empty() || pdf_tool("pdfinfo").is_none() {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        write_pdf(td.path(), "a0.pdf", &pdf_with_pages(&[A0_LABEL], ""));
+        assert_a0_label_size(td.path(), "contain", 616);
+    }
+
+    /// A page drawn below the job's dpi gets a tool run of its own, before
+    /// any is drawn at the job's dpi: the pages around it are drawn exactly
+    /// as in a document without it, which takes a single run.
+    #[test]
+    fn a_page_over_the_budget_is_drawn_in_a_run_of_its_own() {
+        if pdf_tool("pdfinfo").is_none() {
+            return;
+        }
+        let td = tempfile::tempdir().unwrap();
+        // 4×6 pages with a 1, 2 and 3 in wide box, and A0 as page 2.
+        let small = [
+            "0 g 36 36 72 36 re f",
+            "0 g 36 36 144 36 re f",
+            "0 g 36 36 216 36 re f",
+        ];
+        let pages = [
+            (288, 432, small[0]),
+            A0_LABEL,
+            (288, 432, small[1]),
+            (288, 432, small[2]),
+        ];
+        let mixed = write_pdf(td.path(), "mixed.pdf", &pdf_with_pages(&pages, ""));
+        let without = write_pdf(td.path(), "small.pdf", &pdf_with_content(288, 432, &small));
+        let label = Some((812, 1186));
+        for (i, renderer) in renderers().iter().enumerate() {
+            let out = td.path().join(i.to_string());
+            fs::create_dir_all(&out).unwrap();
+            let renderer = logged(&out, renderer);
+            let draw = |pdf: &Path, dir: &str| {
+                let info = PdfInfo::read(pdf, 1, MAX_PDF_PAGES + 1).unwrap();
+                pdf_all_pages_to_png(&renderer, pdf, &out.join(dir), 203, &info, label).unwrap()
+            };
+            let with = draw(&mixed, "mixed");
+            let runs = [(1, 1, 203), (2, 2, 179), (3, 4, 203)];
+            assert_eq!(logged_runs(&out), runs, "{renderer:?}");
+            let without = draw(&without, "small");
+            assert_eq!(logged_runs(&out), [(1, 3, 203)], "{renderer:?}");
+
+            let dpis: Vec<i64> = with.iter().map(|p| p.dpi).collect();
+            assert_eq!(dpis, [203, 179, 203, 203], "{renderer:?}");
+            assert_eq!(png_dimensions(&with[1].png).map(|(w, _)| w), Some(5927));
+            let png = |p: &DrawnPage| fs::read(&p.png).unwrap();
+            for (i, j) in [(0, 0), (2, 1), (3, 2)] {
+                assert!(
+                    png(&with[i]) == png(&without[j]),
+                    "{renderer:?}: page {} differs",
+                    i + 1
+                );
+            }
+        }
     }
 
     /// The conversion `to_pil_luma` replaced: every image copied to 8-bit
@@ -2780,8 +3326,8 @@ letter.pdf {"zpl_page":"2"} err:pdf_render
 
     #[test]
     fn pdf_labels_are_byte_identical() {
-        let Some(tool) = which("pdftoppm") else {
-            eprintln!("no pdftoppm installed; skipping PDF golden output");
+        // Another release (as on CI's runner) is skipped, but not none.
+        let Some(tool) = pdf_tool("pdftoppm") else {
             return;
         };
         let out = run_with_timeout(&tool, &["-v"], Duration::from_secs(30)).unwrap();
