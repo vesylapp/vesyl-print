@@ -748,9 +748,15 @@ def _looks_like_post_activate_glitch(ust: UpdateStatus) -> bool:
     Classic case: ``apply-update restart`` SIGTERMs the agent while it is still
     waiting; status becomes ``failed`` even though ``current`` already points at
     the new release. LCD should show Verifying…, not Update failed.
+
+    Never a gate that judged the version and could not roll it back
+    (``last_error`` starts ``health failed``, as update.rs writes it): its
+    version stays current, but it failed.
     """
     target = (ust.target_version or "").strip()
     if not target:
+        return False
+    if (ust.last_error or "").startswith("health failed"):
         return False
     err = (ust.last_error or "").lower()
     if "sigterm" in err or "apply-update" in err and "restart" in err:

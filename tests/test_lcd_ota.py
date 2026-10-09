@@ -72,6 +72,30 @@ class TestOtaDisplayMessage(unittest.TestCase):
         self.assertEqual(out[0], "Verifying 0.3.1…")
         self.assertEqual(out[1], disp.WARN)
 
+    def test_gate_that_could_not_roll_back_shows_failed(self):
+        """A health gate that failed its version and could not roll it back
+        leaves it current (current_version == target_version): Update failed,
+        not Verifying, whatever else the error says."""
+        for last_error in (
+            "health failed: timeout (no previous slot to roll back to)",
+            "health failed: current slot has no executable vesyl-print binary; "
+            "rollback error: release 0.3.0 cannot run: no executable vesyl-print "
+            "in its slot",
+            "health failed: timeout; rollback error: apply-update activate "
+            "failed: restart pending",
+        ):
+            st = disp.UpdateStatus(
+                status=disp.STATUS_FAILED,
+                current_version="0.3.1",
+                target_version="0.3.1",
+                previous_version="0.3.0",
+                last_error=last_error,
+            )
+            with self.subTest(last_error=last_error):
+                self.assertEqual(
+                    disp.ota_display_message(st), ("Update failed", disp.DOWN)
+                )
+
     def test_no_target_version(self):
         st = disp.UpdateStatus(status=disp.STATUS_DOWNLOADING)
         out = disp.ota_display_message(st)
