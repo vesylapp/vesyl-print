@@ -7,8 +7,15 @@ Sudoers: vesyl ALL=(root) NOPASSWD: /usr/local/lib/vesyl-print/wifi-setup
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# The modules below come from the release slot, which the service user owns.
+# Running as root, Python would leave root-owned __pycache__ there that the
+# agent can never delete; the portal this spawns inherits the same setting.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 if sys.version_info < (3, 9):
     sys.stderr.write("wifi-setup requires Python 3.9+\n")
