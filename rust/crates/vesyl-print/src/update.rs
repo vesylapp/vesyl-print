@@ -473,13 +473,77 @@ pub fn parse_version(v: &str) -> Vec<i64> {
     core.split('.').map(|p| p.parse().unwrap_or(0)).collect()
 }
 
-/// Ordering of two semver-ish version strings (numeric, missing parts = 0).
-pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+/// Ordering of the numbers of two versions only (missing parts = 0), any
+/// suffix ignored: what `build-release.sh`'s `version_core_ge` compares, so
+/// the `min_agent_version` floor means the same to the build that checks it
+/// and to the agent that applies it (a 0.4.0-rc.1 agent meets a 0.4.0
+/// floor, as the build that let it be numbered so assumed).
+fn version_number_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     let (mut ta, mut tb) = (parse_version(a), parse_version(b));
     let n = ta.len().max(tb.len());
     ta.resize(n, 0);
     tb.resize(n, 0);
     ta.cmp(&tb)
+}
+
+/// What follows the numbers of `v` (`-rc.1` in `0.9.1-rc.1`, `+b7` in
+/// `0.9.1+b7`, `.lab` in `0.5.0.lab`), or "" when it has nothing else.
+fn version_suffix(v: &str) -> &str {
+    let bytes = v.as_bytes();
+    // End of the last number of the leading `N(.N)*`.
+    let (mut end, mut i) = (0, 0);
+    loop {
+        let start = i;
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+        if i == start {
+            break;
+        }
+        end = i;
+        if bytes.get(i) != Some(&b'.') {
+            break;
+        }
+        i += 1;
+    }
+    &v[end..]
+}
+
+/// Semver's order of two pre-release strings (after the `-`, before any
+/// `+`): identifier by identifier, numbers numerically and below words, and
+/// fewer identifiers first when all before are equal.
+fn prerelease_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let ident = |s: &str| -> Result<u64, String> { s.parse::<u64>().map_err(|_| s.to_string()) };
+    let ta = a.split('.').map(ident);
+    let tb = b.split('.').map(ident);
+    // Ok (a number) sorts below Err (a word), as semver has it.
+    ta.cmp(tb)
+}
+
+/// Ordering of two semver-ish version strings: numeric first (missing parts
+/// = 0, so 0.3 is 0.3.0). The same numbers with a suffix then sort as
+/// semver has them: a pre-release (`-rc.1`) before the release
+/// (0.9.1-rc.1 < 0.9.1), pre-releases by their identifiers; any other
+/// suffix (`+b7`, `.lab`) after the bare release, by its text. So two
+/// different releases never compare equal: a device running 0.9.1-rc.1 is
+/// not taken to run 0.9.1 already.
+pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let by_numbers = version_number_cmp(a, b);
+    if by_numbers.is_ne() {
+        return by_numbers;
+    }
+    let (sa, sb) = (version_suffix(a), version_suffix(b));
+    fn pre(s: &str) -> Option<&str> {
+        s.strip_prefix('-')
+            .map(|p| p.split('+').next().unwrap_or(""))
+    }
+    match (pre(sa), pre(sb)) {
+        (Some(pa), Some(pb)) => prerelease_cmp(pa, pb).then_with(|| sa.cmp(sb)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => sa.cmp(sb),
+    }
 }
 
 fn same_version(a: &str, b: &str) -> bool {
@@ -673,7 +737,7 @@ const SHOWN_URL_CHARS: usize = 200;
 /// the heartbeat or the journal): [`net::redact_url`]'s form, without the
 /// userinfo, query or fragment a presigned URL carries its signature in,
 /// cut to [`SHOWN_URL_CHARS`] as cloud.rs cuts a redirect target.
-fn shown_url(url: &str) -> String {
+pub(crate) fn shown_url(url: &str) -> String {
     net::redact_url(url).chars().take(SHOWN_URL_CHARS).collect()
 }
 
@@ -1853,7 +1917,7 @@ fn check_manifest(
     require_signature: bool,
 ) -> Result<(), UpdateError> {
     if let Some(min) = &manifest.min_agent_version {
-        if version_cmp(&env.running_version, min).is_lt() {
+        if version_number_cmp(&env.running_version, min).is_lt() {
             return Err(UpdateError::new(
                 format!("current {} < min_agent_version {min}", env.running_version),
                 "too_old",
@@ -2522,6 +2586,35 @@ fn manual_rollback(st: &UpdateStatus) -> bool {
             .is_some_and(|e| e.starts_with(MANUAL_ROLLBACK))
 }
 
+/// True when `st` records a rollback that restarted the services, or asked
+/// for their restart: one a health gate made by rolling back to its
+/// previous slot. A manual `update rollback` (it restarts only with
+/// `--restart`, and then itself) and a gate closed because `current` was
+/// switched by hand restart nothing, though they also move `current` and
+/// leave `rolled_back`: an agent that sees `current` move under it must not
+/// wait for a restart after them.
+pub fn rollback_restarted_services(st: &UpdateStatus) -> bool {
+    st.is(STATUS_ROLLED_BACK)
+        && !manual_rollback(st)
+        && !st
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(CURRENT_CHANGED))
+}
+
+/// The version `st` holds back on a node running `running`: its target when
+/// the agent would not install that again for the same desired version (it
+/// failed its health gate here, a rollback left it, or it cannot be
+/// installed here: see [`failed_health_gate`], [`failed_for_good`]), and is
+/// not the version running. An `update apply` that installs nothing must
+/// not write over such a record: the agent would install the version again.
+pub fn held_version<'a>(st: &'a UpdateStatus, running: &str) -> Option<&'a str> {
+    st.target_version
+        .as_deref()
+        .filter(|t| !same_version(t, running))
+        .filter(|_| failed_health_gate(st) || failed_for_good(st))
+}
+
 /// True when this status records that its target failed the health gate on
 /// this node: rolled back (by the gate, or by hand, while the gate was open
 /// or after), or failed with no way to roll back. A rollback because the
@@ -2669,7 +2762,8 @@ pub fn check_manifest_version(
 /// After any other failure the same version is tried again only once its
 /// backoff has passed (`retry_at`). With `status_path`, a gate armed (or a
 /// rollback recorded) there since `status` was read wins over `status` (see
-/// `current_status`).
+/// `current_status`), and so does one written there while this update ran
+/// (see [`written_meanwhile`]): the caller writes the result back.
 ///
 /// Once `stop` is set, an update not yet activated gives up and is tried
 /// again on the next start; one activated already stays `pending_health`
@@ -2686,6 +2780,60 @@ pub fn maybe_update_from_heartbeat(
     status_path: Option<&Path>,
     jobs_busy: bool,
     stop: &AtomicBool,
+) -> UpdateStatus {
+    let Some(path) = status_path else {
+        return update_from_heartbeat(
+            hb,
+            cfg,
+            env,
+            status,
+            None,
+            jobs_busy,
+            stop,
+            &RefCell::default(),
+        );
+    };
+    let before = read_update_status(path);
+    let written = RefCell::default();
+    let st = update_from_heartbeat(hb, cfg, env, status, Some(path), jobs_busy, stop, &written);
+    written_meanwhile(path, written.into_inner().or(before)).unwrap_or(st)
+}
+
+/// The record at `path` if another process wrote a `pending_health` or a
+/// manual rollback there since it held `ours` (what this heartbeat last
+/// wrote there, else what it found): `update apply … --restart` arming its
+/// gate while this agent downloaded, then stopping it with the restart, or
+/// an `update rollback`. Written over by the stale status this heartbeat
+/// returns, the restarted agent would run the new slot with no gate (and
+/// nothing to roll a bad one back), or install the version rolled back from
+/// again.
+fn written_meanwhile(path: &Path, ours: Option<UpdateStatus>) -> Option<UpdateStatus> {
+    let now = read_update_status(path)
+        .filter(|on_disk| on_disk.is(STATUS_PENDING_HEALTH) || manual_rollback(on_disk))?;
+    if Some(&now) == ours.as_ref() {
+        return None;
+    }
+    log::warn!(
+        target: LOG,
+        "update status written meanwhile by another process: {} for {} — keeping it",
+        now.status,
+        now.target_version.as_deref().unwrap_or("?")
+    );
+    Some(now)
+}
+
+/// [`maybe_update_from_heartbeat`], noting in `written` the record it last
+/// wrote to `status_path` (as read back).
+#[allow(clippy::too_many_arguments)] // maybe_update_from_heartbeat's, and what it wrote
+fn update_from_heartbeat(
+    hb: &JsonObject,
+    cfg: &Config,
+    env: &UpdateEnv,
+    status: Option<UpdateStatus>,
+    status_path: Option<&Path>,
+    jobs_busy: bool,
+    stop: &AtomicBool,
+    written: &RefCell<Option<UpdateStatus>>,
 ) -> UpdateStatus {
     let report = Report::start("heartbeat");
     let mut st = current_status(status, status_path);
@@ -2724,7 +2872,24 @@ pub fn maybe_update_from_heartbeat(
     // The version this status is about, before it becomes `desired`.
     let prev_target = st.target_version.replace(desired.clone());
     if same_version(&desired, &st.current_version) {
-        if !sticky(&st) {
+        // A rollback is over once the server asks for the version running:
+        // the version it held is no longer the one asked for, and the
+        // target is now the version running, so nothing is held any more.
+        // Kept, it showed "Rolled back" on the LCD (and reported it) while
+        // the server's own version ran, for good: say after `update
+        // rollback` from 0.9.0 to 0.8.0 and a reinstall of 0.9.0 by
+        // `update apply --file` without --restart, while the server asks
+        // for 0.9.0. A failure stays: its gate clears it once the version
+        // runs healthy (`clear_failed_gate_once_healthy`).
+        if st.is(STATUS_ROLLED_BACK) {
+            log::info!(
+                target: LOG,
+                "{desired} runs and is the desired version: the rollback ({}) is over",
+                st.last_error.as_deref().unwrap_or("?")
+            );
+            st.last_error = None;
+            st.status = STATUS_IDLE.into();
+        } else if !sticky(&st) {
             st.status = STATUS_IDLE.into();
         }
         return st;
@@ -2848,8 +3013,9 @@ pub fn maybe_update_from_heartbeat(
 
     let persist = |st: &UpdateStatus| {
         if let Some(p) = status_path {
-            if let Err(e) = write_update_status(p, st) {
-                log::warn!(target: LOG, "write update status: {e}");
+            match write_update_status(p, st) {
+                Ok(()) => *written.borrow_mut() = read_update_status(p),
+                Err(e) => log::warn!(target: LOG, "write update status: {e}"),
             }
         }
     };
@@ -3126,7 +3292,47 @@ mod tests {
         assert_eq!(version_cmp("0.3.0", "0.4.0"), Less);
         assert_eq!(version_cmp("1.0.0", "0.9.9"), Greater);
         assert_eq!(version_cmp("0.3", "0.3.0"), Equal);
-        assert_eq!(version_cmp("0.3.17-rc.1", "0.3.17"), Equal);
+        // A suffix makes another release, ordered as semver orders it (it
+        // was ignored: a device on 0.9.1-rc.1 stayed there when the server
+        // asked for 0.9.1, which it took for the version running).
+        assert_eq!(version_cmp("0.3.17-rc.1", "0.3.17"), Less);
+        assert_eq!(version_cmp("0.3.17", "0.3.17-rc.1"), Greater);
+        assert_eq!(version_cmp("0.3.17-rc.1", "0.3.16"), Greater);
+        assert_eq!(version_cmp("0.3.17-rc.1", "0.3.17-rc.1"), Equal);
+        assert_eq!(version_cmp("0.3.17-rc.1", "0.3.17-rc.2"), Less);
+        assert_eq!(version_cmp("0.3.17-rc.2", "0.3.17-rc.10"), Less);
+        assert_eq!(version_cmp("0.3.17-alpha", "0.3.17-alpha.1"), Less);
+        assert_eq!(version_cmp("0.3.17-1", "0.3.17-alpha"), Less);
+        assert_eq!(version_cmp("0.3.17-beta", "0.3.17-alpha.9"), Greater);
+        assert_eq!(version_cmp("0.5.0.lab", "0.5.0"), Greater);
+        assert_eq!(version_cmp("0.5.0+b7", "0.5.0"), Greater);
+        assert_eq!(version_cmp("0.5.0.lab", "0.5.1"), Less);
+        for (a, b) in [
+            ("0.9.1-rc.1", "0.9.1"),
+            ("0.5.0.lab", "0.5.0"),
+            ("0.5.0+b7", "0.5.0"),
+        ] {
+            assert!(!same_version(a, b), "{a} {b}");
+        }
+        assert!(same_version("0.3", "0.3.0"));
+        assert_eq!(version_suffix("0.9.1-rc.1"), "-rc.1");
+        assert_eq!(version_suffix("0.5.0.lab"), ".lab");
+        assert_eq!(version_suffix("0.5.0+b7"), "+b7");
+        assert_eq!(version_suffix("0.5.0"), "");
+    }
+
+    /// Releases sort with a pre-release below its release: a rollback with
+    /// no version picks the newest of the rest.
+    #[test]
+    fn releases_sort_pre_releases_before_their_release() {
+        let td = tempfile::tempdir().unwrap();
+        for v in ["0.9.1", "0.9.1-rc.1", "0.9.0", "0.9.1-rc.2"] {
+            fs::create_dir_all(td.path().join("releases").join(v)).unwrap();
+        }
+        assert_eq!(
+            list_releases(td.path()),
+            ["0.9.0", "0.9.1-rc.1", "0.9.1-rc.2", "0.9.1"]
+        );
     }
 
     #[test]
@@ -3827,7 +4033,14 @@ mod tests {
             (err.code, err.message.as_str()),
             ("too_old", "current 0.4.0 < min_agent_version 0.4.1")
         );
+        // The floor compares numbers only, as build-release.sh does: a
+        // pre-release of 0.4.0 meets a 0.4.0 floor.
         m.min_agent_version = Some("0.4.0".into());
+        let rc = UpdateEnv {
+            running_version: "0.4.0-rc.1".into(),
+            ..env(&root)
+        };
+        assert!(check_manifest(&m, &rc, None, false).is_ok());
         let other = td.path().join("other.tar.gz");
         fs::write(&other, b"not the artifact").unwrap();
         let err = apply_local_release(&m, &env(&root), &other, None, false).unwrap_err();
@@ -6556,6 +6769,89 @@ mod tests {
         );
         assert_eq!(out.status, STATUS_PENDING_HEALTH, "{:?}", out.last_error);
         assert_eq!(current_name(&root), "0.4.1");
+    }
+
+    /// A rollback, by a gate or by hand, is over once the server asks for
+    /// the version running: idle, with nothing held. It stayed `rolled_back`
+    /// (an amber "Rolled back" on the LCD) until the next update. With no
+    /// desired version it stays, and so does a failure.
+    #[test]
+    fn a_rollback_is_over_once_the_version_running_is_desired() {
+        let td = tempfile::tempdir().unwrap();
+        let root = two_slots(td.path());
+        flip_current(&root, "0.3.0").unwrap();
+        let c = unsigned_ok(td.path());
+        let agent = slot_agent(&root, "0.3.0");
+        let rolled = |why: &str| UpdateStatus {
+            status: STATUS_ROLLED_BACK.into(),
+            current_version: "0.3.0".into(),
+            target_version: Some("0.4.0".into()),
+            last_error: Some(why.into()),
+            ..Default::default()
+        };
+        for st in [
+            rolled("health failed: timeout; rolled back to 0.3.0"),
+            rolled("manual rollback from 0.4.0 to 0.3.0"),
+        ] {
+            let heartbeat = |hb: Value| {
+                maybe_update_from_heartbeat(
+                    &obj(hb),
+                    &c,
+                    &agent,
+                    Some(st.clone()),
+                    None,
+                    false,
+                    &NO_STOP,
+                )
+            };
+            let out = heartbeat(json!({"desired_agent_version": "0.3.0"}));
+            assert_eq!(out.status, STATUS_IDLE, "{st:?}");
+            assert_eq!(out.last_error, None);
+            assert_eq!(held_version(&out, "0.3.0"), None);
+            let out = heartbeat(json!({}));
+            assert_eq!(out.status, STATUS_ROLLED_BACK, "{st:?}");
+            // Still held while the server asks for 0.4.0.
+            let out = heartbeat(json!({"desired_agent_version": "0.4.0"}));
+            assert_eq!(out.status, STATUS_ROLLED_BACK, "{st:?}");
+            assert_eq!(held_version(&out, "0.3.0"), Some("0.4.0"));
+            assert_eq!(current_name(&root), "0.3.0");
+        }
+        let failed = UpdateStatus {
+            status: STATUS_FAILED.into(),
+            target_version: Some("0.4.0".into()),
+            last_error: Some("health failed: timeout (no previous slot to roll back to)".into()),
+            ..Default::default()
+        };
+        let hb = obj(json!({"desired_agent_version": "0.3.0"}));
+        let out = maybe_update_from_heartbeat(&hb, &c, &agent, Some(failed), None, false, &NO_STOP);
+        assert_eq!(out.status, STATUS_FAILED);
+    }
+
+    /// Of the records that leave `rolled_back`, only a gate's rollback to
+    /// its previous slot restarted the services. An agent that sees a manual
+    /// rollback (or a gate closed because `current` moved by hand) move
+    /// `current` must not wait for a restart.
+    #[test]
+    fn only_a_gates_rollback_restarted_the_services() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("update_status.json");
+        let manual = record_manual_rollback(&path, "0.4.0", "0.3.0").unwrap();
+        let rolled = |why: &str| UpdateStatus {
+            status: STATUS_ROLLED_BACK.into(),
+            last_error: Some(why.into()),
+            ..Default::default()
+        };
+        assert!(!rollback_restarted_services(&manual));
+        assert!(!rollback_restarted_services(&rolled(
+            "current changed to 0.3.0 during the health gate"
+        )));
+        assert!(rollback_restarted_services(&rolled(
+            "health failed: timeout; rolled back to 0.3.0"
+        )));
+        assert!(rollback_restarted_services(&rolled(
+            "restart never happened (still running 0.3.0); rolled back to 0.3.0"
+        )));
+        assert!(!rollback_restarted_services(&UpdateStatus::default()));
     }
 
     // --- stopping ----------------------------------------------------------------

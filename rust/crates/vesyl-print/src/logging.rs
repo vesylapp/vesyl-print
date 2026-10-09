@@ -50,17 +50,37 @@ impl log::Log for Logger {
     fn flush(&self) {}
 }
 
-/// Install the logger. `verbose` (or `VESYL_PRINT_LOG=debug`) enables debug.
-pub fn init(verbose: bool) {
-    let level = match std::env::var("VESYL_PRINT_LOG").as_deref() {
+/// The level for `verbose` and `VESYL_PRINT_LOG` (`env`), else `default`.
+fn level(verbose: bool, env: Option<&str>, default: log::LevelFilter) -> log::LevelFilter {
+    match env {
         _ if verbose => log::LevelFilter::Debug,
-        Ok("debug") => log::LevelFilter::Debug,
-        Ok("warning") | Ok("warn") => log::LevelFilter::Warn,
-        _ => log::LevelFilter::Info,
-    };
+        Some("debug") => log::LevelFilter::Debug,
+        Some("info") => log::LevelFilter::Info,
+        Some("warning") | Some("warn") => log::LevelFilter::Warn,
+        _ => default,
+    }
+}
+
+fn install(verbose: bool, default: log::LevelFilter) {
+    let env = std::env::var("VESYL_PRINT_LOG").ok();
+    let level = level(verbose, env.as_deref(), default);
     if log::set_boxed_logger(Box::new(Logger { level })).is_ok() {
         log::set_max_level(level);
     }
+}
+
+/// Install the agent's logger. `verbose` (or `VESYL_PRINT_LOG=debug`)
+/// enables debug.
+pub fn init(verbose: bool) {
+    install(verbose, log::LevelFilter::Info);
+}
+
+/// Install the logger of a one-off command (`update`, `claim`, …): warnings
+/// and errors only, unless `VESYL_PRINT_LOG` asks for more. Without one,
+/// their warnings were lost: a symlink root would not follow, a file it
+/// could not hand to the service user, a release passed over.
+pub fn init_command() {
+    install(false, log::LevelFilter::Warn);
 }
 
 #[cfg(test)]
@@ -105,6 +125,21 @@ mod tests {
         assert!(!enabled(&info, "vesyl-print.agent", Level::Debug));
         assert!(enabled(&info, "vesyl-print.agent", Level::Info));
         assert!(!enabled(&info, "ureq::run", Level::Info));
+    }
+
+    /// The agent logs from info, a one-off command only warnings, unless
+    /// VESYL_PRINT_LOG (or --verbose) asks for another level.
+    #[test]
+    fn levels() {
+        use log::LevelFilter::*;
+        assert_eq!(level(false, None, Info), Info);
+        assert_eq!(level(false, None, Warn), Warn);
+        assert_eq!(level(true, None, Warn), Debug);
+        assert_eq!(level(false, Some("debug"), Warn), Debug);
+        assert_eq!(level(false, Some("info"), Warn), Info);
+        assert_eq!(level(false, Some("warning"), Info), Warn);
+        assert_eq!(level(false, Some("warn"), Info), Warn);
+        assert_eq!(level(false, Some("loud"), Warn), Warn);
     }
 
     /// Counts how often it is formatted.

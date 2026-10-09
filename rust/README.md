@@ -39,7 +39,8 @@ VESYL_PRINT_CONFIG_DIR=/tmp/vp/cfg VESYL_PRINT_STATE_DIR=/tmp/vp/state \
 VESYL_PRINT_INSTALL_ROOT=/tmp/vp/install cargo run -- agent
 ```
 
-`VESYL_PRINT_LOG=debug` raises log verbosity.
+`VESYL_PRINT_LOG=debug` raises log verbosity. Commands other than `agent` log
+warnings only (to stderr) unless `VESYL_PRINT_LOG` asks for more.
 
 ## Interfaces the Python LCD relies on
 
@@ -109,9 +110,9 @@ install cargo-zigbuild and zig from `.github/zigbuild-requirements.txt`
 The first Rust-only release is tagged `v0.5.0`, with `VERSION` bumped to
 0.5.0 in the same commit: the lab Pi already ran lab builds 0.4.0 through
 0.4.3 (throwaway lab key), and an agent ignores a desired version equal to
-its own. `update::version_cmp` ignores a `-` suffix (an open item: 0.9.1-rc.1
-counts as 0.9.1), so releases are tagged `vX.Y.Z`, and no build made before
-the tag may be numbered 0.5.0 or 0.5.0-anything (use e.g. 0.4.4).
+its own. `update::version_cmp` orders versions as semver does (0.9.1-rc.1
+sorts below 0.9.1), so no build made before the tag may be numbered 0.5.0
+(use e.g. 0.4.4).
 `MIN_AGENT_VERSION` stays 0.4.0, the Python-era cutoff
 ([OTA_UPDATES.md](../OTA_UPDATES.md) §4.8).
 
