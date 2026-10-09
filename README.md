@@ -107,8 +107,8 @@ link and the directory that holds it, and nobody else may write to that
 directory unless it is sticky (`/var/lib`, `/etc` and `/opt` qualify by
 default). Any further symlink on the way to the target must meet the same
 rule, and the target must exist. Run as root (`sudo vesyl-print claim`,
-`enroll`, `unpair`, `print-test` or `update …`), the CLI follows no other
-symlink on its way into these trees. It refuses a symlink that root does not
+`enroll`, `unpair`, `print-test` or `update …`), the CLI's writes into these
+trees (and an update's unpack and hand-over) follow no other symlink. It refuses a symlink that root does not
 own, and one in a directory that someone other than root owns or can write
 to, such as `/var/lib/vesyl-print/queue` inside the service user's state dir.
 Such a run fails with "Not a directory" and logs which symlink it refused;
@@ -317,8 +317,12 @@ owner of `/var/lib/vesyl-print`) and refuses to run as root, which would
 leave root-owned files in the state dir and follow links that account can
 plant there. To run it in the foreground, stop the service and use
 `sudo -u <service user> vesyl-print agent` (e.g. `sudo -u vesyl`). On
-SIGTERM or Ctrl-C it finishes the step in flight, an HTTP request included,
-then exits; a second signal quits at once. Under systemd a stop waits for that
+SIGTERM or Ctrl-C it finishes an in-process step in flight, an HTTP request
+included, then exits; a second signal quits at once. Child processes are not
+spared: systemd's stop signals every process in the unit's cgroup, and Ctrl-C
+the whole foreground process group, so a running `lp`, `lpstat`, `pdftoppm`
+or `gs` is killed with the agent (see the drain notes under
+[Local print test](#local-print-test-no-cloud)). Under systemd a stop waits for that
 at most the default `TimeoutStopSec` (90 s) before the agent is killed. Jobs
 not yet given to `lp` stay queued for the next start
 ([Local print test](#local-print-test-no-cloud)). A stop during an OTA
@@ -471,10 +475,21 @@ gate of an install cut off after its slot flip.
   of memory, say) is retired to `queue/failed/` as `crash_loop` and reported
   `error`.
 - Once the agent is stopping (SIGTERM), the drain takes no further job and no
-  job goes to `lp`. A step already running (a content fetch, a conversion,
-  `lp`) finishes first. A `wait_cups: sync` wait ends at its next check: it
-  naps 100 ms at a time between `lpstat` polls, and a poll already running
-  finishes first. A job cut short stays queued for the next start.
+  job goes to `lp`. An in-process step already running (a content fetch, an
+  image conversion) finishes first. A `wait_cups: sync` wait ends at its next
+  check: it naps 100 ms at a time between `lpstat` polls. A job cut short
+  that way stays queued for the next start.
+- Child processes do not finish first. The unit sets no `KillMode`, so
+  `systemctl stop` or restart sends SIGTERM to the whole cgroup at once (and
+  Ctrl-C reaches the whole foreground process group); the CUPS tools and
+  renderers run in the agent's group with signals unblocked. A PDF
+  conversion killed that way currently fails the job permanently as
+  `pdf_render` (retired to `queue/failed/`, reported `error`). An `lp` killed
+  mid-submit fails as `lp_error`, reported `error` but kept queued and sent
+  again on the next start; if cupsd had already accepted it, it can print
+  twice. This is a known gap (it needs `KillMode=mixed` in the unit, which
+  reaches devices only through `setup.sh`, or the children in their own
+  process group).
 
 The queue file is the cloud payload plus the agent's notes under `_agent`
 (`attempts`, `cups_job_id`, `submitted_at`). Agents from older releases ignore

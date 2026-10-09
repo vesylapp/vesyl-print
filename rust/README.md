@@ -138,9 +138,17 @@ agent on purpose):
   atomically.
 - Agent sleeps wake within 100 ms of SIGTERM. Once it is set, the queue drain
   takes no further job, no job goes to `lp`, and a synchronous CUPS wait ends
-  at its next check (it naps 100 ms at a time between `lpstat` polls). A
-  step already running (a content fetch, a conversion, `lp`, an `lpstat`
-  poll of up to 15 s, a wait-tick heartbeat) finishes first.
+  at its next check (it naps 100 ms at a time between `lpstat` polls). An
+  in-process step already running (a content fetch, an image conversion, a
+  wait-tick heartbeat) finishes first. Child processes do not: the unit sets
+  no `KillMode`, so a systemd stop signals the whole cgroup (Ctrl-C the whole
+  process group), and `printers::unblocked_signals` leaves the children
+  killable. A killed `pdftoppm`/`gs` maps to `pdf_render`, which is
+  permanent, so a PDF job converting at stop time is retired to
+  `queue/failed/`; a killed `lp` is a retryable `lp_error` and may print
+  twice if cupsd already had the job. Known gap: fixing it needs
+  `KillMode=mixed` (via `setup.sh`) or a process group per child, or treating
+  a child failure while stopping as `Interrupted`.
 - Every CUPS tool (lp, lpstat, lpinfo, lpoptions, ipptool, lpadmin) runs
   with LC_ALL and LC_MESSAGES set to C.UTF-8 (`printers::CUPS_ENV`): their
   output is parsed in English.
@@ -177,7 +185,8 @@ agent on purpose):
   explicit one that cannot.
 - `vesyl-print agent` refuses to run as root: run it as the service user
   (`sudo -u <service user> vesyl-print agent`). On SIGTERM or SIGINT it
-  finishes the step in flight, an HTTP request included, so a stop takes up
+  finishes an in-process step in flight, an HTTP request included (child
+  processes are killed with it, see above), so a stop takes up
   to systemd's `TimeoutStopSec` (default 90 s); a second signal exits at
   once. A stop during an OTA download removes the partial file; one after
   activation skips the restart, and the next start runs the health gate.
