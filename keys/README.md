@@ -64,6 +64,11 @@ openssl pkey -in update_private.pem -pubout -out keys/update_public.pem
 
 ## Build a release locally
 
+The build needs the cargo-zigbuild and zig versions CI uses, installed (in a
+venv) with
+`pip install --require-hashes --only-binary :all: -r .github/zigbuild-requirements.txt`,
+and binutils, jq, rsync and openssl.
+
 ```bash
 UPDATE_PRIVATE_KEY_FILE=./update_private.pem ./scripts/build-release.sh 0.5.0
 VERIFY_ONLY=1 ./scripts/build-release.sh 0.5.0   # the publish job's check
@@ -79,8 +84,12 @@ git push origin v0.5.0
 ```
 
 The first Rust-only release is v0.5.0 (`VERSION` bumped in the same commit):
-the lab Pi already ran lab builds 0.4.0 and 0.4.1, signed with a throwaway
-lab key. See `OTA_UPDATES.md` §4.8.
+the lab Pi already ran lab builds 0.4.0 through 0.4.3, signed with a
+throwaway lab key. See `OTA_UPDATES.md` §4.8. The lab Pi refuses
+production-signed releases: it held one as `bad_signature`, not to be tried
+again until the desired version changes (`OTA_UPDATES.md` §4.3 step 18), so
+it is re-provisioned from the published tarball instead (`OTA_UPDATES.md`
+§4.2.1).
 
 ## Canonical signature
 

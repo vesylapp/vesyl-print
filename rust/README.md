@@ -1,10 +1,12 @@
 # vesyl-print (Rust)
 
-The agent and CLI that ship on devices: one binary, `vesyl-print`. The
-`vesyl-print-agent.service` unit runs `vesyl-print agent`; operators and the
-LCD display use the same binary as the CLI. The LCD display stack is still
-Python (`main.py` and its modules at the repository root) and talks to the
-binary only through state files and CLI calls.
+**Status: Rust-only.** The agent and CLI that ship on devices are one
+binary, `vesyl-print`: the `vesyl-print-agent.service` unit runs
+`vesyl-print agent`, and operators and the LCD display use the same binary as
+the CLI. There is no Python agent, no bridge and no Python fallback; they
+are in git history only. Only the LCD display stack is still Python
+(`main.py` and its modules at the repository root), a thin client of the CLI
+and of the state files, `printers.json` among them (see below).
 
 ```bash
 cd rust
@@ -26,7 +28,9 @@ cargo test --locked
 | `zpl.rs` | PDF/PNG/JPEG → ZPL `^GFA` for raw thermal queues (`image` crate, `pdftoppm`) |
 | `update.rs` | app OTA: manifest verify (`ed25519-dalek`), download, extract, activate, health gate, rollback |
 | `config.rs`, `auth.rs`, `statusio.rs` | paths and config, `credentials.json` (0600), `status.json` for the LCD |
-| `sysinfo.rs`, `net.rs`, `util.rs`, `logging.rs` | helpers |
+| `net.rs` | shared HTTP plumbing (`ureq` agents for the API, job content, OTA and LAN probes): urllib-like timeouts and proxies, redirects, URL redaction for errors and logs |
+| `util.rs` | durable atomic writes; root-safe directory walks and hand-over to the service user |
+| `sysinfo.rs`, `logging.rs` | helpers |
 
 Run the agent locally (unpaired, temp dirs):
 
@@ -57,8 +61,11 @@ VESYL_PRINT_INSTALL_ROOT=/tmp/vp/install cargo run -- agent
 
 Unit tests sit next to the code and replace mocks with injectable hooks:
 `jobs::Pipeline` takes `lp`, `ack`, `report_state`, `fetch_url`,
-`wait_cups_job` and `supports_raw` as closures, and the cloud/cable tests run
-against local HTTP/WebSocket servers.
+`wait_cups_job`, `cups_lookup` and `supports_raw` as closures (and `stop` as
+a flag), and the cloud/cable tests run against local HTTP/WebSocket servers.
+The PDF tests run against the `pdftoppm` and `gs` on PATH and skip without
+them, unless `VESYL_PRINT_REQUIRE_RENDERERS=1` (CI's test job) makes a
+missing `pdftoppm`, `pdfinfo` or `gs` fail them.
 
 `crates/vesyl-print/tests/` drives the release tooling in temp dirs:
 `build_release.rs` runs `scripts/build-release.sh` (all modes, with a fake
@@ -100,11 +107,12 @@ install cargo-zigbuild and zig from `.github/zigbuild-requirements.txt`
 (pinned versions and hashes). See [OTA_UPDATES.md](../OTA_UPDATES.md) §4.2.
 
 The first Rust-only release is tagged `v0.5.0`, with `VERSION` bumped to
-0.5.0 in the same commit: the lab Pi already ran lab builds 0.4.0 and 0.4.1
-(throwaway lab key), and an agent ignores a desired version equal to its own.
-`update::version_cmp` ignores a `-` suffix, so 0.5.0-rc.1 equals 0.5.0 and no
-build made before the tag may be numbered 0.5.0 or 0.5.0-anything (use e.g.
-0.4.2). `MIN_AGENT_VERSION` stays 0.4.0, the Python-era cutoff
+0.5.0 in the same commit: the lab Pi already ran lab builds 0.4.0 through
+0.4.3 (throwaway lab key), and an agent ignores a desired version equal to
+its own. `update::version_cmp` ignores a `-` suffix (an open item: 0.9.1-rc.1
+counts as 0.9.1), so releases are tagged `vX.Y.Z`, and no build made before
+the tag may be numbered 0.5.0 or 0.5.0-anything (use e.g. 0.4.4).
+`MIN_AGENT_VERSION` stays 0.4.0, the Python-era cutoff
 ([OTA_UPDATES.md](../OTA_UPDATES.md) §4.8).
 
 ## Behaviour notes
@@ -128,12 +136,47 @@ agent on purpose):
   compact, `\uXXXX` for non-ASCII, nulls and `signature` dropped).
 - `update_status.json`, `status.json` and `printers.json` are written
   atomically.
-- Agent sleeps wake within 100 ms of SIGTERM.
+- Agent sleeps wake within 100 ms of SIGTERM. Once it is set, the queue drain
+  takes no further job, no job goes to `lp`, and a synchronous CUPS wait ends
+  at its next check (it naps 100 ms at a time between `lpstat` polls). An
+  in-process step already running (a content fetch, an image conversion, a
+  wait-tick heartbeat) finishes first. Child processes do not: the unit sets
+  no `KillMode`, so a systemd stop signals the whole cgroup (Ctrl-C the whole
+  process group), and `printers::unblocked_signals` leaves the children
+  killable. A killed `pdftoppm`/`gs` maps to `pdf_render`, which is
+  permanent, so a PDF job converting at stop time is retired to
+  `queue/failed/`; a killed `lp` is a retryable `lp_error` and may print
+  twice if cupsd already had the job. Known gap: fixing it needs
+  `KillMode=mixed` (via `setup.sh`) or a process group per child, or treating
+  a child failure while stopping as `Interrupted`.
+- Every CUPS tool (lp, lpstat, lpinfo, lpoptions, ipptool, lpadmin) runs
+  with LC_ALL and LC_MESSAGES set to C.UTF-8 (`printers::CUPS_ENV`): their
+  output is parsed in English.
+- Queue records keep the cloud payload as received; the agent's notes go
+  under `_agent` (attempts, cups_job_id, submitted_at). A record that says
+  CUPS has the job is never sent to `lp` again; three deaths in one job
+  retire it as `crash_loop`. Agents of older releases ignore `_agent`, so
+  after a rollback to one such a record may print again.
 - Release tarballs keep shipping `base.jpg`: it is the sample image for
   `vesyl-print print-test --file /opt/vesyl-print/current/base.jpg` (top-level
-  README). `printers::test_image()` also looks for it, but nothing calls that
-  (or `print_test_page()`) at present.
+  README).
 - `status --check` and `queues --json` print JSON keys sorted.
+- ZPL conversion has size limits Python lacked. A PDF page over 50 MP fails
+  with `pdf_page_too_large` (Python rasterized it, so A0 at 203 dpi printed
+  scaled down), unless `zpl_fit` scales it onto the label, when it is drawn
+  at the highest dpi within 50 MP instead. A page pdftoppm could not allocate
+  fails with `pdf_render` (Python printed a one-dot label). A label graphic
+  over 50 M dots, or a resize needing over 512 MiB, fails with
+  `label_too_large` (Python printed such labels; on an absurd box, such as
+  200000 dots square, it ran out of memory, and the Rust agent, before this
+  limit, aborted on the allocation). `zpl_x`/`zpl_y` over 32000 fail with
+  `zpl_error` (Python emitted out-of-range `^FO`/`^LL`). A positive `zpl_x`
+  narrows the fit box and widens `^PW` by that much (Python clipped the right
+  edge). Images over 178,956,970 pixels fail with `image_bad`, as under
+  Pillow.
+- The cable WebSocket handshake follows no HTTP redirect (the Python agent's
+  websocket-client followed up to 3): a redirecting `cable_url` leaves push
+  off, while REST pull still works.
 - Every activation (an OTA install, `update apply --file` /
   `--manifest-url`, `update rollback`, the health gate's rollback) goes
   through the installed `apply-update` sudo helper when present, and its
@@ -141,9 +184,32 @@ agent on purpose):
   tests). A rollback takes the newest other slot that can run and refuses an
   explicit one that cannot.
 - `vesyl-print agent` refuses to run as root: run it as the service user
-  (`sudo -u <service user> vesyl-print agent`). On SIGTERM it finishes the
-  request in flight, so a stop takes up to systemd's `TimeoutStopSec`
-  (default 90 s).
+  (`sudo -u <service user> vesyl-print agent`). On SIGTERM or SIGINT it
+  finishes an in-process step in flight, an HTTP request included (child
+  processes are killed with it, see above), so a stop takes up
+  to systemd's `TimeoutStopSec` (default 90 s); a second signal exits at
+  once. A stop during an OTA download removes the partial file; one after
+  activation skips the restart, and the next start runs the health gate.
+- Run as root (an operator's CLI), `util::write_durable`,
+  `create_dir_all_owned`, `open_dir_owned` and `hand_tree_to_parent_owner`
+  follow no symlink on the path except a root-owned link in a root-owned
+  directory that is not group/other-writable or is sticky; anything else
+  fails with ENOTDIR and a warning naming the link. A state dir that is a
+  symlink to another disk must therefore be root's link. Root's writes go to
+  the service user that owns the tree.
 - `update apply` (online, or `--version`) installs even with
-  `auto_update_enabled: false`; `--version X` uses the heartbeat's
-  `update_url` only when the server wants exactly X.
+  `auto_update_enabled: false`, and even a version the agent holds or backs
+  off; `--version X` (a leading `v` allowed, validated before any network
+  call) uses the heartbeat's `update_url` only when the server wants exactly
+  X, and any source's manifest for another version is refused.
+- An install that fails for good (`update::fails_for_good`: bad_manifest,
+  bad_signature, bad_checksum, bad_archive, too_old, version_mismatch,
+  no_exchange) holds the desired version until the server asks for another
+  or `update apply` runs; any other failure backs off 1 min, doubling to a
+  1 h cap. `update rollback` holds the version it left. `update_status.json`
+  carries `last_error_code`, `attempts` and `retry_at` (like `armed_at`) only
+  while set, so the file is unchanged for every status that does not need
+  them.
+- Reinstalling the active version swaps the slot in one step with
+  renameat2(RENAME_EXCHANGE); without exchange support that install is
+  refused (`no_exchange`), and the active slot is never replaced another way.
