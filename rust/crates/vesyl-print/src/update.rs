@@ -2872,16 +2872,22 @@ fn update_from_heartbeat(
     // The version this status is about, before it becomes `desired`.
     let prev_target = st.target_version.replace(desired.clone());
     if same_version(&desired, &st.current_version) {
-        // A rollback is over once the server asks for the version running:
-        // the version it held is no longer the one asked for, and the
-        // target is now the version running, so nothing is held any more.
+        // A rollback is over once the server asks for the version running
+        // and `current` is that version too: nothing is held any more.
         // Kept, it showed "Rolled back" on the LCD (and reported it) while
         // the server's own version ran, for good: say after `update
         // rollback` from 0.9.0 to 0.8.0 and a reinstall of 0.9.0 by
         // `update apply --file` without --restart, while the server asks
-        // for 0.9.0. A failure stays: its gate clears it once the version
-        // runs healthy (`clear_failed_gate_once_healthy`).
-        if st.is(STATUS_ROLLED_BACK) {
+        // for 0.9.0. The version running alone is not enough: the process
+        // a rollback leaves running until its restart (`update rollback`
+        // without --restart, a gate's restart that is late or never comes)
+        // runs the version rolled back from, and cleared by it the hold
+        // would be gone when the slot rolled back to starts, which would
+        // install that version again. A failure stays: its gate clears it
+        // once the version runs healthy (`clear_failed_gate_once_healthy`).
+        let current_is_desired =
+            current_release_version(&env.install_root).is_some_and(|c| same_version(&c, &desired));
+        if st.is(STATUS_ROLLED_BACK) && current_is_desired {
             log::info!(
                 target: LOG,
                 "{desired} runs and is the desired version: the rollback ({}) is over",
@@ -6772,9 +6778,11 @@ mod tests {
     }
 
     /// A rollback, by a gate or by hand, is over once the server asks for
-    /// the version running: idle, with nothing held. It stayed `rolled_back`
-    /// (an amber "Rolled back" on the LCD) until the next update. With no
-    /// desired version it stays, and so does a failure.
+    /// the version running and `current` is that version: idle, with
+    /// nothing held. It stayed `rolled_back` (an amber "Rolled back" on the
+    /// LCD) until the next update. With no desired version it stays, and so
+    /// does a failure, and so it does for the process the rollback left
+    /// running (`current` is not the version it runs).
     #[test]
     fn a_rollback_is_over_once_the_version_running_is_desired() {
         let td = tempfile::tempdir().unwrap();
@@ -6815,6 +6823,15 @@ mod tests {
             assert_eq!(out.status, STATUS_ROLLED_BACK, "{st:?}");
             assert_eq!(held_version(&out, "0.3.0"), Some("0.4.0"));
             assert_eq!(current_name(&root), "0.3.0");
+            // The 0.4.0 process the rollback left running until its restart:
+            // 0.4.0 runs and is asked for, but `current` is 0.3.0. Not over.
+            let old = slot_agent(&root, "0.4.0");
+            let hb = obj(json!({"desired_agent_version": "0.4.0"}));
+            let out =
+                maybe_update_from_heartbeat(&hb, &c, &old, Some(st.clone()), None, false, &NO_STOP);
+            assert_eq!(out.status, STATUS_ROLLED_BACK, "{st:?}");
+            assert_eq!(out.last_error, st.last_error);
+            assert_eq!(held_version(&out, "0.3.0"), Some("0.4.0"));
         }
         let failed = UpdateStatus {
             status: STATUS_FAILED.into(),
@@ -6825,6 +6842,45 @@ mod tests {
         let hb = obj(json!({"desired_agent_version": "0.3.0"}));
         let out = maybe_update_from_heartbeat(&hb, &c, &agent, Some(failed), None, false, &NO_STOP);
         assert_eq!(out.status, STATUS_FAILED);
+    }
+
+    /// The gate this heartbeat's own activation arms is no record "written
+    /// meanwhile by another process": the heartbeat returns its own status,
+    /// with no such warning, whether the status file was there before or not.
+    #[test]
+    fn the_gate_a_heartbeat_arms_itself_is_not_written_meanwhile() {
+        for idle_before in [false, true] {
+            let td = tempfile::tempdir().unwrap();
+            let root = two_slots(td.path());
+            flip_current(&root, "0.3.0").unwrap();
+            let c = unsigned_ok(td.path());
+            let agent = slot_agent(&root, "0.3.0");
+            let path = td.path().join("update_status.json");
+            let before = UpdateStatus {
+                current_version: "0.3.0".into(),
+                ..Default::default()
+            };
+            if idle_before {
+                write_update_status(&path, &before).unwrap();
+            }
+            let (out, logs) = logs_during(|| {
+                maybe_update_from_heartbeat(
+                    &desire(td.path(), "0.4.1"),
+                    &c,
+                    &agent,
+                    Some(before.clone()),
+                    Some(&path),
+                    false,
+                    &NO_STOP,
+                )
+            });
+            assert_eq!(out.status, STATUS_PENDING_HEALTH, "{:?}", out.last_error);
+            assert_eq!(current_name(&root), "0.4.1");
+            assert!(
+                !logs.iter().any(|(_, l)| l.contains("written meanwhile")),
+                "idle before: {idle_before}: {logs:?}"
+            );
+        }
     }
 
     /// Of the records that leave `rolled_back`, only a gate's rollback to

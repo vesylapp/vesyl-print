@@ -3172,6 +3172,73 @@ mod tests {
         assert_eq!(current(&d).as_deref(), Some("0.9.0"));
     }
 
+    /// The process a rollback leaves running until its restart runs the
+    /// version rolled back from, which the server still asks for: its
+    /// heartbeats keep the hold, here after `update rollback` without
+    /// --restart (for a gate's late restart, see
+    /// [`the_process_a_gate_rolls_back_from_keeps_its_hold`]). They
+    /// ended the rollback (idle, nothing held) as the version asked for was
+    /// running, and the agent rolled back to installed it again.
+    #[test]
+    fn the_process_a_rollback_leaves_running_keeps_its_hold() {
+        // `update rollback` without --restart: the 0.9.0 agent still runs.
+        let td = tempfile::tempdir().unwrap();
+        let (d, agent080, _srv) = rolled_back_by_hand(td.path());
+        let old = slot_agent(&d, "0.9.0", Arc::new(|| Some(Vec::new())));
+        for _ in 0..2 {
+            old.run_once(false);
+            let st = update::read_update_status(&d.cfg.update_status_path()).unwrap();
+            assert_eq!(st.status, update::STATUS_ROLLED_BACK, "{st:?}");
+            assert_eq!(st.target_version.as_deref(), Some("0.9.0"));
+        }
+        assert_still_held(&d, &agent080, "after the 0.9.0 agent's heartbeats");
+    }
+
+    /// [`the_process_a_rollback_leaves_running_keeps_its_hold`], for a gate's
+    /// rollback: 0.9.0 fails its gate, and the restart into 0.8.0 has not
+    /// come yet when the 0.9.0 agent heartbeats again. Ended there, the
+    /// rollback looped: download, gate, rollback, for as long as the server
+    /// asked for 0.9.0.
+    #[test]
+    fn the_process_a_gate_rolls_back_from_keeps_its_hold() {
+        let td = tempfile::tempdir().unwrap();
+        let (d, agent080, _srv) = rolled_back_by_hand(td.path());
+        let root = &d.update_env.install_root;
+        update::flip_current(root, "0.9.0").unwrap();
+        let path = d.cfg.update_status_path();
+        let gate = update::UpdateStatus {
+            status: update::STATUS_PENDING_HEALTH.into(),
+            current_version: "0.9.0".into(),
+            target_version: Some("0.9.0".into()),
+            previous_version: Some("0.8.0".into()),
+            health_deadline_at: Some("2000-01-01T00:00:00+00:00".into()),
+            ..Default::default()
+        };
+        update::write_update_status(&path, &gate).unwrap();
+        // What fails the gate: the slot can no longer run.
+        let binary = root.join("releases/0.9.0/vesyl-print");
+        crate::util::set_mode(&binary, 0o644).unwrap();
+        let old = slot_agent(&d, "0.9.0", Arc::new(|| Some(Vec::new())));
+        old.run_once(false);
+        assert_eq!(current(&d).as_deref(), Some("0.8.0"), "never rolled back");
+        crate::util::set_mode(&binary, 0o755).unwrap();
+        let gated = update::read_update_status(&path).unwrap();
+        assert_eq!(gated.status, update::STATUS_ROLLED_BACK, "{gated:?}");
+        for _ in 0..2 {
+            old.run_once(false);
+            let st = update::read_update_status(&path).unwrap();
+            assert_eq!(st.status, update::STATUS_ROLLED_BACK, "{st:?}");
+            assert_eq!(st.target_version.as_deref(), Some("0.9.0"));
+            assert_eq!(st.last_error, gated.last_error);
+        }
+        agent080.run_once(false);
+        assert_eq!(current(&d).as_deref(), Some("0.8.0"), "0.9.0 reinstalled");
+        let st = update::read_update_status(&path).unwrap();
+        assert_eq!(st.status, update::STATUS_ROLLED_BACK, "{st:?}");
+        assert_eq!(st.target_version.as_deref(), Some("0.9.0"));
+        assert_eq!(st.last_error, gated.last_error);
+    }
+
     /// `update check` shows the manifest URL without the query a presigned
     /// URL carries its signature in.
     #[test]

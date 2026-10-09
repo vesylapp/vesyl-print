@@ -268,9 +268,11 @@ after a successful heartbeat and from the CLI.
 2. Response may include desired_agent_version (+ update_channel, update_url);
    the desired version is normalized: a leading `v` is dropped
 3. If desired empty or == current → idle (a `rolled_back` status stays with
-   no desired version, and is over once desired == current; a `failed` one
-   stays). A desired version held here, or still backing off (step 18), is
-   left alone: nothing is fetched
+   no desired version, and is over once desired == the running version ==
+   the `current` slot's version; the old process a rollback leaves running
+   until its restart does not end it; a `failed` one stays). A desired
+   version held here, or still backing off (step 18), is left alone:
+   nothing is fetched
 4. If auto_update_enabled false → record target only, do not install
    (the agent; a manual `vesyl-print update apply` installs anyway, §4.7)
 5. If buffered ActionCable jobs, or a start-up drain held back by the health
